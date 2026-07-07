@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>飞毛腿浏览器 - 上传到 GitHub</title>
+<style>
+  :root {
+    --bg: #0d1117; --card: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --green: #238636;
+    --green-hover: #2ea043; --blue: #58a6ff; --red: #f85149;
+    --input-bg: #0d1117;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; justify-content: center; align-items: center;
+    min-height: 100vh; padding: 20px;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 32px; width: 100%; max-width: 440px;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.4);
+  }
+  h1 {
+    font-size: 22px; font-weight: 600; margin-bottom: 4px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  h1 svg { width: 28px; height: 28px; fill: #f0f6fc; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 28px; }
+  .field { margin-bottom: 18px; }
+  .field label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; color: var(--text); }
+  .field input {
+    width: 100%; padding: 10px 14px; font-size: 14px;
+    background: var(--input-bg); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); outline: none;
+    transition: border-color 0.2s;
+  }
+  .field input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(88,166,255,0.15); }
+  .field .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .field .hint a { color: var(--blue); }
+  .btn {
+    width: 100%; padding: 11px; font-size: 15px; font-weight: 600;
+    background: var(--green); color: #fff; border: none;
+    border-radius: 8px; cursor: pointer; transition: background 0.2s;
+    margin-top: 6px;
+  }
+  .btn:hover { background: var(--green-hover); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status {
+    margin-top: 16px; padding: 12px; border-radius: 8px;
+    font-size: 13px; display: none; line-height: 1.6;
+  }
+  .status.ok { background: rgba(35,134,54,0.15); border: 1px solid rgba(35,134,54,0.3); display: block; }
+  .status.err { background: rgba(248,81,73,0.15); border: 1px solid rgba(248,81,73,0.3); display: block; }
+  .status.info { background: rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.25); display: block; }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.6s linear infinite; vertical-align: middle; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .steps { display: none; margin-top: 12px; }
+  .steps .step { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 13px; }
+  .steps .step .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .steps .step .dot.done { background: var(--green); }
+  .steps .step .dot.wait { background: var(--muted); }
+  .steps .step .dot.fail { background: var(--red); }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>
+    <svg viewBox="0 0 24 24"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.385-1.335-1.755-1.335-1.755-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.605-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12 24 5.37 18.63 0 12 0z"/></svg>
+    上传到 GitHub
+  </h1>
+  <p class="sub">飞毛腿浏览器 v1.2.12 — 一键推送到你的仓库</p>
+  
+  <div class="field">
+    <label>GitHub 用户名</label>
+    <input id="username" type="text" placeholder="例如：VDV810" value="VDV810">
+  </div>
+  <div class="field">
+    <label>仓库名</label>
+    <input id="repo" type="text" value="feimaotui-browser" placeholder="feimaotui-browser">
+  </div>
+  <div class="field">
+    <label>Personal Access Token (经典令牌)</label>
+    <input id="token" type="password" placeholder="ghp_xxxxxxxxxxxxxxxxxxxx">
+    <div class="hint">
+      <a href="https://github.com/settings/tokens/new?scopes=repo&description=feimaotui-upload" target="_blank">点此创建 Token</a> — 勾选 <b>repo</b>，生成后粘贴到这里
+    </div>
+  </div>
+  
+  <button class="btn" id="btn" onclick="doUpload()">上传到 GitHub</button>
+  
+  <div class="steps" id="steps">
+    <div class="step" id="s1"><span class="dot wait"></span><span>创建仓库</span></div>
+    <div class="step" id="s2"><span class="dot wait"></span><span>推送代码</span></div>
+    <div class="step" id="s3"><span class="dot wait"></span><span>完成</span></div>
+  </div>
+  <div class="status" id="status"></div>
+</div>
+
+<script>
+async function doUpload() {
+  const btn = document.getElementById('btn');
+  const status = document.getElementById('status');
+  const steps = document.getElementById('steps');
+  const username = document.getElementById('username').value.trim();
+  const repo = document.getElementById('repo').value.trim();
+  const token = document.getElementById('token').value.trim();
+
+  if (!username || !repo || !token) {
+    status.className = 'status err';
+    status.textContent = '请填写所有字段';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>处理中…';
+  status.className = 'status';
+  status.textContent = '';
+  steps.style.display = 'block';
+  resetSteps();
+
+  try {
+    // Step 1: Create repo
+    markStep('s1', 'wait');
+    const s1span = document.getElementById('s1').querySelector('span:last-child');
+    s1span.textContent = '创建仓库中…';
+    
+    const resp = await fetch('https://api.github.com/user/repos', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Basic ' + btoa(username + ':' + token),
+        'Content-Type': 'application/json',
+        'Accept': 'application/vnd.github.v3+json'
+      },
+      body: JSON.stringify({
+        name: repo,
+        description: '飞毛腿浏览器 - 快速、安全、功能强大的浏览器',
+        private: false,
+        auto_init: false
+      })
+    });
+
+    const data = await resp.json();
+    if (!resp.ok && data.message) {
+      throw new Error('创建仓库失败: ' + data.message + (data.errors ? ' ' + JSON.stringify(data.errors) : ''));
+    }
+    markStep('s1', 'done');
+    s1span.textContent = '仓库已创建';
+
+    // Step 2: Push code
+    markStep('s2', 'wait');
+    const s2span = document.getElementById('s2').querySelector('span:last-child');
+    s2span.textContent = '推送代码中…';
+
+    const remoteUrl = 'https://' + username + ':' + encodeURIComponent(token) + '@github.com/' + username + '/' + repo + '.git';
+    const pushResp = await fetch('/api/push', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ remoteUrl, username, repo })
+    });
+
+    const pushData = await pushResp.json();
+    if (!pushData.ok) {
+      throw new Error('推送代码失败: ' + (pushData.error || '未知错误'));
+    }
+    markStep('s2', 'done');
+    s2span.textContent = '代码已推送';
+
+    markStep('s3', 'done');
+    status.className = 'status ok';
+    status.innerHTML = '<b>上传成功！</b><br>仓库地址：<a href="https://github.com/' + username + '/' + repo + '" target="_blank" style="color:#58a6ff">https://github.com/' + username + '/' + repo + '</a>';
+  } catch (err) {
+    // Mark failed step
+    const s1 = document.getElementById('s1').querySelector('.dot');
+    const s2 = document.getElementById('s2').querySelector('.dot');
+    if (s2.classList.contains('wait')) markStep('s2', 'fail');
+    if (s1.classList.contains('wait')) markStep('s1', 'fail');
+    status.className = 'status err';
+    status.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '上传到 GitHub';
+  }
+}
+
+function resetSteps() {
+  ['s1','s2','s3'].forEach(id => {
+    markStep(id, 'wait');
+    document.getElementById(id).querySelector('span:last-child').textContent = 
+      id === 's1' ? '创建仓库' : id === 's2' ? '推送代码' : '完成';
+  });
+}
+
+function markStep(id, cls) {
+  document.getElementById(id).querySelector('.dot').className = 'dot ' + cls;
+}
+</script>
+</body>
+</html>

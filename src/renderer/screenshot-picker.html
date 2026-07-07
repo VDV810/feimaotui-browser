@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>区域截图</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100vw; height: 100vh;
+            overflow: hidden; user-select: none;
+            background: transparent;
+            cursor: crosshair;
+        }
+        #selection {
+            position: fixed;
+            border: 2px solid #0078d4;
+            background: rgba(0, 120, 212, 0.12);
+            pointer-events: none;
+            display: none; z-index: 3;
+        }
+        #info {
+            position: fixed;
+            background: #0078d4; color: white;
+            font-size: 12px; padding: 2px 8px;
+            border-radius: 3px;
+            pointer-events: none;
+            display: none; z-index: 4;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+<body>
+    <div id="selection"></div>
+    <div id="info"></div>
+
+    <script>
+        const { ipcRenderer } = require('electron');
+
+        let isDragging = false, startX = 0, startY = 0, curX = 0, curY = 0;
+
+        const selection = document.getElementById('selection');
+        const info = document.getElementById('info');
+
+        document.addEventListener('mousedown', e => {
+            if (e.button !== 0) return;
+            isDragging = true;
+            startX = e.screenX;
+            startY = e.screenY;
+            curX = e.screenX;
+            curY = e.screenY;
+            selection.style.display = 'block';
+            info.style.display = 'block';
+            updateSel();
+        });
+
+        document.addEventListener('mousemove', e => {
+            if (!isDragging) return;
+            curX = e.screenX;
+            curY = e.screenY;
+            updateSel();
+        });
+
+        document.addEventListener('mouseup', e => {
+            if (!isDragging) return;
+            isDragging = false;
+
+            const x = Math.min(startX, curX);
+            const y = Math.min(startY, curY);
+            const w = Math.abs(curX - startX);
+            const h = Math.abs(curY - startY);
+
+            if (w < 10 || h < 10) {
+                ipcRenderer.send('screenshot-cancel');
+                return;
+            }
+
+            ipcRenderer.send('screenshot-region', { x, y, w, h });
+        });
+
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') ipcRenderer.send('screenshot-cancel');
+        });
+
+        function updateSel() {
+            const left = Math.min(startX, curX);
+            const top = Math.min(startY, curY);
+            const w = Math.abs(curX - startX);
+            const h = Math.abs(curY - startY);
+
+            // 用 clientX/clientY 显示选择框（相对于窗口）
+            const clientLeft = Math.min(startX, curX) - window.screenX;
+            const clientTop = Math.min(startY, curY) - window.screenY;
+
+            selection.style.left = clientLeft + 'px';
+            selection.style.top = clientTop + 'px';
+            selection.style.width = w + 'px';
+            selection.style.height = h + 'px';
+            info.textContent = w + ' x ' + h;
+            info.style.left = (clientLeft + w / 2 - info.offsetWidth / 2) + 'px';
+            info.style.top = (clientTop - 28) + 'px';
+        }
+    </script>
+</body>
+</html>
