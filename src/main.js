@@ -2427,7 +2427,11 @@ function ensureUniqueFilePath(dir, fileName) {
 function buildMediaSaveFileName(pendingMedia, originalFileName) {
   if (!pendingMedia || !pendingMedia.roughName) return originalFileName;
   const baseName = sanitizeRoughMediaTitle(pendingMedia.fileName || pendingMedia.title || originalFileName);
-  const extension = getSafeExtension(originalFileName || pendingMedia.url);
+  // 从URL提取扩展名，避免服务器返回的.htm被误用
+  let extension = getSafeExtension(pendingMedia.url || originalFileName);
+  if (extension === '.htm' || extension === '.html') {
+    extension = '.mp4';
+  }
   return `${baseName}${extension}`;
 }
 
@@ -2503,25 +2507,29 @@ function handleDownload(event, item, webContents) {
   }
   processedDownloadItems.add(item);
 
-  const now = Date.now();
-  const key = buildDownloadKey(item);
-  for (const [oldKey, oldTime] of recentDownloadKeys) {
-    if (now - oldTime > DUPLICATE_DOWNLOAD_WINDOW_MS) {
-      recentDownloadKeys.delete(oldKey);
+  const downloadUrl = item.getURL();
+  const pendingMedia = findPendingMediaDownload(item, downloadUrl, webContents, '');
+  const isMediaDownload = Boolean(pendingMedia);
+
+  // 媒体下载跳过recentDownloadKeys去重（由download-media-list统一调度）
+  if (!isMediaDownload) {
+    const now = Date.now();
+    const key = buildDownloadKey(item);
+    for (const [oldKey, oldTime] of recentDownloadKeys) {
+      if (now - oldTime > DUPLICATE_DOWNLOAD_WINDOW_MS) {
+        recentDownloadKeys.delete(oldKey);
+      }
     }
+    const lastTime = recentDownloadKeys.get(key);
+    if (lastTime && now - lastTime < DUPLICATE_DOWNLOAD_WINDOW_MS) {
+      cancelDuplicateDownload(event, item, key, item.getFilename());
+      return;
+    }
+    recentDownloadKeys.set(key, now);
   }
-  const lastTime = recentDownloadKeys.get(key);
-  if (lastTime && now - lastTime < DUPLICATE_DOWNLOAD_WINDOW_MS) {
-    cancelDuplicateDownload(event, item, key, item.getFilename());
-    return;
-  }
-  recentDownloadKeys.set(key, now);
 
   const downloadId = `download-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   const fileName = item.getFilename();
-  const downloadUrl = item.getURL();
-  const pendingMedia = findPendingMediaDownload(item, downloadUrl, webContents, downloadId);
-  const isMediaDownload = Boolean(pendingMedia);
   if (!isMediaDownload) {
     addLog('DOWNLOAD', '非媒体下载(未匹配嗅探)', `${item.getURL()} -> ${fileName}`);
   }
@@ -4219,7 +4227,7 @@ function setupIPC() {
   });
 
   // 书签栏溢出菜单（原生Menu，避免被遮挡）
-  ipcMain.handle('show-bookmark-overflow-menu', async (event, bookmarkIds) => {
+  ipcMain.handle('show-bookmark-overflow-menu', async (event, bookmarkIds, btnRect) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     if (!Array.isArray(bookmarkIds) || bookmarkIds.length === 0) return;
     
@@ -4246,7 +4254,13 @@ function setupIPC() {
     if (menuItems.length === 0) return;
     
     const menu = Menu.buildFromTemplate(menuItems);
-    menu.popup({ window: mainWindow });
+    // 菜单弹出在按钮左侧
+    const popupOpts = { window: mainWindow };
+    if (btnRect && typeof btnRect.x === 'number') {
+      popupOpts.x = Math.round(btnRect.x);
+      popupOpts.y = Math.round(btnRect.y);
+    }
+    menu.popup(popupOpts);
   });
 
   // 下载/嗅探列表右键菜单（原生 Menu，避免被 BrowserView 遮挡）

@@ -428,8 +428,11 @@ body {
 
 /* ========== 书签栏溢出按钮 ========== */
 .bookmark-overflow-btn {
-    width: 28px;
-    height: 28px;
+    position: absolute;
+    top: 4px;
+    right: 0;
+    width: 24px;
+    height: 24px;
     border-radius: 4px;
     background: var(--bg-color);
     display: flex;
@@ -439,78 +442,19 @@ body {
     flex-shrink: 0;
     color: var(--text-secondary);
     transition: all 0.2s;
-    margin-left: 8px;
     border: 1px solid var(--border-color);
+    z-index: 10;
 }
 
 .bookmark-overflow-btn:hover {
     background: var(--hover-color);
     color: var(--text-color);
+    border-color: var(--primary-color);
 }
 
 .bookmark-overflow-btn svg {
     width: 14px;
     height: 14px;
-}
-
-.bookmark-overflow-dropdown {
-    position: fixed;
-    min-width: 220px;
-    max-width: 380px;
-    max-height: 420px;
-    background: var(--surface-color);
-    border: 1px solid var(--border-color);
-    border-radius: 8px;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
-    z-index: 99999;
-    overflow: hidden;
-    display: none;
-}
-
-.bookmark-overflow-list {
-    max-height: 360px;
-    overflow-y: auto;
-    padding: 4px 0;
-}
-
-.bookmark-overflow-list::-webkit-scrollbar {
-    width: 6px;
-}
-
-.bookmark-overflow-list::-webkit-scrollbar-thumb {
-    background: var(--border-color);
-    border-radius: 3px;
-}
-
-.bookmark-overflow-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    cursor: pointer;
-    font-size: 13px;
-    color: var(--text-color);
-    transition: background 0.15s;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.bookmark-overflow-item:hover {
-    background: var(--hover-color);
-}
-
-.bookmark-overflow-item img {
-    width: 16px;
-    height: 16px;
-    border-radius: 2px;
-    flex-shrink: 0;
-}
-
-.bookmark-overflow-item span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
 }
 
 /* ========== 内容区域 ========== */
@@ -947,42 +891,19 @@ body {
 
 /* ========== 媒体项 ========== */
 .media-toolbar {
-    display: grid;
-    grid-template-columns: 1fr 1fr 1fr 1fr;
-    gap: 6px;
-    margin-bottom: 10px;
-}
-
-.media-toolbar.toolbar-3col {
-    grid-template-columns: 1fr 1fr 1fr;
-}
-
-.media-toolbar.toolbar-2col {
-    grid-template-columns: 1fr 1fr;
-}
-
-.media-action-row {
     display: flex;
-    gap: 8px;
+    gap: 12px;
     margin-bottom: 10px;
-}
-
-.media-action-row .media-batch-download-btn {
-    flex: 0 1 auto;
-    margin-bottom: 0;
-}
-
-.media-action-row .media-clear-all {
-    flex: 0 1 auto;
+    flex-wrap: wrap;
 }
 
 .media-sniff-btn {
     height: 32px;
-    padding: 0 8px;
-    border: 1px solid var(--primary-color);
+    padding: 0 16px;
+    border: 1px solid #1677ff;
     border-radius: var(--border-radius);
     background: var(--bg-color);
-    color: var(--primary-color);
+    color: #1677ff;
     cursor: pointer;
     font-size: 12px;
     white-space: nowrap;
@@ -991,95 +912,27 @@ body {
 }
 
 .media-sniff-btn:hover {
-    background: var(--primary-color);
+    background: #1677ff;
     color: #fff;
 }
 
 .media-sniff-btn.active {
-    background: var(--bg-color);
-    color: var(--primary-color);
-    border-color: var(--primary-color);
-    border-width: 2px;
-}
-
-.media-batch-download-btn {
-    height: 36px;
-    padding: 0 12px;
-    border: 1px solid var(--primary-color);
-    border-radius: var(--border-radius);
-    background: var(--bg-color);
-    color: var(--primary-color);
-    cursor: pointer;
-    font-size: 13px;
-    font-weight: 500;
-    transition: all 0.2s;
-    white-space: nowrap;
-}
-
-.media-batch-download-btn:hover {
-    background: var(--primary-color);
-    color: #fff;
-}
-
-.media-download-all {
-    height: 32px;
-    padding: 0 8px;
-    border: none;
-    border-radius: var(--border-radius);
-    background: var(--primary-color);
-    color: #fff;
-    cursor: pointer;
-    font-size: 12px;
-    white-space: nowrap;
-    flex-shrink: 0;
-}
-
-.media-download-all:hover {
-    opacity: 0.9;
-}
-
-.media-pause-download-btn {
-    height: 32px;
-    padding: 0 8px;
-    border: 1px solid var(--primary-color);
-    border-radius: var(--border-radius);
-    background: var(--bg-color);
-    color: var(--primary-color);
-    cursor: pointer;
-    font-size: 12px;
-    transition: all 0.2s;
-    white-space: nowrap;
-    flex-shrink: 0;
-}
-
-.media-pause-download-btn:hover {
-    background: var(--primary-color);
-    color: #fff;
-}
-
-.media-pause-download-btn.paused {
-    border-color: #e6a61c;
-    color: #e6a61c;
-    background: var(--bg-color);
-}
-
-.media-pause-download-btn.paused:hover {
-    background: #e6a61c;
+    background: #1677ff;
     color: #fff;
 }
 
 .media-downloaded-btn {
     height: 32px;
-    padding: 0 8px;
+    padding: 0 16px;
     border: 1px solid #52c41a;
     border-radius: var(--border-radius);
     background: var(--bg-color);
     color: #52c41a;
     cursor: pointer;
     font-size: 12px;
-    transition: all 0.2s;
     white-space: nowrap;
     flex-shrink: 0;
+    transition: all 0.2s;
 }
 
 .media-downloaded-btn:hover {
@@ -1092,6 +945,29 @@ body {
     color: #fff;
 }
 
+.media-batch-row {
+    margin-bottom: 10px;
+    display: inline-flex;
+}
+
+.media-batch-download-btn {
+    height: 28px;
+    padding: 0 14px;
+    border: 1px solid #1677ff;
+    border-radius: var(--border-radius);
+    background: var(--bg-color);
+    color: #1677ff;
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+    transition: all 0.2s;
+}
+
+.media-batch-download-btn:hover {
+    background: #1677ff;
+    color: #fff;
+}
+
 .media-item {
     display: flex;
     align-items: center;
@@ -1100,13 +976,6 @@ body {
     border-radius: var(--border-radius);
     background: var(--bg-color);
     margin-bottom: 8px;
-}
-
-.media-completed-label {
-    font-size: 11px;
-    color: #52c41a;
-    font-weight: 500;
-    margin-left: 8px;
 }
 
 .media-icon {

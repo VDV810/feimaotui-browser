@@ -9,7 +9,7 @@ Unicode True
 
 ; ==================== 基本设置 ====================
 !define PRODUCT_NAME "飞毛腿浏览器"
-!define PRODUCT_VERSION "1.2.12"
+!define PRODUCT_VERSION "1.2.22"
 !define PRODUCT_PUBLISHER "飞毛腿浏览器团队"
 !define PRODUCT_EXE "飞毛腿浏览器.exe"
 !define PRODUCT_REGKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"

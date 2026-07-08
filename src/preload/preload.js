@@ -454,7 +454,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 原生层遮挡处理
   setPanelOpen: (open) => ipcRenderer.invoke('set-panel-open', open),
   showBookmarkMenu: (bookmarkId) => ipcRenderer.invoke('show-bookmark-menu', bookmarkId),
-  showBookmarkOverflowMenu: (bookmarkIds) => ipcRenderer.invoke('show-bookmark-overflow-menu', bookmarkIds),
+  showBookmarkOverflowMenu: (bookmarkIds, btnRect) => ipcRenderer.invoke('show-bookmark-overflow-menu', bookmarkIds, btnRect),
   showDownloadContextMenu: (downloadData) => ipcRenderer.invoke('show-download-context-menu', downloadData),
   showAddressBarMenu: (data) => ipcRenderer.invoke('show-address-bar-menu', data),
 
