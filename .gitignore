@@ -6,3 +6,9 @@ out/
 *.log
 .DS_Store
 Thumbs.db
+
+# Build artifacts
+*.exe
+*.7z
+*.zip
+*.nsh

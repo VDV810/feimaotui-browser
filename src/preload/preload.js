@@ -42,8 +42,8 @@ if (!window.chrome) {
   var FIX_CSS = [
     '#icon-close::before{content:none!important}',
     '#icon-close::after{content:none!important}',
-    '.spaui-icon,.spaui-icon::before,.spaui-icon::after{display:inline-block!important;min-width:14px!important;min-height:14px!important;width:1em!important;height:1em!important;line-height:1!important;-webkit-font-smoothing:antialiased!important}',
-    '.spaui-icon svg{display:inline-block!important;width:1em!important;height:1em!important;min-width:14px!important;min-height:14px!important;overflow:visible!important}'
+    '.spaui-icon,.spaui-icon::before,.spaui-icon::after{display:inline-block!important;min-width:14px!important;min-height:14px!important;line-height:1!important;-webkit-font-smoothing:antialiased!important}',
+    '.spaui-icon svg{display:inline-block!important;min-width:14px!important;min-height:14px!important;overflow:visible!important}'
   ].join('');
 
   function tick() {

@@ -1,6 +1,6 @@
 {
   "name": "feimaotui-browser",
-  "version": "1.2.22",
+  "version": "1.2.24",
   "description": "飞毛腿浏览器 - 快速、安全、功能强大的浏览器",
   "main": "src/main.js",
   "scripts": {
@@ -74,6 +74,7 @@
   },
   "dependencies": {
     "axios": "^1.17.0",
-    "cheerio": "^1.2.0"
+    "cheerio": "^1.2.0",
+    "makensis": "^3.0.5"
   }
 }

@@ -1,8 +1,24 @@
-const { app, BrowserWindow, BrowserView, ipcMain, dialog, session, shell, Menu, Tray, clipboard, desktopCapturer } = require('electron');
+const { app, BrowserWindow, BrowserView, ipcMain, dialog, session, shell, Menu, Tray, clipboard, desktopCapturer, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
 const { execFile } = require('child_process');
+
+// 启用 Chrome 实验性特性，提高网页兼容性
+app.commandLine.appendSwitch('enable-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass');
+app.commandLine.appendSwitch('enable-blink-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass');
+app.commandLine.appendSwitch('disable-features', 'IsolateOrigins,site-per-process');
+
+// 提高下载性能：增加每个域名的最大并发连接数（默认6，改为16）
+app.commandLine.appendSwitch('max-connections-per-server', '16');
+
+// 修复跨域iframe兼容性（千问等阿里系网站需要）
+app.commandLine.appendSwitch('disable-site-isolation-trials', 'true');
+app.commandLine.appendSwitch('disable-web-security', 'true');
+app.commandLine.appendSwitch('allow-file-access-from-files', 'true');
+app.commandLine.appendSwitch('allow-cross-origin-auth-prompt', 'true');
+app.commandLine.appendSwitch('disable-renderer-backgrounding', 'true');
+app.commandLine.appendSwitch('no-sandbox', 'true');
 
 // ==================== 运行日志系统 ====================
 const MAX_LOG_LINES = 5000;
@@ -51,6 +67,7 @@ const AD_BLOCK_RULES = [
 
 function isAdUrl(url) {
   if (!globalState.settings.adblockEnabled) return false;
+  // 检查内置规则
   for (const rule of AD_BLOCK_RULES) {
     const regexPattern = rule
       .replace(/\*\:\/\//g, 'https?://')
@@ -66,6 +83,18 @@ function isAdUrl(url) {
       }
     } catch (e) {}
   }
+  // 检查用户自定义规则（URL模式）
+  for (const rule of globalState.customAdRules) {
+    if (rule.urlPattern) {
+      try {
+        const regex = new RegExp(rule.urlPattern, 'i');
+        if (regex.test(url)) {
+          addLog('ADBLOCK', '拦截自定义广告', url);
+          return true;
+        }
+      } catch (e) {}
+    }
+  }
   return false;
 }
 
@@ -77,6 +106,7 @@ const globalState = {
   bookmarks: [],
   history: [],
   downloads: new Map(),
+  customAdRules: [],  // 用户自定义广告规则（CSS选择器 + URL模式）
   settings: {
     homepage: 'https://www.baidu.com',
     searchEngine: 'baidu',
@@ -89,7 +119,9 @@ const globalState = {
     alwaysTranslateNonCjk: true
   },
   mediaUrls: new Map(),
-  isQuitting: false
+  mediaSizeCache: new Map(), // URL → file size (bytes) from response headers, used when video-element sniffing doesn't have size
+  isQuitting: false,
+  savedTabs: null
 };
 
 const dataPath = path.join(app.getPath('userData'), 'browser-data');
@@ -102,6 +134,8 @@ function loadData() {
     const sp = path.join(dataPath, 'settings.json');
     const dp = path.join(dataPath, 'downloads.json');
     const mp = path.join(dataPath, 'media-urls.json');
+    const tp = path.join(dataPath, 'tabs-session.json');
+    const ap = path.join(dataPath, 'custom-ad-rules.json');
     if (fs.existsSync(bp)) globalState.bookmarks = JSON.parse(fs.readFileSync(bp, 'utf8'));
     if (fs.existsSync(hp)) globalState.history = JSON.parse(fs.readFileSync(hp, 'utf8'));
     if (fs.existsSync(sp)) globalState.settings = { ...globalState.settings, ...JSON.parse(fs.readFileSync(sp, 'utf8')) };
@@ -118,7 +152,59 @@ function loadData() {
       const mediaEntries = JSON.parse(fs.readFileSync(mp, 'utf8'));
       globalState.mediaUrls = new Map(Array.isArray(mediaEntries) ? mediaEntries : []);
     }
+    if (fs.existsSync(tp)) {
+      globalState.savedTabs = JSON.parse(fs.readFileSync(tp, 'utf8'));
+      addLog('SESSION', '加载会话标签页', `${globalState.savedTabs.length} 个`);
+    }
+    if (fs.existsSync(ap)) {
+      globalState.customAdRules = JSON.parse(fs.readFileSync(ap, 'utf8'));
+      addLog('ADBLOCK', '加载自定义广告规则', `${globalState.customAdRules.length} 条`);
+    }
   } catch (e) { addLog('ERROR', '加载数据失败', e.message); }
+}
+
+function saveTabsSession() {
+  try {
+    const tabs = [];
+    globalState.tabs.forEach((tab) => {
+      tabs.push({
+        url: tab.url,
+        title: tab.title,
+        favicon: tab.favicon,
+        zoomLevel: tab.zoomLevel || 0
+      });
+    });
+    fs.writeFileSync(path.join(dataPath, 'tabs-session.json'), JSON.stringify(tabs));
+  } catch (e) { addLog('ERROR', '保存会话失败', e.message); }
+}
+
+// 深色模式CSS和函数（全局，确保createTab中did-finish-load可以调用）
+const darkModeCSS = `
+  html {
+    filter: invert(1) hue-rotate(180deg);
+  }
+  img, video, canvas, svg, picture, iframe {
+    filter: invert(1) hue-rotate(180deg);
+  }
+`;
+
+function applyDarkModeToTab(tab, enabled) {
+  if (!tab.webContents || tab.webContents.isDestroyed()) return;
+  if (enabled) {
+    tab.webContents.executeJavaScript(`
+      if (!document.getElementById('__feimaotui_dark_mode__')) {
+        var s = document.createElement('style');
+        s.id = '__feimaotui_dark_mode__';
+        s.textContent = ${JSON.stringify(darkModeCSS)};
+        document.head.appendChild(s);
+      }
+    `).catch(() => {});
+  } else {
+    tab.webContents.executeJavaScript(`
+      var s = document.getElementById('__feimaotui_dark_mode__');
+      if (s) s.remove();
+    `).catch(() => {});
+  }
 }
 
 function saveData() {
@@ -128,6 +214,8 @@ function saveData() {
     fs.writeFileSync(path.join(dataPath, 'settings.json'), JSON.stringify(globalState.settings));
     fs.writeFileSync(path.join(dataPath, 'downloads.json'), JSON.stringify(Array.from(globalState.downloads.values()).slice(-500)));
     fs.writeFileSync(path.join(dataPath, 'media-urls.json'), JSON.stringify(Array.from(globalState.mediaUrls.entries())));
+    fs.writeFileSync(path.join(dataPath, 'custom-ad-rules.json'), JSON.stringify(globalState.customAdRules || []));
+    saveTabsSession();
   } catch (e) { addLog('ERROR', '保存数据失败', e.message); }
 }
 
@@ -148,7 +236,20 @@ let downloadListenerRegistered = false;
 function createMainWindow() {
   addLog('INFO', '开始创建主窗口');
 
-  // 隐藏默认菜单栏
+  // 恢复上次会话的标签页（在窗口创建前执行，确保渲染进程启动时标签已存在）
+  if (globalState.savedTabs && globalState.savedTabs.length > 0 && globalState.tabs.size === 0) {
+    addLog('SESSION', '开始恢复会话', `${globalState.savedTabs.length} 个标签页`);
+    globalState.savedTabs.forEach((savedTab, index) => {
+      createTab(savedTab.url, {
+        active: index === globalState.savedTabs.length - 1,
+        title: savedTab.title
+      });
+    });
+    globalState.savedTabs = null;
+    addLog('SESSION', '会话恢复完成');
+  }
+
+  // 隐藏默认菜单栏，F12 快捷键独立注册
   Menu.setApplicationMenu(null);
 
   mainWindow = new BrowserWindow({
@@ -157,7 +258,7 @@ function createMainWindow() {
     minWidth: 800,
     minHeight: 600,
     title: '飞毛腿浏览器（BY:老南）',
-    icon: path.join(__dirname, '../assets/icon.png'),
+    icon: path.join(__dirname, '../build/icon.png'),
     // Windows 使用原生标题栏
     frame: true,
     titleBarStyle: 'default',
@@ -182,6 +283,66 @@ function createMainWindow() {
   // 使用 loadURL 而不是 loadFile，兼容性更好
   const fileUrl = 'file://' + indexPath.replace(/\\/g, '/');
   mainWindow.loadURL(fileUrl);
+
+  // 监听文件拖入 → 自动导入书签
+  mainWindow.webContents.session.on('will-download', (event, item, webContents) => {
+    handleDownload(event, item, webContents);
+  });
+  // 使用 webContents 的 file-drop-for-security 来处理拖入的书签文件
+  mainWindow.on('will-prevent-unload', (event) => {});
+  // 监听 preload 发来的关闭按钮诊断信息
+  ipcMain.on('close-btn-diag', (event, url, data) => {
+    try {
+      const items = JSON.parse(data);
+      items.forEach(item => addLog('CLOSE-BTN', '关闭按钮诊断', `url=${url} ${item}`));
+    } catch(e) {
+      addLog('CLOSE-BTN', '关闭按钮诊断', `url=${url} data=${data}`);
+    }
+  });
+
+  // 监听 preload 发来的关闭按钮修复信息
+  ipcMain.on('close-btn-fix', (event, payload) => {
+    try {
+      const candidates = payload.candidates || [];
+      const fixed = payload.fixed || 0;
+      const href = payload.href || '';
+      addLog('CLOSE-FIX', '修复统计', `href=${href} fixed=${fixed}`);
+      candidates.forEach(item => addLog('CLOSE-FIX', '候选元素', item));
+    } catch(e) {
+      addLog('CLOSE-FIX', '修复信息异常', e.message || 'unknown');
+    }
+  });
+
+  // 监听渲染进程发来的拖入文件事件
+  ipcMain.on('file-dropped', async (event, filePath) => {
+    try {
+      const lowerPath = String(filePath || '').toLowerCase();
+      if (!lowerPath.endsWith('.json') && !lowerPath.endsWith('.html') && !lowerPath.endsWith('.htm')) return;
+      const content = fs.readFileSync(filePath, 'utf8');
+      const imported = parseBookmarkFile(content, filePath);
+      if (!imported || imported.length === 0) return;
+      const existingUrls = new Set(globalState.bookmarks.map(b => b.url));
+      let addedCount = 0;
+      let duplicateCount = 0;
+      imported.forEach(item => {
+        if (existingUrls.has(item.url)) { duplicateCount++; return; }
+        existingUrls.add(item.url);
+        globalState.bookmarks.push({
+          id: `bookmark-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          url: item.url, title: item.title || item.url,
+          folder: item.folder || '导入书签', createdAt: Date.now()
+        });
+        addedCount++;
+      });
+      saveData();
+      addLog('BOOKMARK', '拖入导入书签', `新增 ${addedCount} 个，重复 ${duplicateCount} 个`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('bookmarks-imported', { added: addedCount, duplicated: duplicateCount });
+      }
+    } catch (e) {
+      addLog('ERROR', '拖入导入书签失败', e.message);
+    }
+  });
 
   // 设置超时，如果 did-finish-load 不触发，强制显示窗口
   const loadTimeout = setTimeout(() => {
@@ -210,7 +371,39 @@ function createMainWindow() {
         addLog('INFO', '初始标签页已创建');
       }
     }, 300);
+
   });
+
+  // 注册全局 F12 / Ctrl+Shift+I 快捷键打开/关闭当前标签页的开发者工具
+  // 在窗口创建后立即注册，确保快捷键可用
+  let devToolsShortcutRegistered = false;
+  function toggleActiveTabDevTools() {
+    try {
+      var activeTab = globalState.tabs.get(globalState.activeTabId);
+      var wc = null;
+      if (activeTab && activeTab.view && activeTab.view.webContents && !activeTab.view.webContents.isDestroyed()) {
+        wc = activeTab.view.webContents;
+      } else {
+        wc = mainWindow.webContents;
+      }
+      if (wc && !wc.isDestroyed()) {
+        if (wc.isDevToolsOpened()) {
+          wc.closeDevTools();
+        } else {
+          wc.openDevTools({ mode: 'right' });
+        }
+      }
+    } catch(e) {
+      addLog('DEVTOOLS', '切换开发者工具失败', e.message || 'unknown');
+    }
+  }
+  if (!devToolsShortcutRegistered) {
+    const f12Ok = globalShortcut.register('F12', toggleActiveTabDevTools);
+    const csiOk = globalShortcut.register('CommandOrControl+Shift+I', toggleActiveTabDevTools);
+    devToolsShortcutRegistered = true;
+    addLog('INFO', 'F12快捷键注册', f12Ok ? '成功' : '失败');
+    addLog('INFO', 'Ctrl+Shift+I快捷键注册', csiOk ? '成功' : '失败');
+  }
 
   mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
     clearTimeout(loadTimeout);
@@ -235,6 +428,17 @@ function createMainWindow() {
   mainWindow.on('close', (event) => {
     globalState.isQuitting = true;
     saveData();
+    // 正常关闭时清除会话文件，下次启动不恢复标签页
+    // 只有断电/强制关机时 tabs-session.json 才会保留
+    try {
+      const sessionFile = path.join(dataPath, 'tabs-session.json');
+      if (fs.existsSync(sessionFile)) {
+        fs.unlinkSync(sessionFile);
+        addLog('SESSION', '正常关闭，清除会话文件');
+      }
+    } catch (e) {
+      addLog('ERROR', '清除会话文件失败', e.message);
+    }
     if (logAutoClear) {
       runtimeLogs = [];
     }
@@ -299,7 +503,7 @@ function getWheelDirection(inputEvent) {
 function normalizeFontSize(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 16;
-  return Math.max(12, Math.min(28, Math.round(parsed)));
+  return Math.max(8, Math.min(28, Math.round(parsed)));
 }
 
 function applyFontSizeToTab(tab) {
@@ -313,7 +517,7 @@ function applyFontSizeToTab(tab) {
       style.id = styleId;
       document.documentElement.appendChild(style);
     }
-    style.textContent = 'body, body * { font-size: ${fontSize}px !important; }';
+    style.textContent = 'html { font-size: ${fontSize}px !important; }';
   })()`;
   tab.webContents.executeJavaScript(script).catch(error => addLog('SETTINGS', '应用字体大小失败', error.message));
 }
@@ -327,6 +531,10 @@ function resetZoomForActiveTab(tabId = globalState.activeTabId) {
   if (!tab || !tab.webContents) return;
   tab.zoomLevel = 0;
   tab.webContents.setZoomLevel(0);
+  if (globalState.settings) {
+    globalState.settings.defaultZoomLevel = 0;
+    saveData();
+  }
   addLog('SETTINGS', '重置页面缩放', tab.url || tabId);
 }
 
@@ -335,6 +543,18 @@ function applyZoomToTab(tab, nextLevel, reason = '页面缩放') {
   const normalizedLevel = Math.max(-3, Math.min(3, Number(nextLevel) || 0));
   tab.zoomLevel = normalizedLevel;
   tab.webContents.setZoomLevel(normalizedLevel);
+  // 保存缩放级别到设置
+  if (globalState.settings && globalState.settings.defaultZoomLevel !== normalizedLevel) {
+    globalState.settings.defaultZoomLevel = normalizedLevel;
+    saveData();
+  }
+  // 同步缩放级别到所有打开的标签页
+  for (const otherTab of globalState.tabs.values()) {
+    if (otherTab === tab) continue;
+    if (!otherTab.webContents || otherTab.webContents.isDestroyed()) continue;
+    otherTab.zoomLevel = normalizedLevel;
+    otherTab.webContents.setZoomLevel(normalizedLevel);
+  }
   addLog('SETTINGS', reason, `级别: ${normalizedLevel}`);
 }
 
@@ -482,100 +702,13 @@ function showBookmarkEditModal(bookmark) {
 }
 
 let screenshotPickerWindow = null;
-let lastScreenshotDataUrl = null; // 预截取的屏幕图片
 
-async function startRegionScreenshot(tabId) {
+function startRegionScreenshot(tabId) {
   if (screenshotPickerWindow) {
     screenshotPickerWindow.close();
     screenshotPickerWindow = null;
   }
 
-  // 1. 用 capturePage 截取主窗口（不闪烁）
-  try {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-
-    const winImage = await mainWindow.capturePage();
-    const winSize = winImage.getSize();
-    addLog('SCREENSHOT', '主窗口截图', `${winSize.width}x${winSize.height}`);
-
-    // 2. 截取当前活动标签的 BrowserView
-    const tab = globalState.tabs.get(tabId);
-    let viewImage = null;
-    let viewBounds = null;
-
-    if (tab && tab.view && tab.webContents) {
-      viewBounds = tab.view.getBounds();
-      viewImage = await tab.webContents.capturePage();
-      const viewSize = viewImage.getSize();
-      addLog('SCREENSHOT', 'BrowserView截图', `${viewSize.width}x${viewSize.height}, bounds:${JSON.stringify(viewBounds)}`);
-    }
-
-    // 3. 在隐藏窗口中用 canvas 合成完整截图
-    const { screen } = require('electron');
-    const primaryDisplay = screen.getPrimaryDisplay();
-    const { width, height } = primaryDisplay.workAreaSize;
-
-    const composeWin = new BrowserWindow({
-      width: winSize.width,
-      height: winSize.height,
-      show: false,
-      webPreferences: {
-        nodeIntegration: true,
-        contextIsolation: false,
-        offscreen: true
-      }
-    });
-
-    await new Promise(resolve => {
-      composeWin.webContents.once('did-finish-load', async () => {
-        try {
-          // 将合成逻辑注入隐藏窗口
-          const result = await composeWin.webContents.executeJavaScript(`
-            new Promise((resolve) => {
-              const canvas = document.createElement('canvas');
-              canvas.width = ${winSize.width};
-              canvas.height = ${winSize.height};
-              const ctx = canvas.getContext('2d');
-
-              // 绘制主窗口截图
-              const winImg = new Image();
-              winImg.onload = () => {
-                ctx.drawImage(winImg, 0, 0);
-                
-                // 如果有 BrowserView 截图，叠加到正确位置
-                ${viewImage && viewBounds ? `
-                  const viewImg = new Image();
-                  viewImg.onload = () => {
-                    ctx.drawImage(viewImg, ${viewBounds.x}, ${viewBounds.y}, ${viewBounds.width}, ${viewBounds.height});
-                    resolve(canvas.toDataURL('image/png'));
-                  };
-                  viewImg.src = '${viewImage.toDataURL()}';
-                ` : `
-                  resolve(canvas.toDataURL('image/png'));
-                `}
-              };
-              winImg.src = '${winImage.toDataURL()}';
-            });
-          `);
-
-          lastScreenshotDataUrl = result;
-          addLog('SCREENSHOT', '合成截图完成');
-        } catch (e) {
-          addLog('ERROR', '合成失败', e.message);
-          lastScreenshotDataUrl = winImage.toDataURL();
-        }
-        composeWin.close();
-        resolve();
-      });
-      composeWin.loadURL('about:blank');
-    });
-
-  } catch (error) {
-    addLog('ERROR', '截图失败', error.message);
-    return;
-  }
-
-  // 4. 打开截图选择窗口
   const { screen } = require('electron');
   const primaryDisplay = screen.getPrimaryDisplay();
   const { width, height } = primaryDisplay.workAreaSize;
@@ -586,7 +719,7 @@ async function startRegionScreenshot(tabId) {
     x: 0,
     y: 0,
     frame: false,
-    transparent: false,
+    transparent: true,
     alwaysOnTop: true,
     fullscreen: true,
     skipTaskbar: true,
@@ -605,10 +738,7 @@ async function startRegionScreenshot(tabId) {
 
   screenshotPickerWindow.loadFile(path.join(__dirname, 'renderer/screenshot-picker.html'));
 
-  screenshotPickerWindow.webContents.once('did-finish-load', () => {
-    if (lastScreenshotDataUrl) {
-      screenshotPickerWindow.webContents.send('screenshot-image', lastScreenshotDataUrl);
-    }
+  screenshotPickerWindow.once('ready-to-show', () => {
     screenshotPickerWindow.show();
     screenshotPickerWindow.focus();
     addLog('SCREENSHOT', '启动区域截图选择');
@@ -632,11 +762,11 @@ function savePageScreenshot(tab) {
   });
 }
 
-function showPageContextMenu(tabId) {
+function showPageContextMenu(tabId, params) {
   const tab = globalState.tabs.get(tabId);
   if (!tab || !tab.webContents || !mainWindow || mainWindow.isDestroyed()) return;
 
-  const menu = Menu.buildFromTemplate([
+  const menuItems = [
     {
       label: '返回',
       enabled: tab.webContents.canGoBack(),
@@ -651,41 +781,360 @@ function showPageContextMenu(tabId) {
       label: '刷新',
       click: () => tab.webContents.reload()
     },
-    { type: 'separator' },
-    {
+    { type: 'separator' }
+  ];
+
+  // 如果选中文本，添加复制选项
+  if (params && params.selectionText && params.selectionText.trim()) {
+    menuItems.push({
       label: '复制',
       click: () => tab.webContents.copy()
-    },
-    {
+    });
+  }
+
+  // 如果是可编辑区域，添加粘贴选项
+  if (params && (params.isEditable || params.inputFieldType !== 'none')) {
+    menuItems.push({
       label: '粘贴',
       click: () => tab.webContents.paste()
-    },
-    {
-      label: '全选',
-      click: () => tab.webContents.selectAll()
-    },
-    { type: 'separator' },
-    {
-      label: '打印',
-      click: () => tab.webContents.print({ silent: false, printBackground: true })
-    },
-    {
-      label: '截图',
-      click: () => startRegionScreenshot(tabId)
+    });
+    menuItems.push({
+      label: '剪切',
+      click: () => tab.webContents.cut()
+    });
+  }
+
+  menuItems.push({
+    label: '全选',
+    click: () => tab.webContents.selectAll()
+  });
+
+  menuItems.push({ type: 'separator' });
+
+  // 如果是链接，添加"在新标签页打开链接"
+  if (params && params.linkURL) {
+    menuItems.push({
+      label: '在新标签页打开链接',
+      click: () => {
+        createTab(params.linkURL, { active: false });
+      }
+    });
+    menuItems.push({
+      label: '复制链接地址',
+      click: () => {
+        const { clipboard } = require('electron');
+        clipboard.writeText(params.linkURL);
+      }
+    });
+    menuItems.push({ type: 'separator' });
+  }
+
+  // 如果是图片，添加"复制图片"和"将图片另存为"
+  if (params && params.srcURL) {
+    menuItems.push({
+      label: '复制图片',
+      click: () => tab.webContents.copyImageAt(params.x, params.y)
+    });
+    menuItems.push({
+      label: '将图片另存为',
+      click: () => {
+        const { dialog } = require('electron');
+        const fileName = getFileNameFromUrl(params.srcURL) || 'image.png';
+        dialog.showSaveDialog(mainWindow, {
+          title: '将图片另存为',
+          defaultPath: path.join(globalState.settings.downloadPath || app.getPath('downloads'), fileName),
+          filters: [
+            { name: '图片文件', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'] },
+            { name: '所有文件', extensions: ['*'] }
+          ]
+        }).then(result => {
+          if (!result.canceled && result.filePath) {
+            const https = require('https');
+            const http = require('http');
+            const url = require('url');
+            const imgUrl = params.srcURL;
+            const parsedUrl = url.parse(imgUrl);
+            const mod = parsedUrl.protocol === 'https:' ? https : http;
+            const file = fs.createWriteStream(result.filePath);
+            mod.get(imgUrl, (response) => {
+              if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                mod.get(response.headers.location, (redirectResponse) => {
+                  redirectResponse.pipe(file);
+                });
+              } else {
+                response.pipe(file);
+              }
+              file.on('finish', () => {
+                file.close();
+                addLog('INFO', '图片另存为', result.filePath);
+              });
+            }).on('error', (err) => {
+              fs.unlink(result.filePath, () => {});
+              addLog('ERROR', '图片另存为失败', err.message);
+            });
+          }
+        });
+      }
+    });
+    menuItems.push({ type: 'separator' });
+  }
+
+  menuItems.push({
+    label: '打印',
+    click: () => tab.webContents.print({ silent: false, printBackground: true })
+  });
+  menuItems.push({
+    label: '截图',
+    click: () => startRegionScreenshot(tabId)
+  });
+
+  menuItems.push({ type: 'separator' });
+
+  // 标记为广告（支持批量标记）
+  menuItems.push({
+    label: '标记为广告',
+    click: () => {
+      addLog('ADBLOCK', '开始标记广告', `坐标: x=${params.x}, y=${params.y}`);
+      tab.webContents.executeJavaScript(`
+        (function() {
+          // 生成CSS选择器
+          function getSelector(element) {
+            if (element.id) return '#' + CSS.escape(element.id);
+            var path = [];
+            var current = element;
+            while (current && current !== document.body) {
+              var selector = current.tagName.toLowerCase();
+              if (current.className && typeof current.className === 'string') {
+                var classes = current.className.trim().split(/\\s+/).filter(c => c && !/^ad|^banner|^sponsor/i.test(c));
+                if (classes.length > 0) {
+                  selector += '.' + classes.map(c => CSS.escape(c)).join('.');
+                }
+              }
+              var parent = current.parentElement;
+              if (parent) {
+                var siblings = Array.from(parent.children).filter(c => c.tagName === current.tagName);
+                if (siblings.length > 1) {
+                  var index = siblings.indexOf(current) + 1;
+                  selector += ':nth-of-type(' + index + ')';
+                }
+              }
+              path.unshift(selector);
+              current = parent;
+            }
+            return path.join(' > ');
+          }
+          
+          // 从文本选择范围收集元素（只收集最内层元素，避免隐藏大块内容）
+          function collectElementsFromTextSelection() {
+            var selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return [];
+            var range = selection.getRangeAt(0);
+            var elements = [];
+            var seen = new Set();
+            var commonAncestor = range.commonAncestorContainer;
+            if (commonAncestor.nodeType === Node.TEXT_NODE) {
+              commonAncestor = commonAncestor.parentElement;
+            }
+            if (!commonAncestor || commonAncestor === document.body || commonAncestor === document.documentElement) return [];
+            
+            var walker = document.createTreeWalker(commonAncestor, NodeFilter.SHOW_ELEMENT, {
+              acceptNode: function(node) {
+                if (node === document.body || node === document.documentElement) return NodeFilter.FILTER_REJECT;
+                return range.intersectsNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+              }
+            });
+            var node;
+            while ((node = walker.nextNode())) {
+              if (!seen.has(node)) { seen.add(node); elements.push(node); }
+            }
+            
+            // 过滤掉祖先元素，只保留叶子元素
+            var leafElements = elements.filter(function(el) {
+              return !elements.some(function(other) {
+                return other !== el && el.contains(other);
+              });
+            });
+            
+            // 内联元素向上查找到块级容器
+            var inlineTags = {'SPAN':1,'A':1,'STRONG':1,'EM':1,'B':1,'I':1,'U':1,'SMALL':1,'SUB':1,'SUP':1,'LABEL':1,'CODE':1,'MARK':1};
+            var containers = [];
+            var containerSeen = new Set();
+            function addContainer(el) {
+              if (!el || el === document.body || el === document.documentElement) return;
+              if (containerSeen.has(el)) return;
+              containerSeen.add(el);
+              containers.push(el);
+            }
+            leafElements.forEach(function(el) {
+              if (el.matches && el.matches('img, iframe, video, svg, canvas, embed, object, [style*="background-image"]')) {
+                addContainer(el);
+                return;
+              }
+              var current = el, depth = 0;
+              while (current && inlineTags[current.tagName] && depth < 5 && current.parentElement && current.parentElement !== document.body) {
+                current = current.parentElement;
+                depth++;
+              }
+              addContainer(current);
+            });
+            
+            // 只保留最内层容器
+            var result = containers.filter(function(el) {
+              return !containers.some(function(other) {
+                return other !== el && el.contains(other) && !other.contains(el);
+              });
+            });
+            
+            if (result.length > 15) result = result.slice(0, 15);
+            return result;
+          }
+          
+          // 收集所有要标记的元素（去重）
+          var elementsToMark = [];
+          var seenElements = new Set();
+          
+          function addElement(el) {
+            if (!el || el === document.body || el === document.documentElement) return;
+            if (seenElements.has(el)) return;
+            seenElements.add(el);
+            elementsToMark.push({
+              selector: getSelector(el),
+              tagName: el.tagName,
+              text: (el.textContent || '').substring(0, 50).trim(),
+              className: el.className || ''
+            });
+            // 清除选中样式
+            el.removeAttribute('data-feimaotui-selected');
+            el.style.outline = '';
+            el.style.outlineOffset = '';
+          }
+          
+          // 1. 先收集data-feimaotui-selected标记的元素
+          document.querySelectorAll('[data-feimaotui-selected="true"]').forEach(addElement);
+          
+          // 2. 再从文本选择中收集元素
+          collectElementsFromTextSelection().forEach(addElement);
+          
+          // 清除文本选择
+          window.getSelection().removeAllRanges();
+          
+          if (elementsToMark.length > 0) {
+            return JSON.stringify({
+              mode: elementsToMark.length > 1 ? 'batch' : 'single',
+              count: elementsToMark.length,
+              elements: elementsToMark
+            });
+          } else {
+            // 单个标记模式：右键点击的元素
+            var el = document.elementFromPoint(${params.x}, ${params.y});
+            if (!el) return null;
+            return JSON.stringify({
+              mode: 'single',
+              count: 1,
+              elements: [{
+                selector: getSelector(el),
+                tagName: el.tagName,
+                text: (el.textContent || '').substring(0, 50).trim(),
+                className: el.className || ''
+              }]
+            });
+          }
+        })();
+      `, true).then(result => {
+        if (result) {
+          try {
+            var data = JSON.parse(result);
+            var domain = new URL(tab.webContents.getURL()).hostname;
+            var addedCount = 0;
+            var existCount = 0;
+            
+            addLog('ADBLOCK', '标记模式', data.mode === 'batch' ? '批量标记' : '单个标记');
+            
+            data.elements.forEach(function(info) {
+              addLog('ADBLOCK', '获取元素信息', '标签: ' + info.tagName + ', 类名: ' + info.className + ', 文本: ' + info.text);
+              var rule = {
+                selector: info.selector,
+                urlPattern: '',
+                domain: domain,
+                createdAt: Date.now()
+              };
+              // 检查是否已存在
+              var exists = globalState.customAdRules.some(r => r.selector === rule.selector && r.domain === rule.domain);
+              if (!exists) {
+                globalState.customAdRules.push(rule);
+                addedCount++;
+                addLog('ADBLOCK', '保存广告规则', '选择器: ' + info.selector + ', 域名: ' + domain);
+              } else {
+                existCount++;
+                addLog('ADBLOCK', '规则已存在', '选择器: ' + info.selector);
+              }
+            });
+            
+            saveData();
+            addLog('ADBLOCK', '批量保存完成', '新增: ' + addedCount + ' 条, 已存在: ' + existCount + ' 条');
+            
+            // 立即隐藏当前页面的所有匹配元素
+            tab.webContents.executeJavaScript(`
+              (function() {
+                var rules = ${JSON.stringify(data.elements.map(e => e.selector))};
+                var totalCount = 0;
+                rules.forEach(function(selector) {
+                  try {
+                    var els = document.querySelectorAll(selector);
+                    els.forEach(function(el) {
+                      el.setAttribute('style', 'display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important;');
+                      totalCount++;
+                    });
+                  } catch(e) {}
+                });
+                return totalCount;
+              })();
+            `).then(count => {
+              addLog('ADBLOCK', '已隐藏元素', '成功隐藏 ' + count + ' 个元素');
+            }).catch(err => {
+              addLog('ADBLOCK', '隐藏元素失败', err.message);
+            });
+          } catch(e) {
+            addLog('ADBLOCK', '解析失败', e.message);
+          }
+        } else {
+          addLog('ADBLOCK', '未获取到元素', 'elementFromPoint返回null');
+        }
+      }).catch(err => {
+        addLog('ADBLOCK', '执行JS失败', err.message);
+      });
     }
-  ]);
+  });
+
+  // 开发者工具
+  menuItems.push({
+    label: '开发者工具',
+    click: () => {
+      tab.webContents.openDevTools({ mode: 'right' });
+    }
+  });
+
+  const menu = Menu.buildFromTemplate(menuItems);
 
   addLog('INFO', '显示网页右键菜单', tab.url);
   menu.popup({ window: mainWindow });
 }
 
 // ==================== 会话设置 ====================
-function setupSession() {
+function setupSessionHandlersForPartition(sess, partitionLabel) {
   const filter = { urls: ['*://*/*'] };
+  const label = partitionLabel || 'default';
 
-  session.defaultSession.webRequest.onBeforeRequest(filter, (details, callback) => {
+  // onBeforeRequest: 广告拦截 + 崩溃SDK拦截 + URL级媒体嗅探
+  sess.webRequest.onBeforeRequest(filter, (details, callback) => {
     const url = details.url;
     if (isAdUrl(url)) {
+      callback({ cancel: true });
+      return;
+    }
+    // 阻止阿里系监控SDK加载，避免在Electron中触发渲染进程崩溃（千问等）
+    if (url.indexOf('fireyejs') !== -1 || url.indexOf('arms-retcode') !== -1) {
+      addLog('BLOCK', '拦截崩溃SDK(' + label + ')', url.substring(0, 100));
       callback({ cancel: true });
       return;
     }
@@ -698,7 +1147,8 @@ function setupSession() {
     callback({});
   });
 
-  session.defaultSession.webRequest.onBeforeSendHeaders(filter, (details, callback) => {
+  // onBeforeSendHeaders: Range请求媒体嗅探
+  sess.webRequest.onBeforeSendHeaders(filter, (details, callback) => {
     const requestHeaders = details.requestHeaders || {};
     const rangeHeader = requestHeaders.Range || requestHeaders.range;
     if (rangeHeader && isLikelyMediaRequest(details.url, requestHeaders)) {
@@ -711,7 +1161,8 @@ function setupSession() {
     callback({ requestHeaders });
   });
 
-  session.defaultSession.webRequest.onHeadersReceived(filter, (details, callback) => {
+  // onHeadersReceived: Content-Type媒体嗅探
+  sess.webRequest.onHeadersReceived(filter, (details, callback) => {
     const ct = details.responseHeaders['content-type'] || details.responseHeaders['Content-Type'];
     const cd = details.responseHeaders['content-disposition'] || details.responseHeaders['Content-Disposition'];
     const cl = details.responseHeaders['content-length'] || details.responseHeaders['Content-Length'];
@@ -719,6 +1170,11 @@ function setupSession() {
     const contentDisposition = cd && cd[0] ? cd[0] : '';
     const contentLength = cl && cl[0] ? parseInt(cl[0]) : 0;
     if ((contentType && isMediaContentType(contentType)) || isLikelyMediaResponse(details.url, contentType, contentDisposition, contentLength)) {
+      // 缓存文件大小，供 video-element 嗅探时使用
+      if (contentLength > 0) {
+        const normUrl = normalizeMediaDownloadUrl(details.url);
+        globalState.mediaSizeCache.set(normUrl, contentLength);
+      }
       registerMediaCandidate(details.webContentsId, details.url, {
         source: 'response-header',
         type: contentType || getMediaType(details.url),
@@ -730,32 +1186,102 @@ function setupSession() {
     callback({ responseHeaders: details.responseHeaders });
   });
 
-  // 下载监听必须只注册一次。
-  // 之前写在 createTab() 里，导致每创建一个标签页就多注册一个监听器；
-  // 用户点一次下载时，同一个 DownloadItem 会被 N 个监听器重复处理，表现为下载很多相同文件。
-  if (!downloadListenerRegistered) {
-    downloadListenerRegistered = true;
-    session.defaultSession.on('will-download', (event, item, webContents) => {
-      handleDownload(event, item, webContents);
-    });
+  // onCompleted: chunked响应更新媒体大小 + 后过滤小文件
+  sess.webRequest.onCompleted(filter, (details) => {
+    if (details.statusCode !== 200) return;
+    const url = details.url;
+    const tabId = getTabIdFromWebContents(details.webContentsId);
+    
+    // 缓存实际文件大小，供后续 video-element 嗅探使用
+    if (details.responseHeaders) {
+      const cl = details.responseHeaders['content-length'] || details.responseHeaders['Content-Length'];
+      const actualSize = cl && cl[0] ? parseInt(cl[0]) : 0;
+      if (actualSize > 0) {
+        const normUrl = normalizeMediaDownloadUrl(url);
+        globalState.mediaSizeCache.set(normUrl, actualSize);
+      }
+    }
+    
+    if (!tabId) return;
+    const list = globalState.mediaUrls.get(tabId);
+    if (!list) return;
+    const found = list.find(m => m.url === url);
+    if (found && details.responseHeaders) {
+      const cl = details.responseHeaders['content-length'] || details.responseHeaders['Content-Length'];
+      const actualSize = cl && cl[0] ? parseInt(cl[0]) : 0;
+      if (actualSize > 0) {
+        // 更新文件大小
+        if (actualSize > (found.size || 0)) {
+          found.size = actualSize;
+        }
+        // 后过滤：实际大小 < 800KB 且不是流媒体，移除
+        const isStream = /\.(m3u8|mpd)(\?|$)/i.test(url);
+        if (actualSize < 800 * 1024 && !isStream) {
+          const idx = list.indexOf(found);
+          if (idx > -1) {
+            list.splice(idx, 1);
+            addLog('MEDIA', '过滤小文件', `${found.title}: ${actualSize} bytes < 800KB`);
+            saveData();
+          }
+          return;
+        }
+        saveData();
+        addLog('MEDIA', '更新媒体文件大小', `${found.title}: ${actualSize} bytes`);
+      }
+    }
+  });
+
+  // will-download: 下载监听（每个session只需注册一次）
+  sess.on('will-download', (event, item, webContents) => {
+    handleDownload(event, item, webContents);
+  });
+}
+
+function setupSession() {
+  // 为所有会用到的分区注册完整的处理器（广告拦截+媒体嗅探+下载）
+  // defaultSession: 主窗口（标签栏、设置页等）
+  setupSessionHandlersForPartition(session.defaultSession, 'default');
+
+  // persist:main: 普通标签页使用的分区
+  try {
+    setupSessionHandlersForPartition(session.fromPartition('persist:main'), 'persist:main');
+  } catch(e) {
+    addLog('WARN', 'persist:main会话配置失败', e.message || 'unknown');
+  }
+
+  // persist:privacy: 无痕模式标签页使用的分区
+  try {
+    setupSessionHandlersForPartition(session.fromPartition('persist:privacy'), 'persist:privacy');
+  } catch(e) {
+    addLog('WARN', 'persist:privacy会话配置失败', e.message || 'unknown');
   }
 }
 
 function isMediaUrl(url) {
   if (isStaticAssetUrl(url)) return false;
-  const exts = ['.mp4','.webm','.ogg','.ogv','.mkv','.avi','.mov','.flv','.m3u8','.mpd','.m4v','.3gp','.wmv'];
+  // 获取URL路径部分（去掉查询参数）
+  const pathPart = String(url || '').split('?')[0].toLowerCase();
+  // 严格匹配：视频扩展名必须在路径末尾
+  const videoExts = ['.mp4','.webm','.ogg','.ogv','.mkv','.avi','.mov','.flv','.m3u8','.mpd','.m4v','.3gp','.wmv'];
+  const hasVideoExt = videoExts.some(ext => pathPart.endsWith(ext));
+  if (hasVideoExt) return true;
+  // 检查URL参数中的视频标识
   const lower = url.toLowerCase();
-  return exts.some(ext => lower.includes(ext)) ||
-    lower.includes('mime=video') ||
+  return lower.includes('mime=video') ||
     /[?&](type|format|mime|content_type)=([^&]*)(video|mp4|m3u8|mov|webm)/i.test(lower);
 }
 
 function getMediaType(url) {
-  const lower = url.toLowerCase();
-  if (lower.includes('.mp4')) return 'video/mp4';
-  if (lower.includes('.webm')) return 'video/webm';
-  if (lower.includes('.m3u8')) return 'application/x-mpegURL';
-  if (lower.includes('.mpd')) return 'application/dash+xml';
+  // 获取URL路径部分（去掉查询参数）
+  const pathPart = String(url || '').split('?')[0].toLowerCase();
+  if (pathPart.endsWith('.mp4')) return 'video/mp4';
+  if (pathPart.endsWith('.webm')) return 'video/webm';
+  if (pathPart.endsWith('.m3u8')) return 'application/x-mpegURL';
+  if (pathPart.endsWith('.mpd')) return 'application/dash+xml';
+  if (pathPart.endsWith('.mov')) return 'video/quicktime';
+  if (pathPart.endsWith('.mkv')) return 'video/x-matroska';
+  if (pathPart.endsWith('.avi')) return 'video/x-msvideo';
+  if (pathPart.endsWith('.flv')) return 'video/x-flv';
   return 'video/unknown';
 }
 
@@ -811,10 +1337,32 @@ function isLikelyMediaResponse(url, contentType = '', contentDisposition = '', c
 
 function isValidVideoCandidate(url, meta = {}) {
   if (!url || isStaticAssetUrl(url) || isStaticAssetContentType(meta.contentType || meta.type || '')) return false;
-  // 忽略小于 500KB 的文件（除非是流媒体格式如 m3u8/mpd）
+  
+  // 过滤非媒体文件扩展名（.htm, .html, .json, .xml 等）
+  const urlPath = String(url).split('?')[0].toLowerCase();
+  if (/\.(html?|json|xml|css|js|txt|pdf|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|eot)(\?|$|#)/i.test(urlPath)) return false;
+  
+  // 忽略小于 800KB 的文件（除非是流媒体格式如 m3u8/mpd）
   const size = meta.size || meta.contentLength || 0;
   const isStream = /\.(m3u8|mpd)(\?|$)/i.test(String(url || ''));
-  if (size > 0 && size < 500 * 1024 && !isStream) return false;
+  if (size >= 800 * 1024 || isStream) {
+    // 大小已知且 >= 800KB，或者流媒体格式，继续判断
+  } else if (size > 0 && size < 800 * 1024) {
+    // 大小已知但 < 800KB，直接过滤
+    return false;
+  } else {
+    // size === 0（未知大小），需要进一步判断：
+    // 如果是明确的视频类型或视频URL，先放行，后续由 onCompleted 更新大小后再过滤
+    const contentType = String(meta.contentType || meta.type || '').toLowerCase();
+    if (contentType.includes('video/') || contentType.includes('mpegurl') || contentType.includes('dash+xml')) {
+      // 明确是视频类型，放行
+    } else if (isMediaUrl(url)) {
+      // URL 明确是媒体格式，放行
+    } else {
+      // 既没有大小信息，也不是明确的视频类型/URL，过滤掉
+      return false;
+    }
+  }
   const title = String(meta.title || getFileNameFromUrl(url) || '').toLowerCase();
   if (isStaticAssetUrl(title)) return false;
   const contentType = String(meta.contentType || meta.type || '').toLowerCase();
@@ -849,8 +1397,83 @@ function registerMediaCandidate(webContentsId, url, meta = {}) {
   if (!tabId) return null;
   if (!globalState.mediaUrls.has(tabId)) globalState.mediaUrls.set(tabId, []);
   const existing = globalState.mediaUrls.get(tabId);
+
+  // URL 去重：归一化后检查是否已经存在，避免重复加入
+  const normalizedUrl = normalizeMediaDownloadUrl(url);
+  const alreadyExists = existing.some(m => normalizeMediaDownloadUrl(m.url) === normalizedUrl);
+  if (alreadyExists) {
+    addLog('MEDIA', '跳过重复媒体', `${url} (already in list)`);
+    return null;
+  }
+  
+  // 从 URL 或 title 中提取视频基础名称（去掉分辨率标识如 _720p, _1080p, -720, 720p 等）
+  const rawName = String(meta.title || getFileNameFromUrl(url) || '').replace(/\.(mp4|webm|mov|m4v|avi|mkv|flv|wmv)$/i, '');
+  const baseName = rawName.replace(/[_\- ]*(720p|1080p|480p|360p|240p|144p|720|1080|480|360|240|144)[_\- ]*/gi, '').trim() || rawName;
+
+  // 检查是否已有同名视频的多个分辨率版本
+  const sameBase = existing.filter(m => {
+    const mRaw = String(m.title || '').replace(/\.(mp4|webm|mov|m4v|avi|mkv|flv|wmv)$/i, '');
+    const mBase = mRaw.replace(/[_\- ]*(720p|1080p|480p|360p|240p|144p|720|1080|480|360|240|144)[_\- ]*/gi, '').trim() || mRaw;
+    return mBase === baseName && m.url !== url;
+  });
+
+  const newSize = meta.size || meta.contentLength || 0;
+  // 如果嗅探时没有拿到大小，尝试从缓存中查找（onHeadersReceived/onCompleted 提前缓存）
+  if (!newSize) {
+    const normUrl = normalizeMediaDownloadUrl(url);
+    const cachedSize = globalState.mediaSizeCache.get(normUrl);
+    if (cachedSize) {
+      meta.size = cachedSize;
+    }
+  }
+  if (sameBase.length > 0) {
+    const best = sameBase.reduce((a, b) => ((a.size || 0) > (b.size || 0) ? a : b));
+    const bestSize = best.size || 0;
+
+    if (newSize > bestSize) {
+      // 新版本文件更大，移除旧的
+      const idx = existing.indexOf(best);
+      existing.splice(idx, 1);
+      addLog('MEDIA', `发现更高清版本(${meta.source})`, `${best.title} → ${rawName}`);
+    } else if (newSize === bestSize) {
+      // 文件大小相同或都未知，比较 URL 中的分辨率标记
+      const newRes = extractResolution(url);
+      const oldRes = extractResolution(best.url);
+      if (newRes > oldRes) {
+        // 新版本分辨率更高，替换旧的
+        const idx = existing.indexOf(best);
+        existing.splice(idx, 1);
+        addLog('MEDIA', `替换为更高分辨率版本(${meta.source})`, `${oldRes}p → ${newRes}p`);
+      } else if (newRes === oldRes) {
+        // 分辨率相同，保留已有的
+        return null;
+      } else {
+        // 旧版本分辨率更高，忽略新的
+        return null;
+      }
+    } else {
+      // 旧版本更大，忽略新的
+      return null;
+    }
+  }
+
   const found = existing.find(m => m.url === url);
   if (found) {
+    // 检查是否已有同名视频的更高分辨率版本，避免被替换后又加回来
+    const sameBaseNow = existing.filter(m => {
+      const mRaw = String(m.title || '').replace(/\.(mp4|webm|mov|m4v|avi|mkv|flv|wmv)$/i, '');
+      const mBase = mRaw.replace(/[_\- ]*(720p|1080p|480p|360p|240p|144p|720|1080|480|360|240|144)[_\- ]*/gi, '').trim() || mRaw;
+      return mBase === baseName && m.url !== url;
+    });
+    if (sameBaseNow.length > 0) {
+      const best = sameBaseNow.reduce((a, b) => ((a.size || 0) > (b.size || 0) ? a : b));
+      const newRes = extractResolution(url);
+      const bestRes = extractResolution(best.url);
+      if (bestRes > newRes || (best.size || 0) > (meta.size || meta.contentLength || 0)) {
+        // 已有更高清版本，跳过
+        return null;
+      }
+    }
     Object.assign(found, {
       ...meta,
       size: meta.size || found.size || 0,
@@ -860,6 +1483,22 @@ function registerMediaCandidate(webContentsId, url, meta = {}) {
     saveData();
     return found;
   }
+
+  // 再次检查：防止 onHeadersReceived 把被替换掉的低分辨率版本重新加回来
+  const sameBaseFinal = existing.filter(m => {
+    const mRaw = String(m.title || '').replace(/\.(mp4|webm|mov|m4v|avi|mkv|flv|wmv)$/i, '');
+    const mBase = mRaw.replace(/[_\- ]*(720p|1080p|480p|360p|240p|144p|720|1080|480|360|240|144)[_\- ]*/gi, '').trim() || mRaw;
+    return mBase === baseName && m.url !== url;
+  });
+  if (sameBaseFinal.length > 0) {
+    const best = sameBaseFinal.reduce((a, b) => ((a.size || 0) > (b.size || 0) ? a : b));
+    const newRes = extractResolution(url);
+    const bestRes = extractResolution(best.url);
+    if (bestRes > newRes || (best.size || 0) > (meta.size || meta.contentLength || 0)) {
+      return null;
+    }
+  }
+
   const mediaInfo = {
     url,
     type: meta.type || meta.contentType || getMediaType(url),
@@ -876,6 +1515,17 @@ function registerMediaCandidate(webContentsId, url, meta = {}) {
     mainWindow.webContents.send('media-detected', { tabId, media: mediaInfo });
   }
   return mediaInfo;
+}
+
+// 从 URL 中提取分辨率数字（如 720, 1080, 540 等），返回 0 表示未识别
+function extractResolution(url) {
+  const lower = String(url || '').toLowerCase();
+  const match = lower.match(/[_\- ]*(1080|720|540|480|360|240|144)[_\- p]*/i);
+  if (match && match[1]) return parseInt(match[1]);
+  // 也尝试匹配 video_1280x720 这种格式
+  const dimMatch = lower.match(/(\d{2,4})x(\d{2,4})/i);
+  if (dimMatch) return Math.max(parseInt(dimMatch[1]), parseInt(dimMatch[2]));
+  return 0;
 }
 
 function getTabIdFromWebContents(wcId) {
@@ -932,9 +1582,15 @@ function createTab(url = null, options = {}) {
       preload: path.join(__dirname, 'preload', 'preload.js'),
       webSecurity: true,
       sandbox: false,
-      partition: options.privacyMode ? 'persist:privacy' : undefined
+      allowRunningInsecureContent: true,
+      nodeIntegrationInSubFrames: false,
+      partition: options.privacyMode ? 'persist:privacy' : 'persist:main'
     }
   });
+
+  // 伪装成 Chrome 浏览器，避免网页因检测到 Electron 而禁用功能
+  const chromeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  view.webContents.setUserAgent(chromeUserAgent);
 
   const tab = {
     id: tabId,
@@ -948,11 +1604,24 @@ function createTab(url = null, options = {}) {
     webContents: view.webContents,
     view: view,
     referrer: referrer,
-    goPhpFallbackTried: false
+    goPhpFallbackTried: false,
+    openerTabId: options.openerTabId || null
   };
 
-  globalState.tabs.set(tabId, tab);
-  view.webContents.setZoomLevel(0);
+  // 如果有父标签，将新标签插入到父标签右侧
+  if (options.openerTabId && globalState.tabs.has(options.openerTabId)) {
+    const newTabs = new Map();
+    for (const [key, value] of globalState.tabs) {
+      newTabs.set(key, value);
+      if (key === options.openerTabId) {
+        newTabs.set(tabId, tab);
+      }
+    }
+    globalState.tabs = newTabs;
+  } else {
+    globalState.tabs.set(tabId, tab);
+  }
+  view.webContents.setZoomLevel((globalState.settings && typeof globalState.settings.defaultZoomLevel === 'number') ? globalState.settings.defaultZoomLevel : 0);
 
   // 关键修复：把来源页的 Referer 一并传给目标页，避免中转脚本判定为站外访问
   const loadOptions = {};
@@ -978,10 +1647,40 @@ function createTab(url = null, options = {}) {
     addLog('TAB', '页面加载完成', `${tab.title} | ${tab.url}`);
     notifyTabUpdate(tabId, { title: tab.title, url: tab.url });
     addToHistory(tab.url, tab.title);
-    view.webContents.setZoomLevel(0);
-    applyZoomToTab(tab, tab.zoomLevel || 0, '页面加载应用缩放');
+    // 不再强制重置缩放为0，使用保存的缩放级别
+    var savedZoom = (globalState.settings && typeof globalState.settings.defaultZoomLevel === 'number') ? globalState.settings.defaultZoomLevel : 0;
+    if (typeof tab.zoomLevel !== 'number') tab.zoomLevel = savedZoom;
+    view.webContents.setZoomLevel(tab.zoomLevel);
+    applyZoomToTab(tab, tab.zoomLevel, '页面加载应用缩放');
     applyFontSizeToTab(tab);
-    setTimeout(() => autoTranslatePageIfNeeded(tabId), 1200);
+
+    // 如果深色模式开启，向新页面注入深色CSS
+    const settings = globalState.settings || {};
+    if (settings.darkMode) {
+      applyDarkModeToTab(tab, true);
+    }
+
+    // 修复微信小店客服弹窗位置：强制覆盖 iframe top 值
+    view.webContents.insertCSS(`
+      /* 微信小店客服 iframe 被错误下拉，强制修正 */
+      .assistant-iframe,
+      iframe[src*="platformkfim"] {
+        top: 0 !important;
+      }
+    `).catch(() => {});
+
+    // 注入自定义广告规则CSS：隐藏用户标记的广告元素
+    if (globalState.customAdRules && globalState.customAdRules.length > 0) {
+      const currentDomain = new URL(tab.url).hostname;
+      const domainRules = globalState.customAdRules.filter(r => r.domain === currentDomain || r.domain === '*');
+      if (domainRules.length > 0) {
+        const adCss = domainRules.map(r => `${r.selector} { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; }`).join('\n');
+        view.webContents.insertCSS(adCss).catch(() => {});
+        addLog('ADBLOCK', '注入广告规则CSS', `${domainRules.length} 条规则 (${currentDomain})`);
+      }
+    }
+
+        setTimeout(() => autoTranslatePageIfNeeded(tabId), 1200);
 
     // ==================== go.php / 中转页兜底 ====================
     // 若页面仍然停留在 go.php?url=base64... 之类的中转地址(标题为"温馨提示"等)，
@@ -1007,8 +1706,331 @@ function createTab(url = null, options = {}) {
     }
   });
 
-  view.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+  view.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    // ERR_ABORTED (-3) 是正常的导航取消，不需要报错
+    if (errorCode === -3) return;
     addLog('ERROR', '页面加载失败', `${validatedURL} | ${errorDescription} (${errorCode})`);
+  });
+
+  // 监听子 frame 加载完成，用于诊断 iframe 加载问题
+  view.webContents.on('did-frame-finish-load', (event, isMainFrame, frameProcessId, frameRoutingId) => {
+    if (!isMainFrame) {
+      try {
+        // 尝试获取子 frame 的 URL（注意：部分 Electron 版本 getAllFrames 不可用）
+        let frameUrl = '';
+        try {
+          if (typeof view.webContents.getAllFrames === 'function') {
+            const allFrames = view.webContents.getAllFrames();
+            const frame = allFrames.find(f => f.routingId === frameRoutingId);
+            if (frame) frameUrl = frame.url;
+          }
+        } catch(e) {}
+        addLog('FRAME', '子框架加载完成', `url=${frameUrl.substring(0, 120)} routingId=${frameRoutingId}`);
+      } catch(e) {
+        addLog('FRAME', '子框架加载完成', `routingId=${frameRoutingId}`);
+      }
+    }
+  });
+
+  // ========== 腾讯广告面板X按钮检测（主进程驱动，可扫描iframe） ==========
+  var _panelScanTimer = null;
+  var _lastPanelSig = '';
+
+  function scanForPanel() {
+    // 已禁用：改用 preload.js 的 MutationObserver 监听 splitview 面板
+    // 之前的扫描会误检测到 spaui-alert-close 等元素
+    return;
+    if (!view || !view.webContents || view.webContents.isDestroyed()) return;
+    var url = view.webContents.getURL();
+    if (!url || url.indexOf('ad.qq.com') === -1) return;
+
+    view.webContents.executeJavaScript(`
+      (function() {
+        var vw = window.innerWidth || 1920;
+        var vh = window.innerHeight || 1080;
+        var results = [];
+
+        function buildSelector(el, doc) {
+          try {
+            var parts = [];
+            var node = el;
+            for (var d = 0; d < 12 && node && node.nodeType === 1; d++) {
+              var part = node.tagName.toLowerCase();
+              if (node.id) {
+                part += '#' + node.id.replace(/"/g, '\\\\"');
+                parts.unshift(part);
+                break;
+              }
+              var parent = node.parentNode;
+              if (parent && parent.children) {
+                var sibs = parent.children;
+                var nth = 1;
+                for (var si = 0; si < sibs.length; si++) {
+                  if (sibs[si] === node) { nth = si + 1; break; }
+                }
+                part += ':nth-child(' + nth + ')';
+              }
+              parts.unshift(part);
+              node = node.parentElement;
+            }
+            return parts.join(' > ');
+          } catch(e) { return ''; }
+        }
+
+        function isVisible(el, dw) {
+          if (!el) return false;
+          var style;
+          try { style = dw.getComputedStyle(el); } catch(e) { return false; }
+          if (!style) return false;
+          if (style.display === 'none' || style.visibility === 'hidden') return false;
+          if (parseFloat(style.opacity) < 0.1) return false;
+          var rect;
+          try { rect = el.getBoundingClientRect(); } catch(e) { return false; }
+          if (!rect || rect.width < 4 || rect.height < 4) return false;
+          return rect;
+        }
+
+        function searchInDoc(doc, baseX, baseY, iframeIdx) {
+          var docResults = [];
+          if (!doc) return docResults;
+          var dw = doc.defaultView || window;
+
+          // 策略1：直接查找 id="icon-close"（腾讯广告专用）
+          var iconClose = doc.getElementById('icon-close');
+          if (iconClose) {
+            var rect = isVisible(iconClose, dw);
+            if (rect) {
+              docResults.push({
+                tag: iconClose.tagName,
+                cls: ((iconClose.className || '').toString()).substring(0, 100),
+                text: ((iconClose.textContent || '').trim()).substring(0, 20),
+                left: Math.round(baseX + rect.left),
+                top: Math.round(baseY + rect.top),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+                score: 999,
+                selector: '#' + iconClose.id,
+                inIframe: iframeIdx !== undefined,
+                iframeIdx: iframeIdx || 0
+              });
+            }
+          }
+
+          // 策略2：查找其他 id 包含 close 的元素
+          if (docResults.length === 0) {
+            var allWithId = doc.querySelectorAll('[id]');
+            for (var ii = 0; ii < allWithId.length; ii++) {
+              var el = allWithId[ii];
+              var eid = (el.id || '').toLowerCase();
+              if (eid.indexOf('close') === -1 && eid.indexOf('shut') === -1 && eid.indexOf('cancel') === -1) continue;
+              if (eid === 'icon-close') continue; // 已在策略1处理
+              var rect = isVisible(el, dw);
+              if (!rect) continue;
+              if (rect.width > 80 || rect.height > 80) continue;
+              if (rect.top > vh * 0.5) continue;
+              docResults.push({
+                tag: el.tagName,
+                cls: ((el.className || '').toString()).substring(0, 100),
+                text: ((el.textContent || '').trim()).substring(0, 20),
+                left: Math.round(baseX + rect.left),
+                top: Math.round(baseY + rect.top),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+                score: 500,
+                selector: buildSelector(el, doc),
+                inIframe: iframeIdx !== undefined,
+                iframeIdx: iframeIdx || 0
+              });
+              break; // 只取第一个
+            }
+          }
+
+          // 策略3：查找 class 包含 close 的小元素（<i>、<button>、<span>、<a>）
+          if (docResults.length === 0) {
+            var candidates = doc.querySelectorAll('i[class*="close"], button[class*="close"], span[class*="close"], a[class*="close"], div[class*="close"]');
+            for (var ci = 0; ci < candidates.length; ci++) {
+              var el = candidates[ci];
+              var rect = isVisible(el, dw);
+              if (!rect) continue;
+              if (rect.width > 60 || rect.height > 60) continue;
+              if (rect.top > vh * 0.5) continue;
+              var cls = ((el.className || '').toString()).toLowerCase();
+              // 排除 remove 类
+              if (cls.indexOf('remove') !== -1 && cls.indexOf('close') === -1) continue;
+              docResults.push({
+                tag: el.tagName,
+                cls: cls.substring(0, 100),
+                text: ((el.textContent || '').trim()).substring(0, 20),
+                left: Math.round(baseX + rect.left),
+                top: Math.round(baseY + rect.top),
+                width: Math.round(rect.width),
+                height: Math.round(rect.height),
+                score: 300,
+                selector: buildSelector(el, doc),
+                inIframe: iframeIdx !== undefined,
+                iframeIdx: iframeIdx || 0
+              });
+              break;
+            }
+          }
+
+          // 策略4：查找 splitview 面板内的关闭按钮
+          if (docResults.length === 0) {
+            var splitview = doc.getElementById('splitview');
+            if (splitview) {
+              var scls = ((splitview.className || '').toString()).toLowerCase();
+              if (scls.indexOf('show') !== -1) {
+                var svChildren = splitview.querySelectorAll('*');
+                for (var si = 0; si < svChildren.length; si++) {
+                  var el = svChildren[si];
+                  var tag = el.tagName;
+                  if (tag !== 'I' && tag !== 'BUTTON' && tag !== 'SPAN' && tag !== 'A' && tag !== 'DIV') continue;
+                  var ecl = ((el.className || '').toString()).toLowerCase();
+                  if (ecl.indexOf('close') === -1 && ecl.indexOf('cancel') === -1 && ecl.indexOf('fold') === -1) continue;
+                  var rect = isVisible(el, dw);
+                  if (!rect) continue;
+                  if (rect.width > 60 || rect.height > 60) continue;
+                  docResults.push({
+                    tag: el.tagName,
+                    cls: ecl.substring(0, 100),
+                    text: ((el.textContent || '').trim()).substring(0, 20),
+                    left: Math.round(baseX + rect.left),
+                    top: Math.round(baseY + rect.top),
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    score: 400,
+                    selector: buildSelector(el, doc),
+                    inIframe: iframeIdx !== undefined,
+                    iframeIdx: iframeIdx || 0
+                  });
+                  break;
+                }
+              }
+            }
+          }
+
+          return docResults;
+        }
+
+        // 搜索主文档
+        var allResults = searchInDoc(document, 0, 0);
+
+        // 搜索同源iframe
+        var iframes = document.querySelectorAll('iframe');
+        for (var fi = 0; fi < iframes.length; fi++) {
+          try {
+            var iframe = iframes[fi];
+            var iRect = iframe.getBoundingClientRect();
+            if (iRect.width < 100 || iRect.height < 100) continue;
+            if (iRect.top > vh + 100 || iRect.bottom < -100) continue;
+            var idoc = null;
+            try { idoc = iframe.contentDocument; } catch(e) {}
+            if (!idoc) continue;
+            var iframeResults = searchInDoc(idoc, iRect.left, iRect.top, fi);
+            allResults = allResults.concat(iframeResults);
+          } catch(e) {}
+        }
+
+        if (allResults.length > 0) {
+          allResults.sort(function(a, b) { return b.score - a.score; });
+          var best = allResults[0];
+          window.__feimaotuiCloseTarget = best;
+          return JSON.stringify({
+            found: true,
+            closeBtn: best,
+            total: allResults.length,
+            top3: allResults.slice(0, 3).map(function(b) {
+              return { score: b.score, tag: b.tag, text: b.text, cls: (b.cls||'').substring(0,60), left: b.left, top: b.top, iframe: b.inIframe, selector: (b.selector||'').substring(0,80) };
+            })
+          });
+        }
+        window.__feimaotuiCloseTarget = null;
+        return JSON.stringify({ found: false, total: 0 });
+      })();
+    `).then(function(result) {
+      try {
+        var data = JSON.parse(result);
+        if (data.found && data.closeBtn) {
+          var btn = data.closeBtn;
+          var sig = btn.selector || (btn.left + ',' + btn.top + ',' + btn.score);
+          if (sig !== _lastPanelSig) {
+            _lastPanelSig = sig;
+            addLog('CLOSE-FIX', '检测到关闭按钮', 'score=' + btn.score + ' left=' + btn.left + ' top=' + btn.top +
+              ' tag=' + btn.tag + ' cls=' + (btn.cls || '').substring(0, 50) + ' text="' + btn.text + '"' +
+              ' selector=' + (btn.selector || '').substring(0, 80) +
+              (btn.inIframe ? ' [iframe#' + btn.iframeIdx + ']' : '') +
+              ' candidates=' + data.total);
+            if (data.top3) {
+              for (var ti = 0; ti < data.top3.length; ti++) {
+                addLog('CLOSE-FIX', '候选[' + ti + ']', 'score=' + data.top3[ti].score + ' tag=' + data.top3[ti].tag + ' cls=' + data.top3[ti].cls + ' selector=' + data.top3[ti].selector);
+              }
+            }
+          }
+          // 直接修复原始关闭按钮的图标显示（不创建覆盖框）
+          view.webContents.send('feimaotui-fix-close-btn', {
+            selector: btn.selector || '',
+            inIframe: btn.inIframe || false,
+            iframeIdx: btn.iframeIdx || 0
+          });
+        } else {
+          _lastPanelSig = '';
+        }
+      } catch(e) {
+        addLog('CLOSE-FIX', '解析检测结果异常', e.message || 'unknown');
+      }
+    }).catch(function(e) {});
+  }
+
+  // 页面加载完成后开始扫描
+  view.webContents.on('did-finish-load', () => {
+    addLog('CLOSE-FIX', 'did-finish-load', '开始扫描面板');
+    _lastPanelSig = '';
+    setTimeout(scanForPanel, 2000);
+    if (_panelScanTimer) clearInterval(_panelScanTimer);
+    _panelScanTimer = setInterval(scanForPanel, 1500);
+    setTimeout(function() { if (_panelScanTimer) { clearInterval(_panelScanTimer); _panelScanTimer = null; } }, 300000);
+  });
+
+  // 页面导航开始时清除状态
+  view.webContents.on('did-start-navigation', (event, url, isInPlace, isMainFrame) => {
+    if (isMainFrame) {
+      addLog('CLOSE-FIX', 'did-start-navigation', '延迟扫描');
+      _lastPanelSig = '';
+      setTimeout(scanForPanel, 3000);
+    }
+  });
+
+  // 监听渲染进程崩溃
+  view.webContents.on('render-process-gone', (event, details) => {
+    addLog('ERROR', '渲染进程崩溃', `reason=${details.reason} exitCode=${details.exitCode}`);
+    // 崩溃后延迟1秒自动重新加载页面
+    var crashUrl = tab.url || view.webContents.getURL();
+    if (crashUrl && crashUrl !== 'about:blank') {
+      addLog('INFO', '崩溃恢复', '1秒后自动重新加载页面...');
+      setTimeout(function() {
+        try {
+          if (!view.webContents.isDestroyed()) {
+            view.webContents.loadURL(crashUrl);
+            addLog('INFO', '崩溃恢复', '页面已重新加载');
+          }
+        } catch(e) {
+          addLog('ERROR', '崩溃恢复失败', e.message || 'unknown');
+        }
+      }, 1000);
+    }
+  });
+
+  // 监听证书错误
+  view.webContents.on('certificate-error', (event, url, error, certificate, callback) => {
+    addLog('WARN', '证书错误', `url=${url.substring(0, 80)} error=${error}`);
+    callback(false);
+  });
+
+  // 监听页面控制台消息，捕获 iframe 内的错误
+  view.webContents.on('console-message', (event, level, message, line, sourceId) => {
+    if (level >= 2) { // warn 和 error
+      addLog('CONSOLE', `[${['debug','log','warn','error'][level] || '?'}]`, `${message} (${sourceId}:${line})`);
+    }
   });
 
   view.webContents.on('page-title-updated', (event, title) => {
@@ -1024,7 +2046,8 @@ function createTab(url = null, options = {}) {
   });
 
   // 拦截所有非 http/https 协议的链接，避免弹出系统"找不到应用"对话框
-  const isUnknownProtocol = (url) => /^[a-z][a-z0-9+.-]*:/i.test(url) && !/^https?:/i.test(url);
+  // 允许 about: 协议（iframe 初始化需要 about:blank）
+  const isUnknownProtocol = (url) => /^[a-z][a-z0-9+.-]*:/i.test(url) && !/^(https?|about):/i.test(url);
 
   // 调试日志：记录所有导航事件，帮助追踪 bytedance 弹窗来源
   view.webContents.on('will-navigate', (event, url) => {
@@ -1043,6 +2066,62 @@ function createTab(url = null, options = {}) {
       return;
     }
     addLog('NAV', 'did-start-navigation', `url=${url} isMainFrame=${isMainFrame}`);
+
+    // 在主帧导航开始时注入浏览器伪装代码，确保网页脚本运行前环境已伪装
+    if (isMainFrame) {
+      view.webContents.executeJavaScript(`
+        (function() {
+          if (window.__feimaotuiSpoofed) return;
+          window.__feimaotuiSpoofed = true;
+
+          // 伪装 navigator 核心属性
+          var _realUA = navigator.userAgent;
+          var _spoofedUA = _realUA.replace(/Electron\/[\d.]+\s?/g, '').replace(/Feimaotui-Browser\/[\d.]+\s?/g, '');
+          Object.defineProperty(navigator, 'userAgent', {
+            get: function() { return _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'; }
+          });
+          Object.defineProperty(navigator, 'vendor', {
+            get: function() { return 'Google Inc.'; }
+          });
+          Object.defineProperty(navigator, 'platform', {
+            get: function() { return 'Win32'; }
+          });
+          Object.defineProperty(navigator, 'webdriver', {
+            get: function() { return false; }
+          });
+          Object.defineProperty(navigator, 'languages', {
+            get: function() { return ['zh-CN', 'zh', 'en']; }
+          });
+          Object.defineProperty(navigator, 'hardwareConcurrency', {
+            get: function() { return 8; }
+          });
+          Object.defineProperty(navigator, 'deviceMemory', {
+            get: function() { return 8; }
+          });
+
+          // 删除 Electron 痕迹
+          try {
+            if (window.process && window.process.versions) {
+              delete window.process.versions.electron;
+              delete window.process.versions.node;
+              delete window.process.versions.chrome;
+            }
+            try { delete window.process; } catch(e) {}
+          } catch(e) {}
+
+          // 伪装 window.chrome
+          if (!window.chrome) {
+            window.chrome = {
+              runtime: { connect: function(){}, sendMessage: function(){} },
+              loadTimes: function() { return { commitLoadTime: Date.now()/1000, connectionInfo: 'http/1.1', finishDocumentLoadTime: Date.now()/1000, finishLoadTime: Date.now()/1000, firstPaintAfterLoadTime: 0, firstPaintTime: Date.now()/1000, navigationType: 'Other', npnNegotiatedProtocol: 'unknown', wasAlternateProtocolAvailable: false, wasFetchedViaSpdy: true, wasNpnNegotiated: true }; },
+              csi: function() { return { onloadT: Date.now(), pageT: 300, startE: Date.now()-300, tran: 15 }; },
+              app: { isInstalled: false, InstallState: { INSTALLED: 'installed', DISABLED: 'disabled', NOT_INSTALLED: 'not_installed' }, RunningState: { RUNNING: 'running', CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run' } },
+              storage: {}
+            };
+          }
+        })();
+      `, true).catch(() => {});
+    }
   });
 
   view.webContents.on('will-frame-navigate', (event, url, isMainFrame, frameProcessId, frameRoutingId) => {
@@ -1060,8 +2139,12 @@ function createTab(url = null, options = {}) {
       return { action: 'deny' };
     }
     addLog('NAV', 'setWindowOpenHandler', `url=${url} disposition=${disposition}`);
+    // 微信小店客服/平台相关页面：允许窗口正常打开，否则页面 JS 初始化会失败
+    if (/platformkfim|shop\/kf|shop\/platform/i.test(url)) {
+      return { action: 'allow' };
+    }
     const refUrl = (referrer && referrer.url) ? referrer.url : (tab.url || view.webContents.getURL() || '');
-    createTab(url, { referrer: refUrl });
+    createTab(url, { referrer: refUrl, openerTabId: tabId });
     return { action: 'deny' };
   });
 
@@ -1077,7 +2160,7 @@ function createTab(url = null, options = {}) {
   // 右键菜单：禁用 BrowserView 默认菜单，用自定义 context-menu 事件
   view.webContents.setIgnoreMenuShortcuts(true);
   view.webContents.on('context-menu', (e, params) => {
-    showPageContextMenu(tabId);
+    showPageContextMenu(tabId, params);
   });
 
   // Ctrl+滚轮页面缩放 - 在BrowserView层面监听
@@ -1103,10 +2186,22 @@ function createTab(url = null, options = {}) {
     }
   });
 
+  // F5 刷新 - 使用 before-input-event 更可靠地捕获键盘事件
+  view.webContents.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown' && input.key === 'F5') {
+      event.preventDefault();
+      view.webContents.reload();
+      addLog('NAV', 'F5 刷新页面', tab.url);
+    }
+  });
+
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('tab-created', {
-      id: tabId, url: tab.url, title: tab.title, active: options.active !== false
+      id: tabId, url: tab.url, title: tab.title, active: options.active !== false,
+      openerTabId: options.openerTabId || null
     });
+    // 自动保存会话
+    saveTabsSession();
   }
 
   if (options.active !== false) {
@@ -1160,6 +2255,8 @@ function closeTab(tabId) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('tab-closed', { tabId });
   }
+  // 自动保存会话
+  saveTabsSession();
 }
 
 function reorderTabs(tabIds) {
@@ -1181,6 +2278,8 @@ function reorderTabs(tabIds) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('tabs-reordered', { tabIds: Array.from(reordered.keys()) });
   }
+  // 自动保存会话（排序变化）
+  saveTabsSession();
   return true;
 }
 
@@ -1328,7 +2427,11 @@ function ensureUniqueFilePath(dir, fileName) {
 function buildMediaSaveFileName(pendingMedia, originalFileName) {
   if (!pendingMedia || !pendingMedia.roughName) return originalFileName;
   const baseName = sanitizeRoughMediaTitle(pendingMedia.fileName || pendingMedia.title || originalFileName);
-  const extension = getSafeExtension(originalFileName || pendingMedia.url);
+  // 从URL提取扩展名，避免服务器返回的.htm被误用
+  let extension = getSafeExtension(pendingMedia.url || originalFileName);
+  if (extension === '.htm' || extension === '.html') {
+    extension = '.mp4';
+  }
   return `${baseName}${extension}`;
 }
 
@@ -1353,7 +2456,7 @@ function findRecentPendingMediaDownload(webContents) {
   const webContentsId = webContents && webContents.id;
   let best = null;
   for (const [key, pending] of pendingMediaDownloads.entries()) {
-    if (!pending || !pending.roughName) continue;
+    if (!pending) continue;
     if (webContentsId && pending.webContentsId && pending.webContentsId !== webContentsId) continue;
     if (now - (pending.startedAt || 0) > PENDING_MEDIA_FALLBACK_WINDOW_MS) continue;
     if (!best || (pending.startedAt || 0) > (best.startedAt || 0)) {
@@ -1361,13 +2464,12 @@ function findRecentPendingMediaDownload(webContents) {
     }
   }
   if (best) {
-    best.roughName = true;
     pendingMediaDownloads.get(best.key).roughName = true;
   }
   return best;
 }
 
-function findPendingMediaDownload(item, downloadUrl, webContents) {
+function findPendingMediaDownload(item, downloadUrl, webContents, _downloadId) {
   const candidates = getDownloadUrlCandidates(item, downloadUrl);
   const normalizedCandidates = new Set(candidates.map(normalizeMediaDownloadUrl).filter(Boolean));
 
@@ -1383,7 +2485,11 @@ function findPendingMediaDownload(item, downloadUrl, webContents) {
     }
   }
 
-  return findRecentPendingMediaDownload(webContents);
+  const fallback = findRecentPendingMediaDownload(webContents);
+  if (fallback) {
+    addLog('DOWNLOAD', '媒体匹配(时间fallback)', `${item.getFilename()} -> ${fallback.fileName || fallback.url}`);
+  }
+  return fallback;
 }
 
 function cancelDuplicateDownload(event, item, key, reason) {
@@ -1401,25 +2507,32 @@ function handleDownload(event, item, webContents) {
   }
   processedDownloadItems.add(item);
 
-  const now = Date.now();
-  const key = buildDownloadKey(item);
-  for (const [oldKey, oldTime] of recentDownloadKeys) {
-    if (now - oldTime > DUPLICATE_DOWNLOAD_WINDOW_MS) {
-      recentDownloadKeys.delete(oldKey);
+  const downloadUrl = item.getURL();
+  const pendingMedia = findPendingMediaDownload(item, downloadUrl, webContents, '');
+  const isMediaDownload = Boolean(pendingMedia);
+
+  // 媒体下载跳过recentDownloadKeys去重（由download-media-list统一调度）
+  if (!isMediaDownload) {
+    const now = Date.now();
+    const key = buildDownloadKey(item);
+    for (const [oldKey, oldTime] of recentDownloadKeys) {
+      if (now - oldTime > DUPLICATE_DOWNLOAD_WINDOW_MS) {
+        recentDownloadKeys.delete(oldKey);
+      }
     }
+    const lastTime = recentDownloadKeys.get(key);
+    if (lastTime && now - lastTime < DUPLICATE_DOWNLOAD_WINDOW_MS) {
+      cancelDuplicateDownload(event, item, key, item.getFilename());
+      return;
+    }
+    recentDownloadKeys.set(key, now);
   }
-  const lastTime = recentDownloadKeys.get(key);
-  if (lastTime && now - lastTime < DUPLICATE_DOWNLOAD_WINDOW_MS) {
-    cancelDuplicateDownload(event, item, key, item.getFilename());
-    return;
-  }
-  recentDownloadKeys.set(key, now);
 
   const downloadId = `download-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   const fileName = item.getFilename();
-  const downloadUrl = item.getURL();
-  const pendingMedia = findPendingMediaDownload(item, downloadUrl, webContents);
-  const isMediaDownload = Boolean(pendingMedia);
+  if (!isMediaDownload) {
+    addLog('DOWNLOAD', '非媒体下载(未匹配嗅探)', `${item.getURL()} -> ${fileName}`);
+  }
   if (isMediaDownload) pendingMediaDownloads.delete(pendingMedia.key);
   const saveFileName = isMediaDownload ? buildMediaSaveFileName(pendingMedia, fileName) : fileName;
   if (!fs.existsSync(globalState.settings.downloadPath)) {
@@ -1542,6 +2655,60 @@ function resumeDownload(downloadId) {
   } catch (error) {
     return { success: false, error: error.message };
   }
+}
+
+// 一键暂停所有进行中的下载
+function pauseAllDownloads() {
+  let count = 0;
+  for (const [downloadId, info] of globalState.downloads) {
+    if (info.state === 'progressing' && !info.paused) {
+      const item = downloadItems.get(downloadId);
+      if (item && !item.isPaused()) {
+        try { item.pause(); } catch (e) {}
+      }
+      info.paused = true;
+      info.state = 'progressing';
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('download-progress', info);
+      count++;
+    }
+  }
+  addLog('DOWNLOAD', '一键暂停全部下载', `共暂停 ${count} 个任务`);
+  return { success: true, pausedCount: count };
+}
+
+// 一键继续所有已暂停的下载
+function resumeAllDownloads() {
+  let count = 0;
+  for (const [downloadId, info] of globalState.downloads) {
+    if (info.state === 'progressing' && info.paused) {
+      const item = downloadItems.get(downloadId);
+      if (item) {
+        try {
+          if (item.canResume && item.canResume()) item.resume();
+          else if (item.isPaused()) item.resume();
+        } catch (e) {}
+      }
+      info.paused = false;
+      info.state = 'progressing';
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('download-progress', info);
+      count++;
+    }
+  }
+  addLog('DOWNLOAD', '一键继续全部下载', `共继续 ${count} 个任务`);
+  return { success: true, resumedCount: count };
+}
+
+// 获取所有下载的暂停状态
+function getAllDownloadPauseState() {
+  let total = 0;
+  let pausedCount = 0;
+  for (const [downloadId, info] of globalState.downloads) {
+    if (info.state === 'progressing') {
+      total++;
+      if (info.paused) pausedCount++;
+    }
+  }
+  return { total, pausedCount };
 }
 
 // ==================== 翻译功能 ====================
@@ -1863,46 +3030,557 @@ async function autoTranslatePageIfNeeded(tabId) {
   }
 }
 
+// ==================== 书签文件解析 ====================
+function parseBookmarkFile(content, filePath) {
+  const lowerPath = String(filePath || '').toLowerCase();
+  // JSON 格式（飞毛腿导出格式）
+  if (lowerPath.endsWith('.json')) {
+    try {
+      const data = JSON.parse(content);
+      // 飞毛腿格式
+      if (data.appName === '飞毛腿浏览器' && Array.isArray(data.bookmarks)) {
+        return data.bookmarks.map(b => ({
+          url: b.url,
+          title: b.title,
+          folder: b.folder || '导入书签'
+        })).filter(b => b.url);
+      }
+      // Chrome/Edge 格式（roots.bookmark_bar.children）
+      if (data.roots && data.roots.bookmark_bar && Array.isArray(data.roots.bookmark_bar.children)) {
+        return flattenChromeBookmarks(data.roots.bookmark_bar.children);
+      }
+      // 通用 JSON 数组
+      if (Array.isArray(data)) {
+        return data.map(b => ({
+          url: b.url || b.href,
+          title: b.title || b.name || b.text,
+          folder: b.folder || '导入书签'
+        })).filter(b => b.url);
+      }
+    } catch (e) {
+      addLog('ERROR', '解析JSON书签失败', e.message);
+    }
+    return [];
+  }
+  // HTML 格式（Netscape Bookmark File Format - Chrome/Edge/Firefox 通用）
+  if (lowerPath.endsWith('.html') || lowerPath.endsWith('.htm')) {
+    return parseHtmlBookmarks(content);
+  }
+  // 尝试自动检测格式
+  const trimmed = content.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      const data = JSON.parse(content);
+      if (data.appName === '飞毛腿浏览器' && Array.isArray(data.bookmarks)) {
+        return data.bookmarks.map(b => ({ url: b.url, title: b.title, folder: b.folder || '导入书签' })).filter(b => b.url);
+      }
+      if (data.roots && data.roots.bookmark_bar && Array.isArray(data.roots.bookmark_bar.children)) {
+        return flattenChromeBookmarks(data.roots.bookmark_bar.children);
+      }
+      if (Array.isArray(data)) {
+        return data.map(b => ({ url: b.url || b.href, title: b.title || b.name, folder: b.folder || '导入书签' })).filter(b => b.url);
+      }
+    } catch (e) {}
+  }
+  if (trimmed.includes('<DT>') || trimmed.includes('<A ') || trimmed.toLowerCase().includes('<a ')) {
+    return parseHtmlBookmarks(content);
+  }
+  return [];
+}
+
+function flattenChromeBookmarks(nodes, folder = '导入书签') {
+  const result = [];
+  if (!Array.isArray(nodes)) return result;
+  nodes.forEach(node => {
+    if (!node) return;
+    if (node.type === 'url' && node.url) {
+      result.push({ url: node.url, title: node.name || node.url, folder });
+    } else if (node.type === 'folder' && node.children) {
+      const subFolder = node.name || folder;
+      result.push(...flattenChromeBookmarks(node.children, subFolder));
+    }
+  });
+  return result;
+}
+
+function parseHtmlBookmarks(html) {
+  const results = [];
+  // 匹配 <A HREF="url">title</A> 模式
+  const regex = /<a\s+[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = regex.exec(html)) !== null) {
+    const url = match[1].trim();
+    const title = match[2].replace(/<[^>]*>/g, '').trim();
+    if (url && !url.startsWith('javascript:') && !url.startsWith('place:')) {
+      results.push({ url, title: title || url, folder: '导入书签' });
+    }
+  }
+  return results;
+}
+
+// ==================== 自动嗅探滚动 ====================
+let autoSniffState = {
+  active: false,
+  paused: false,        // 是否暂停
+  tab: null,
+  scrollTimer: null,
+  startPos: null,       // 嗅探起始坐标
+  pagePos: null,        // 翻页按钮坐标
+  scrollHeight: 0,      // 上次滚动高度
+  sameCount: 0,         // 连续未变化次数
+  sniffingCount: 0,     // 当前嗅探数量
+  isFirstPage: true,    // 是否第一页（第一页需要翻页确认）
+  notifiedBottom: false // 是否已通知底部
+};
+
+function startAutoSniffScroll(tab, options = {}) {
+  // 清理之前的定时器
+  if (autoSniffState.scrollTimer) {
+    clearInterval(autoSniffState.scrollTimer);
+    autoSniffState.scrollTimer = null;
+  }
+
+  autoSniffState.active = true;
+  autoSniffState.tab = tab;
+  autoSniffState.startPos = options.startPos || null;
+  autoSniffState.pagePos = options.pagePos || autoSniffState.pagePos || null; // 保留之前记住的翻页坐标
+  autoSniffState.scrollHeight = 0;
+  autoSniffState.sameCount = 0;
+  autoSniffState.sniffingCount = getMediaCount();
+  autoSniffState.isFirstPage = !autoSniffState.pagePos; // 没有翻页坐标说明是第一页
+  autoSniffState.notifiedBottom = false;
+
+  addLog('AUTO_SNIFF', '启动自动嗅探', `起始位置: ${JSON.stringify(autoSniffState.startPos)}, 翻页坐标: ${JSON.stringify(autoSniffState.pagePos)}`);
+
+  // 如果有起始坐标，先滚动到该位置
+  if (autoSniffState.startPos) {
+    scrollToStartPosition(tab);
+  }
+
+  // 开始定时滚动
+  autoSniffState.scrollTimer = setInterval(() => {
+    if (!autoSniffState.active || autoSniffState.paused || !autoSniffState.tab || autoSniffState.tab.webContents.isDestroyed()) {
+      if (autoSniffState.paused) return; // 暂停时不停止，只是跳过本次滚动
+      stopAutoSniffScroll();
+      return;
+    }
+    performAutoSniffScroll();
+  }, 800); // 每 800ms 滚动一次
+
+  return { success: true };
+}
+
+function stopAutoSniffScroll() {
+  if (autoSniffState.scrollTimer) {
+    clearInterval(autoSniffState.scrollTimer);
+    autoSniffState.scrollTimer = null;
+  }
+  autoSniffState.active = false;
+  autoSniffState.paused = false;
+  addLog('AUTO_SNIFF', '停止自动嗅探');
+}
+
+function pauseAutoSniffScroll() {
+  if (!autoSniffState.active || autoSniffState.paused) return;
+  if (autoSniffState.scrollTimer) {
+    clearInterval(autoSniffState.scrollTimer);
+    autoSniffState.scrollTimer = null;
+  }
+  autoSniffState.paused = true;
+  addLog('AUTO_SNIFF', '暂停自动嗅探');
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('auto-sniff-paused');
+  }
+}
+
+function resumeAutoSniffScroll() {
+  if (!autoSniffState.active || !autoSniffState.paused) return;
+  autoSniffState.paused = false;
+  addLog('AUTO_SNIFF', '继续自动嗅探');
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('auto-sniff-resumed');
+  }
+  // 重新启动滚动定时器
+  autoSniffState.scrollTimer = setInterval(() => {
+    if (!autoSniffState.active || autoSniffState.paused || !autoSniffState.tab || autoSniffState.tab.webContents.isDestroyed()) {
+      if (autoSniffState.scrollTimer) {
+        clearInterval(autoSniffState.scrollTimer);
+        autoSniffState.scrollTimer = null;
+      }
+      return;
+    }
+    performAutoSniffScroll();
+  }, 1500);
+}
+
+function scrollToStartPosition(tab) {
+  if (!tab || !tab.webContents || tab.webContents.isDestroyed()) return;
+  // 使用 executeJavaScript 滚动到指定位置
+  const script = `
+    (function() {
+      window.scrollTo(${autoSniffState.startPos.x}, ${autoSniffState.startPos.y});
+      return {
+        scrollTop: window.scrollY,
+        scrollHeight: document.documentElement.scrollHeight,
+        clientHeight: window.innerHeight
+      };
+    })()
+  `;
+  tab.webContents.executeJavaScript(script).catch(() => {});
+}
+
+function performAutoSniffScroll() {
+  const tab = autoSniffState.tab;
+  if (!tab || !tab.webContents || tab.webContents.isDestroyed()) {
+    stopAutoSniffScroll();
+    return;
+  }
+
+  // 执行滚动
+  const scrollAmount = 400; // 每次滚动 400px
+  const script = `
+    (function() {
+      const before = window.scrollY;
+      window.scrollBy(0, ${scrollAmount});
+      const after = window.scrollY;
+      return {
+        scrollTop: after,
+        scrollHeight: document.documentElement.scrollHeight,
+        clientHeight: window.innerHeight,
+        changed: after !== before,
+        atBottom: (document.documentElement.scrollHeight - window.innerHeight - after) < 50
+      };
+    })()
+  `;
+
+  tab.webContents.executeJavaScript(script).then((result) => {
+    if (!result) return;
+
+    // 检查是否到达底部
+    if (result.atBottom) {
+      autoSniffState.sameCount++;
+      if (autoSniffState.sameCount >= 3) { // 连续 3 次到底认为真的到底了
+        handleSniffPageBottom();
+        return;
+      }
+    } else {
+      autoSniffState.sameCount = 0;
+    }
+
+    // 更新嗅探计数并通知渲染进程
+    const currentCount = getMediaCount();
+    if (currentCount !== autoSniffState.sniffingCount) {
+      autoSniffState.sniffingCount = currentCount;
+      notifySniffCountUpdate(currentCount);
+    }
+
+    // 更新滚动高度
+    autoSniffState.scrollHeight = result.scrollTop;
+  }).catch((err) => {
+    console.error('[AUTO_SNIFF] 滚动失败:', err);
+  });
+}
+
+function handleSniffPageBottom() {
+  // 停止滚动定时器
+  if (autoSniffState.scrollTimer) {
+    clearInterval(autoSniffState.scrollTimer);
+    autoSniffState.scrollTimer = null;
+  }
+
+  addLog('AUTO_SNIFF', '检测到页面底部');
+
+  // 检查是否需要翻页
+  if (autoSniffState.isFirstPage && !autoSniffState.pagePos) {
+    // 第一页还没标记翻页坐标，通知渲染进程显示确认弹窗
+    notifySniffScrollBottom();
+    return;
+  }
+
+  // 有翻页坐标，直接点击翻页
+  if (autoSniffState.pagePos) {
+    autoSniffState.isFirstPage = false;
+    clickPageButton();
+  } else {
+    // 没有翻页坐标且不是第一页，停止
+    stopAutoSniffScroll();
+  }
+}
+
+function clickPageButton() {
+  const tab = autoSniffState.tab;
+  if (!tab || !tab.webContents || tab.webContents.isDestroyed()) return;
+
+  const { x, y } = autoSniffState.pagePos;
+  addLog('AUTO_SNIFF', '点击翻页按钮', `坐标: ${x}, ${y}`);
+
+  // 使用 executeJavaScript 模拟鼠标点击
+  const script = `
+    (function() {
+      // 创建一个点击事件
+      function simulateClick(x, y) {
+        const clickEvent = new MouseEvent('click', {
+          view: window,
+          bubbles: true,
+          cancelable: true,
+          clientX: x,
+          clientY: y
+        });
+
+        // 找到对应坐标的元素
+        const element = document.elementFromPoint(x, y);
+        if (element) {
+          // 先让元素可见（如果有的话）
+          element.scrollIntoViewIfNeeded ? element.scrollIntoViewIfNeeded() : null;
+
+          // 触发点击
+          const rect = element.getBoundingClientRect();
+          const adjustedX = x - rect.left;
+          const adjustedY = y - rect.top;
+
+          const newEvent = new MouseEvent('click', {
+            view: window,
+            bubbles: true,
+            cancelable: true,
+            clientX: adjustedX,
+            clientY: adjustedY
+          });
+          element.dispatchEvent(newEvent);
+          return { success: true, tagName: element.tagName, text: element.textContent.trim().substring(0, 50) };
+        }
+        return { success: false };
+      }
+      return simulateClick(${x}, ${y});
+    })()
+  `;
+
+  tab.webContents.executeJavaScript(script).then((result) => {
+    if (result && result.success) {
+      addLog('AUTO_SNIFF', '翻页点击成功', result.tagName + ': ' + result.text);
+    }
+
+    // 等待页面加载，然后继续滚动
+    setTimeout(() => {
+      // 重置状态并继续滚动
+      autoSniffState.scrollHeight = 0;
+      autoSniffState.sameCount = 0;
+      autoSniffState.sniffingCount = getMediaCount();
+      autoSniffState.notifiedBottom = false;
+
+      notifySniffPageNext();
+
+      // 重新开始滚动定时器
+      autoSniffState.scrollTimer = setInterval(() => {
+        if (!autoSniffState.active || autoSniffState.paused || !autoSniffState.tab || autoSniffState.tab.webContents.isDestroyed()) {
+          if (autoSniffState.paused) return;
+          stopAutoSniffScroll();
+          return;
+        }
+        performAutoSniffScroll();
+      }, 800);
+    }, 2000); // 等待 2 秒让页面加载
+  }).catch((err) => {
+    addLog('ERROR', '翻页点击失败', err.message);
+    stopAutoSniffScroll();
+  });
+}
+
+function getMediaCount() {
+  let count = 0;
+  globalState.mediaUrls.forEach((list) => {
+    (list || []).forEach((media) => {
+      if (media && media.url) count++;
+    });
+  });
+  return count;
+}
+
+function notifySniffScrollBottom() {
+  autoSniffState.active = false;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('auto-sniff-scroll-bottom');
+  }
+}
+
+function notifySniffPageNext() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('auto-sniff-page-next');
+  }
+}
+
+function notifySniffCountUpdate(count) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('auto-sniff-count-update', count);
+  }
+}
+
 // ==================== IPC 处理 ====================
 function setupIPC() {
-  // 截图区域选择完成（截图窗口传回裁剪坐标，已经是图片像素坐标）
+  // 截图区域选择完成（crop 是屏幕坐标 {x, y, w, h}）
   ipcMain.on('screenshot-region', async (event, crop) => {
-    addLog('SCREENSHOT', '收到裁剪坐标', `x:${crop.x}, y:${crop.y}, w:${crop.w}, h:${crop.h}`);
+    addLog('SCREENSHOT', '收到屏幕坐标', `x:${crop.x}, y:${crop.y}, w:${crop.w}, h:${crop.h}`);
     if (!screenshotPickerWindow) {
       addLog('ERROR', '截图窗口已关闭');
       return;
     }
 
-    // 关闭选择窗口
+    // 先关闭选择窗口
     const win = screenshotPickerWindow;
     screenshotPickerWindow = null;
     win.close();
 
     try {
-      if (!lastScreenshotDataUrl) {
-        throw new Error('没有预截取的屏幕图片');
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+
+      // 获取主窗口在屏幕上的位置
+      const winBounds = mainWindow.getBounds();
+      addLog('SCREENSHOT', '主窗口位置', JSON.stringify(winBounds));
+
+      // 截取主窗口
+      const winImage = await mainWindow.capturePage();
+      const winImgSize = winImage.getSize();
+      addLog('SCREENSHOT', '主窗口截图', `${winImgSize.width}x${winImgSize.height}`);
+
+      // 计算主窗口的 DPI 缩放
+      const winScaleX = winImgSize.width / winBounds.width;
+      const winScaleY = winImgSize.height / winBounds.height;
+
+      // 截取当前活动标签的 BrowserView
+      const tabId = win.tabId;
+      const tab = globalState.tabs.get(tabId);
+      let viewImage = null;
+      let viewBounds = null;
+      let viewScaleX = 1, viewScaleY = 1;
+
+      if (tab && tab.view && tab.webContents) {
+        viewBounds = tab.view.getBounds();
+        viewImage = await tab.webContents.capturePage();
+        const viewImgSize = viewImage.getSize();
+        viewScaleX = viewImgSize.width / viewBounds.width;
+        viewScaleY = viewImgSize.height / viewBounds.height;
+        addLog('SCREENSHOT', 'BrowserView截图', `${viewImgSize.width}x${viewImgSize.height}, bounds:${JSON.stringify(viewBounds)}`);
       }
 
-      // 从预截取的图片中裁剪（坐标已经是图片像素坐标，直接使用）
-      const nativeImage = require('electron').nativeImage;
-      const fullImage = nativeImage.createFromDataURL(lastScreenshotDataUrl);
-      const imgSize = fullImage.getSize();
-      addLog('SCREENSHOT', '图片尺寸', `${imgSize.width}x${imgSize.height}`);
+      // 将屏幕坐标转换为主窗口内坐标
+      const relX = crop.x - winBounds.x;
+      const relY = crop.y - winBounds.y;
 
-      const cropped = fullImage.crop({
-        x: Math.max(0, crop.x),
-        y: Math.max(0, crop.y),
-        width: Math.min(crop.w, imgSize.width - crop.x),
-        height: Math.min(crop.h, imgSize.height - crop.y)
+      // 转换为图片像素坐标
+      const imgX = Math.round(relX * winScaleX);
+      const imgY = Math.round(relY * winScaleY);
+      const imgW = Math.round(crop.w * winScaleX);
+      const imgH = Math.round(crop.h * winScaleY);
+
+      addLog('SCREENSHOT', '图片坐标', `x:${imgX}, y:${imgY}, w:${imgW}, h:${imgH}`);
+
+      // 检查选区是否与 BrowserView 重叠
+      let finalImage = winImage;
+      if (viewImage && viewBounds) {
+        const viewImgX = Math.round(viewBounds.x * winScaleX);
+        const viewImgY = Math.round(viewBounds.y * winScaleY);
+        const viewImgW = Math.round(viewBounds.width * winScaleX);
+        const viewImgH = Math.round(viewBounds.height * winScaleY);
+
+        // 如果选区与 BrowserView 有重叠，需要合成
+        const cropRight = imgX + imgW;
+        const cropBottom = imgY + imgH;
+        const viewRight = viewImgX + viewImgW;
+        const viewBottom = viewImgY + viewImgH;
+
+        if (imgX < viewRight && cropRight > viewImgX &&
+            imgY < viewBottom && cropBottom > viewImgY) {
+          addLog('SCREENSHOT', '选区包含网页内容，需要合成');
+
+          // 用 offscreen canvas 合成（在截图完成后的隐藏窗口中）
+          const { nativeImage } = require('electron');
+
+          // 创建一个空白图片作为画布
+          const canvasSize = { width: imgW, height: imgH };
+
+          // 先从主窗口裁剪
+          const winCrop = winImage.crop({
+            x: Math.max(0, imgX),
+            y: Math.max(0, imgY),
+            width: Math.min(imgW, winImgSize.width - imgX),
+            height: Math.min(imgH, winImgSize.height - imgY)
+          });
+
+          // 计算 BrowserView 在裁剪区域中的相对位置
+          const viewRelX = viewImgX - imgX;
+          const viewRelY = viewImgY - imgY;
+
+          // 从 BrowserView 裁剪对应区域
+          const bvCropX = Math.max(0, Math.round(-viewRelX));
+          const bvCropY = Math.max(0, Math.round(-viewRelY));
+          const bvCropW = Math.min(viewImgW - bvCropX, imgW - Math.max(0, viewRelX));
+          const bvCropH = Math.min(viewImgH - bvCropY, imgH - Math.max(0, viewRelY));
+
+          if (bvCropW > 0 && bvCropH > 0) {
+            const bvCrop = viewImage.crop({
+              x: bvCropX,
+              y: bvCropY,
+              width: bvCropW,
+              height: bvCropH
+            });
+
+            // 将 BrowserView 内容粘贴到主窗口截图的正确位置
+            // 使用 nativeImage 无法直接合成，需要用 data URL + canvas
+            const tempWin = new BrowserWindow({
+              width: imgW,
+              height: imgH,
+              show: false,
+              webPreferences: {
+                nodeIntegration: true,
+                contextIsolation: false,
+                offscreen: true
+              }
+            });
+
+            const composited = await new Promise((resolve, reject) => {
+              tempWin.webContents.once('did-finish-load', async () => {
+                try {
+                  const result = await tempWin.webContents.executeJavaScript(`
+                    new Promise((res) => {
+                      const c = document.createElement('canvas');
+                      c.width = ${imgW};
+                      c.height = ${imgH};
+                      const ctx = c.getContext('2d');
+                      const base = new Image();
+                      base.onload = () => {
+                        ctx.drawImage(base, 0, 0);
+                        const overlay = new Image();
+                        overlay.onload = () => {
+                          ctx.drawImage(overlay, ${Math.max(0, viewRelX)}, ${Math.max(0, viewRelY)}, ${bvCropW}, ${bvCropH});
+                          res(c.toDataURL('image/png'));
+                        };
+                        overlay.src = '${bvCrop.toDataURL()}';
+                      };
+                      base.src = '${winCrop.toDataURL()}';
+                    })
+                  `);
+                  resolve(nativeImage.createFromDataURL(result));
+                } catch (e) { reject(e); }
+                tempWin.close();
+              });
+              tempWin.loadURL('about:blank');
+            });
+
+            finalImage = composited;
+          }
+        }
+      }
+
+      // 最终裁剪
+      const finalSize = finalImage.getSize();
+      const cropped = finalImage.crop({
+        x: 0,
+        y: 0,
+        width: Math.min(imgW, finalSize.width),
+        height: Math.min(imgH, finalSize.height)
       });
 
       clipboard.writeImage(cropped);
       addLog('SCREENSHOT', '截图已复制到剪贴板');
-      lastScreenshotDataUrl = null;
-
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('show-toast', '截图已复制到剪贴板');
-      }
     } catch (error) {
       addLog('ERROR', '截图失败', error.message);
     }
@@ -1915,6 +3593,14 @@ function setupIPC() {
       screenshotPickerWindow = null;
     }
     addLog('SCREENSHOT', '区域截图已取消');
+  });
+
+  // 深色模式 - 向所有网页注入/移除深色CSS
+  ipcMain.on('set-dark-mode-pages', (event, enabled) => {
+    addLog('SETTINGS', '网页深色模式', enabled ? '开启' : '关闭');
+    globalState.tabs.forEach((tab) => {
+      applyDarkModeToTab(tab, enabled);
+    });
   });
   
   ipcMain.on('media-element-detected', (event, payload = {}) => {
@@ -1930,7 +3616,13 @@ function setupIPC() {
     });
   });
 
-  ipcMain.handle('create-tab', (event, url, options = {}) => createTab(url, options));
+  ipcMain.handle('create-tab', (event, url, options = {}) => {
+    // 如果没有指定 opener，自动使用当前活动标签页
+    if (!options.openerTabId && globalState.activeTabId) {
+      options.openerTabId = globalState.activeTabId;
+    }
+    return createTab(url, options);
+  });
   ipcMain.handle('close-tab', (event, tabId) => closeTab(tabId));
   ipcMain.handle('activate-tab', (event, tabId) => activateTab(tabId));
   ipcMain.handle('reorder-tabs', (event, tabIds) => reorderTabs(tabIds));
@@ -2004,9 +3696,124 @@ function setupIPC() {
 
   ipcMain.handle('update-bookmark-order', (event, bookmarks) => {
     if (Array.isArray(bookmarks) && bookmarks.length === globalState.bookmarks.length) {
-      globalState.bookmarks = bookmarks;
+        globalState.bookmarks = bookmarks;
+        saveData();
+        addLog('BOOKMARK', '更新书签排序', `${bookmarks.length} 个书签`);
+    }
+  });
+
+  // 导出书签（飞毛腿格式 JSON）
+  ipcMain.handle('export-bookmarks', async (event) => {
+    try {
+      const exportData = {
+        appName: '飞毛腿浏览器',
+        version: '1.0.74',
+        exportTime: new Date().toISOString(),
+        bookmarks: globalState.bookmarks.map(b => ({
+          url: b.url,
+          title: b.title,
+          folder: b.folder || '默认文件夹',
+          createdAt: b.createdAt
+        }))
+      };
+      const { dialog } = require('electron');
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: '导出书签',
+        defaultPath: '飞毛腿浏览器书签.json',
+        filters: [
+          { name: '飞毛腿书签文件', extensions: ['json'] },
+          { name: '所有文件', extensions: ['*'] }
+        ]
+      });
+      if (result.canceled || !result.filePath) return { success: false, canceled: true };
+      fs.writeFileSync(result.filePath, JSON.stringify(exportData, null, 2), 'utf8');
+      addLog('BOOKMARK', '导出书签', `${exportData.bookmarks.length} 个 → ${result.filePath}`);
+      return { success: true, count: exportData.bookmarks.length, filePath: result.filePath };
+    } catch (e) {
+      addLog('ERROR', '导出书签失败', e.message);
+      return { success: false, error: e.message };
+    }
+  });
+
+  // 导入书签（支持飞毛腿格式和其他浏览器格式，按网址查重）
+  ipcMain.handle('import-bookmarks', async (event) => {
+    try {
+      const { dialog } = require('electron');
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: '导入书签',
+        properties: ['openFile'],
+        filters: [
+          { name: '书签文件', extensions: ['json', 'html', 'htm'] },
+          { name: '所有文件', extensions: ['*'] }
+        ]
+      });
+      if (result.canceled || result.filePaths.length === 0) return { success: false, canceled: true };
+      const filePath = result.filePaths[0];
+      const content = fs.readFileSync(filePath, 'utf8');
+      const imported = parseBookmarkFile(content, filePath);
+      if (!imported || imported.length === 0) return { success: false, error: '未找到可导入的书签' };
+      // 按网址查重：已有相同网址的书签不重复添加
+      const existingUrls = new Set(globalState.bookmarks.map(b => b.url));
+      let addedCount = 0;
+      let duplicateCount = 0;
+      imported.forEach(item => {
+        if (existingUrls.has(item.url)) {
+          duplicateCount++;
+          return;
+        }
+        existingUrls.add(item.url);
+        globalState.bookmarks.push({
+          id: `bookmark-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          url: item.url,
+          title: item.title || item.url,
+          folder: item.folder || '导入书签',
+          createdAt: Date.now()
+        });
+        addedCount++;
+      });
       saveData();
-      addLog('BOOKMARK', '更新书签排序', `${bookmarks.length} 个书签`);
+      addLog('BOOKMARK', '导入书签', `新增 ${addedCount} 个，重复 ${duplicateCount} 个，来源: ${filePath}`);
+      return { success: true, added: addedCount, duplicated: duplicateCount, total: imported.length };
+    } catch (e) {
+      addLog('ERROR', '导入书签失败', e.message);
+      return { success: false, error: e.message };
+    }
+  });
+
+  // 拖入文件导入书签
+  ipcMain.handle('import-bookmarks-from-file', async (event, filePath) => {
+    try {
+      if (!fs.existsSync(filePath)) return { success: false, error: '文件不存在' };
+      const content = fs.readFileSync(filePath, 'utf8');
+      const imported = parseBookmarkFile(content, filePath);
+      if (!imported || imported.length === 0) return { success: false, error: '未找到可导入的书签' };
+      const existingUrls = new Set(globalState.bookmarks.map(b => b.url));
+      let addedCount = 0;
+      let duplicateCount = 0;
+      imported.forEach(item => {
+        if (existingUrls.has(item.url)) {
+          duplicateCount++;
+          return;
+        }
+        existingUrls.add(item.url);
+        globalState.bookmarks.push({
+          id: `bookmark-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          url: item.url,
+          title: item.title || item.url,
+          folder: item.folder || '导入书签',
+          createdAt: Date.now()
+        });
+        addedCount++;
+      });
+      saveData();
+      addLog('BOOKMARK', '拖入导入书签', `新增 ${addedCount} 个，重复 ${duplicateCount} 个`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('bookmarks-changed');
+      }
+      return { success: true, added: addedCount, duplicated: duplicateCount, total: imported.length };
+    } catch (e) {
+      addLog('ERROR', '拖入导入书签失败', e.message);
+      return { success: false, error: e.message };
     }
   });
 
@@ -2157,22 +3964,38 @@ function setupIPC() {
     saveData();
     return { success: true, removed };
   });
-  ipcMain.handle('clear-media-list', () => {
-    const cleared = getAllMediaUrls().length;
-    globalState.mediaUrls.clear();
+  ipcMain.handle('clear-media-list', (event, options = {}) => {
+    const clearType = options.clearType || 'all';
+    let cleared = 0;
     let clearedDownloads = 0;
-    Array.from(globalState.downloads.entries()).forEach(([id, download]) => {
-      if (download.category === 'media' && download.state !== 'progressing') {
-        globalState.downloads.delete(id);
-        clearedDownloads++;
-      }
-    });
-    addLog('MEDIA', '清空嗅探列表', `${cleared} 条，媒体下载记录 ${clearedDownloads} 条，不删除本地文件`);
+    
+    if (clearType === 'sniff' || clearType === 'all') {
+      cleared = getAllMediaUrls().length;
+      globalState.mediaUrls.clear();
+      Array.from(globalState.downloads.entries()).forEach(([id, download]) => {
+        if (download.category === 'media' && download.state !== 'progressing' && download.state !== 'completed') {
+          globalState.downloads.delete(id);
+          clearedDownloads++;
+        }
+      });
+    }
+    
+    if (clearType === 'downloaded' || clearType === 'all') {
+      if (clearType === 'downloaded') cleared = getAllMediaUrls().length;
+      Array.from(globalState.downloads.entries()).forEach(([id, download]) => {
+        if (download.category === 'media' && download.state === 'completed') {
+          globalState.downloads.delete(id);
+          clearedDownloads++;
+        }
+      });
+    }
+    
+    addLog('MEDIA', `清空${clearType === 'sniff' ? '嗅探' : clearType === 'downloaded' ? '已下载' : '全部'}列表`, `${cleared} 条，媒体下载记录 ${clearedDownloads} 条`);
     saveData();
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('media-list-cleared', { cleared, clearedDownloads });
+      mainWindow.webContents.send('media-list-cleared', { cleared, clearedDownloads, clearType });
     }
-    return { success: true, cleared, clearedDownloads };
+    return { success: true, cleared, clearedDownloads, clearType };
   });
   ipcMain.handle('download-media', async (event, url, fileName, options = {}) => {
     try {
@@ -2191,17 +4014,76 @@ function setupIPC() {
     const sender = BrowserWindow.fromWebContents(event.sender);
     if (!sender || sender.isDestroyed()) return { success: false, error: '主窗口不存在' };
     const list = Array.isArray(mediaList) ? mediaList : [];
+
+    // 先清理已暂停或已失败的旧媒体下载项，避免阻碍重新下载
+    const mediaUrls = new Set(list.map(m => m && m.url).filter(Boolean));
+    for (const [downloadId, info] of globalState.downloads) {
+      if (info.category === 'media' && mediaUrls.has(info.mediaUrl) && (info.paused || info.state === 'cancelled' || info.state === 'interrupted')) {
+        const oldItem = downloadItems.get(downloadId);
+        if (oldItem) {
+          try { oldItem.cancel(); } catch (e) {}
+        }
+        downloadItems.delete(downloadId);
+        globalState.downloads.delete(downloadId);
+      }
+    }
+
     let count = 0;
-    list.forEach(media => {
-      if (media && media.url) {
-        pendingMediaDownloads.set(media.url, { url: media.url, fileName: media.title || getFileNameFromUrl(media.url), roughName: Boolean(options.roughName), webContentsId: sender.webContents.id, startedAt: Date.now() });
+    let skipped = 0;
+    // 直接逐个下载，每次等待前一个完成初始化后再发起下一个
+    for (const media of list) {
+      if (!media || !media.url) {
+        addLog('DOWNLOAD', '跳过无效媒体', 'info missing');
+        skipped++;
+        continue;
+      }
+      const url = normalizeMediaDownloadUrl(media.url);
+      addLog('DOWNLOAD', `准备下载(${count + 1}/${list.length})`, `${media.title || getFileNameFromUrl(media.url)} [${url}]`);
+      await new Promise(resolve => {
+        const pending = { url: media.url, fileName: media.title || getFileNameFromUrl(media.url), roughName: Boolean(options.roughName), webContentsId: sender.webContents.id, startedAt: Date.now() };
+        pendingMediaDownloads.set(media.url, pending);
+        // 如果URL是HTTP，也注册HTTPS版本作为pending key，防止Chromium自动升级导致匹配失败
+        if (typeof media.url === 'string' && media.url.startsWith('http://')) {
+          const httpsUrl = media.url.replace(/^http:\/\//, 'https://');
+          pendingMediaDownloads.set(httpsUrl, { ...pending, url: httpsUrl });
+        }
         sender.webContents.downloadURL(media.url);
         count++;
-      }
-    });
-    addLog('DOWNLOAD', '一键下载全部媒体', `${count} 个`);
-    return { success: true, count };
+        setTimeout(resolve, 400);
+      });
+    }
+    addLog('DOWNLOAD', '一键下载全部媒体', `共 ${list.length} 个，发起 ${count} 个，跳过 ${skipped} 个`);
+    return { success: true, count, skipped };
   });
+
+  // 自动嗅探滚动
+  ipcMain.handle('start-auto-sniff-scroll', async (event, webContentsId, options = {}) => {
+    const tabId = getTabIdFromWebContents(webContentsId);
+    if (!tabId) return { success: false, error: '标签页不存在' };
+    const tab = globalState.tabs.get(tabId);
+    if (!tab || !tab.webContents || tab.webContents.isDestroyed()) return { success: false, error: 'BrowserView 不存在' };
+    const { startPos, pagePos } = options;
+    return startAutoSniffScroll(tab, { startPos, pagePos });
+  });
+
+  ipcMain.handle('pause-auto-sniff', () => {
+    pauseAutoSniffScroll();
+    return { success: true, paused: autoSniffState.paused };
+  });
+
+  ipcMain.handle('resume-auto-sniff', () => {
+    resumeAutoSniffScroll();
+    return { success: true, paused: autoSniffState.paused };
+  });
+
+  ipcMain.handle('get-auto-sniff-state', () => {
+    return { active: autoSniffState.active, paused: autoSniffState.paused };
+  });
+
+  ipcMain.handle('pause-all-downloads', () => pauseAllDownloads());
+  ipcMain.handle('resume-all-downloads', () => resumeAllDownloads());
+  ipcMain.handle('get-all-download-pause-state', () => getAllDownloadPauseState());
+
   ipcMain.handle('pause-download', (event, downloadId) => pauseDownload(downloadId));
   ipcMain.handle('resume-download', (event, downloadId) => resumeDownload(downloadId));
 
@@ -2235,6 +4117,40 @@ function setupIPC() {
     }
     addLog('SETTINGS', '更新设置', JSON.stringify(normalized));
     return globalState.settings;
+  });
+
+  // 自定义广告规则管理
+  ipcMain.handle('get-custom-ad-rules', () => {
+    return globalState.customAdRules || [];
+  });
+
+  ipcMain.handle('delete-custom-ad-rule', (event, index) => {
+    if (globalState.customAdRules && index >= 0 && index < globalState.customAdRules.length) {
+      const removed = globalState.customAdRules.splice(index, 1);
+      saveData();
+      addLog('ADBLOCK', '删除广告规则', removed[0].selector);
+      // 通知所有标签页重新加载以移除CSS
+      globalState.tabs.forEach((tab) => {
+        if (tab.view && tab.view.webContents && !tab.view.webContents.isDestroyed()) {
+          tab.view.webContents.reload();
+        }
+      });
+      return { success: true };
+    }
+    return { success: false, error: '索引无效' };
+  });
+
+  ipcMain.handle('clear-custom-ad-rules', () => {
+    const count = (globalState.customAdRules || []).length;
+    globalState.customAdRules = [];
+    saveData();
+    addLog('ADBLOCK', '清空所有广告规则', `${count} 条`);
+    globalState.tabs.forEach((tab) => {
+      if (tab.view && tab.view.webContents && !tab.view.webContents.isDestroyed()) {
+        tab.view.webContents.reload();
+      }
+    });
+    return { success: true, count };
   });
 
   ipcMain.handle('select-download-path', async () => {
@@ -2308,6 +4224,43 @@ function setupIPC() {
     ]);
 
     menu.popup({ window: mainWindow });
+  });
+
+  // 书签栏溢出菜单（原生Menu，避免被遮挡）
+  ipcMain.handle('show-bookmark-overflow-menu', async (event, bookmarkIds, btnRect) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (!Array.isArray(bookmarkIds) || bookmarkIds.length === 0) return;
+    
+    const menuItems = bookmarkIds.map(id => {
+      const bookmark = globalState.bookmarks.find(b => b.id === id);
+      if (!bookmark) return null;
+      const label = bookmark.title.length > 40 ? bookmark.title.slice(0, 37) + '...' : bookmark.title;
+      return {
+        label,
+        submenu: [
+          { label: '打开书签', click: () => createTab(bookmark.url) },
+          { label: '编辑书签', click: () => { showBookmarkEditModal(bookmark); } },
+          { type: 'separator' },
+          { label: '删除书签', click: () => {
+            globalState.bookmarks = globalState.bookmarks.filter(b => b.id !== id);
+            saveData();
+            mainWindow.webContents.send('bookmarks-changed');
+            addLog('BOOKMARK', '删除书签', bookmark.title);
+          }}
+        ]
+      };
+    }).filter(Boolean);
+    
+    if (menuItems.length === 0) return;
+    
+    const menu = Menu.buildFromTemplate(menuItems);
+    // 菜单弹出在按钮左侧
+    const popupOpts = { window: mainWindow };
+    if (btnRect && typeof btnRect.x === 'number') {
+      popupOpts.x = Math.round(btnRect.x);
+      popupOpts.y = Math.round(btnRect.y);
+    }
+    menu.popup(popupOpts);
   });
 
   // 下载/嗅探列表右键菜单（原生 Menu，避免被 BrowserView 遮挡）
@@ -2493,12 +4446,23 @@ function createTray() {
 }
 
 // ==================== 应用生命周期 ====================
+// Windows 任务栏图标设置
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.feimaotui.browser');
+}
 app.whenReady().then(() => {
   loadData();
   createMainWindow();
   setupIPC();
   createTray();
   addLog('INFO', '飞毛腿浏览器启动完成');
+
+  // 每30秒自动保存会话（防止直接关机/断电丢失）
+  setInterval(() => {
+    if (globalState.tabs.size > 0) {
+      saveTabsSession();
+    }
+  }, 30000);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
@@ -2512,6 +4476,11 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   globalState.isQuitting = true;
+  // 正常退出时清空会话，下次不自动恢复
+  try {
+    fs.writeFileSync(path.join(dataPath, 'tabs-session.json'), JSON.stringify([]));
+    addLog('SESSION', '正常退出，清空会话');
+  } catch (e) {}
   saveData();
   if (logAutoClear) runtimeLogs = [];
 });

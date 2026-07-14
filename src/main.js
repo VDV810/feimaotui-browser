@@ -114,7 +114,7 @@ const globalState = {
     darkMode: false,
     privacyMode: false,
     adblockEnabled: true,
-    fontSize: 12,
+    fontSize: 16,
     autoTranslate: true,
     alwaysTranslateNonCjk: true
   },
@@ -517,7 +517,7 @@ function applyFontSizeToTab(tab) {
       style.id = styleId;
       document.documentElement.appendChild(style);
     }
-    style.textContent = 'body, body * { font-size: ${fontSize}px !important; }';
+    style.textContent = 'html { font-size: ${fontSize}px !important; }';
   })()`;
   tab.webContents.executeJavaScript(script).catch(error => addLog('SETTINGS', '应用字体大小失败', error.message));
 }
