@@ -5,8 +5,8 @@ const axios = require('axios');
 const { execFile } = require('child_process');
 
 // 启用 Chrome 实验性特性，提高网页兼容性
-app.commandLine.appendSwitch('enable-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass');
-app.commandLine.appendSwitch('enable-blink-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass');
+app.commandLine.appendSwitch('enable-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass,LocalNetworkAccess');
+app.commandLine.appendSwitch('enable-blink-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass,LocalNetworkAccess');
 app.commandLine.appendSwitch('disable-features', 'IsolateOrigins,site-per-process');
 
 // 提高下载性能：增加每个域名的最大并发连接数（默认6，改为16）
@@ -1138,6 +1138,15 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
       callback({ cancel: true });
       return;
     }
+    // 拦截微信 wxLogin.js，注入 local-network-access 权限覆盖后再加载原脚本
+    if (url.includes('res.wx.qq.com/connect/') && url.includes('wxLogin')) {
+      addLog('WX', '拦截wxLogin.js注入权限覆盖', url.substring(0, 80));
+      callback({ redirectURL: 'data:text/javascript,' + encodeURIComponent(`
+        (function(){var origQuery=navigator.permissions.query.bind(navigator.permissions);navigator.permissions.query=function(d){if(d&&(d.name==="local-network-access"||d.name==="local-network")){return Promise.resolve({state:"granted",onchange:null})}return origQuery(d)};})();
+        var s=document.createElement('script');s.src='${url}';s.crossOrigin='anonymous';document.head.appendChild(s);
+      `) });
+      return;
+    }
     if (isMediaUrl(url)) {
       registerMediaCandidate(details.webContentsId, url, {
         source: 'url',
@@ -1647,6 +1656,29 @@ function createTab(url = null, options = {}) {
     notifyTabUpdate(tabId, { loading: true });
   });
 
+  // dom-ready: 在页面脚本执行前注入权限覆盖到主世界
+  // contextIsolation:true 下 preload 的 navigator 修改对页面不可见，必须用 executeJavaScript 注入主世界
+  view.webContents.on('dom-ready', () => {
+    view.webContents.executeJavaScript(`
+      (function() {
+        try {
+          if (navigator.permissions && navigator.permissions.query) {
+            var orig = navigator.permissions.query.bind(navigator.permissions);
+            if (!navigator.permissions.__fmPatched) {
+              navigator.permissions.__fmPatched = true;
+              navigator.permissions.query = function(desc) {
+                if (desc && (desc.name === 'local-network-access' || desc.name === 'local-network')) {
+                  return Promise.resolve({ state: 'granted', onchange: null });
+                }
+                return orig(desc);
+              };
+            }
+          }
+        } catch(e) {}
+      })();
+    `).catch(() => {});
+  });
+
   view.webContents.on('did-stop-loading', () => {
     tab.loading = false;
     tab.canGoBack = view.webContents.canGoBack();
@@ -1741,16 +1773,17 @@ function createTab(url = null, options = {}) {
         addLog('FRAME', '子框架加载完成', `url=${frameUrl.substring(0, 120)} routingId=${frameRoutingId}`);
 
         // 微信/QQ 登录 iframe 权限注入：伪造 local-network-access 权限
+        // Electron 28 支持 executeJavaScriptInFrame(frameRoutingId, code)
         if (frameUrl.includes('open.weixin.qq.com') || frameUrl.includes('wx.qq.com') || frameUrl.includes('qq.com')) {
-          view.webContents.executeJavaScriptInFrame || view.webContents.executeJavaScript(`
+          const permOverride = `
             (function() {
               try {
                 if (navigator.permissions && navigator.permissions.query) {
                   var orig = navigator.permissions.query.bind(navigator.permissions);
-                  if (!navigator.permissions.__feimaotuiPatched) {
-                    navigator.permissions.__feimaotuiPatched = true;
+                  if (!navigator.permissions.__fmPatched) {
+                    navigator.permissions.__fmPatched = true;
                     navigator.permissions.query = function(desc) {
-                      if (desc && desc.name === 'local-network-access') {
+                      if (desc && (desc.name === 'local-network-access' || desc.name === 'local-network')) {
                         return Promise.resolve({ state: 'granted', onchange: null });
                       }
                       return orig(desc);
@@ -1759,7 +1792,14 @@ function createTab(url = null, options = {}) {
                 }
               } catch(e) {}
             })();
-          `, true).catch(() => {});
+          `;
+          // 优先尝试在指定 frame 中执行
+          if (typeof view.webContents.executeJavaScriptInFrame === 'function') {
+            view.webContents.executeJavaScriptInFrame(frameRoutingId, permOverride).catch(() => {});
+          } else {
+            // 退回在主 frame 执行
+            view.webContents.executeJavaScript(permOverride).catch(() => {});
+          }
         }
       } catch(e) {
         addLog('FRAME', '子框架加载完成', `routingId=${frameRoutingId}`);
