@@ -5,7 +5,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 const _realUA = navigator.userAgent;
 const _spoofedUA = _realUA.replace(/Electron\/[\d.]+\s?/g, '').replace(/Feimaotui-Browser\/[\d.]+\s?/g, '');
 Object.defineProperty(navigator, 'userAgent', {
-  get: () => _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  get: () => _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
 });
 Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
 Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
@@ -13,48 +13,6 @@ Object.defineProperty(navigator, 'webdriver', { get: () => false });
 Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
 Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-
-// ============ 微信快捷登录修复 ============
-// 微信 SDK (wxLogin.js) 通过 navigator.permissions.query({name:'local-network-access'})
-// 检测浏览器是否支持本地网络访问。Chrome 124+ 原生支持，但 Electron 28 (Chromium 120) 不支持。
-// 不支持时 SDK 直接回退到二维码扫码，不尝试检测本地微信客户端。
-// 这里伪造 permissions.query 对 local-network-access 返回 granted。
-try {
-  const _origQuery = navigator.permissions.query.bind(navigator.permissions);
-  navigator.permissions.query = function(desc) {
-    if (desc && desc.name === 'local-network-access') {
-      return Promise.resolve({ state: 'granted', onchange: null });
-    }
-    return _origQuery(desc);
-  };
-} catch(e) {}
-
-// 同时伪造 document.featurePolicy (旧版 API) 对 local-network-access 返回 true
-try {
-  if (document.featurePolicy) {
-    const _origAllowsFeature = document.featurePolicy.allowsFeature.bind(document.featurePolicy);
-    document.featurePolicy.allowsFeature = function(feature, origin) {
-      if (feature === 'local-network-access') return true;
-      return _origAllowsFeature(feature, origin);
-    };
-    const _origAllowedFeatures = document.featurePolicy.allowedFeatures.bind(document.featurePolicy);
-    document.featurePolicy.allowedFeatures = function() {
-      const features = _origAllowedFeatures();
-      if (features.indexOf('local-network-access') === -1) {
-        features.push('local-network-access');
-      }
-      return features;
-    };
-    const _origFeatures = document.featurePolicy.features.bind(document.featurePolicy);
-    document.featurePolicy.features = function() {
-      const features = _origFeatures();
-      if (features.indexOf('local-network-access') === -1) {
-        features.push('local-network-access');
-      }
-      return features;
-    };
-  }
-} catch(e) {}
 
 // 删除 Electron/Node 痕迹
 try {

@@ -5,8 +5,8 @@ const axios = require('axios');
 const { execFile } = require('child_process');
 
 // 启用 Chrome 实验性特性，提高网页兼容性
-app.commandLine.appendSwitch('enable-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass,LocalNetworkAccess');
-app.commandLine.appendSwitch('enable-blink-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass,LocalNetworkAccess');
+app.commandLine.appendSwitch('enable-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass');
+app.commandLine.appendSwitch('enable-blink-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass');
 app.commandLine.appendSwitch('disable-features', 'IsolateOrigins,site-per-process');
 
 // 提高下载性能：增加每个域名的最大并发连接数（默认6，改为16）
@@ -1138,15 +1138,6 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
       callback({ cancel: true });
       return;
     }
-    // 拦截微信 wxLogin.js，注入 local-network-access 权限覆盖后再加载原脚本
-    if (url.includes('res.wx.qq.com/connect/') && url.includes('wxLogin')) {
-      addLog('WX', '拦截wxLogin.js注入权限覆盖', url.substring(0, 80));
-      callback({ redirectURL: 'data:text/javascript,' + encodeURIComponent(`
-        (function(){var origQuery=navigator.permissions.query.bind(navigator.permissions);navigator.permissions.query=function(d){if(d&&(d.name==="local-network-access"||d.name==="local-network")){return Promise.resolve({state:"granted",onchange:null})}return origQuery(d)};})();
-        var s=document.createElement('script');s.src='${url}';s.crossOrigin='anonymous';document.head.appendChild(s);
-      `) });
-      return;
-    }
     if (isMediaUrl(url)) {
       registerMediaCandidate(details.webContentsId, url, {
         source: 'url',
@@ -1170,7 +1161,7 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
     // 伪装 Sec-CH-UA 头，让网站认为这是真正的 Chrome 浏览器
     if (requestHeaders['Sec-CH-UA'] || requestHeaders['sec-ch-ua']) {
       const key = requestHeaders['Sec-CH-UA'] ? 'Sec-CH-UA' : 'sec-ch-ua';
-      requestHeaders[key] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"';
+      requestHeaders[key] = '"Not_A Brand";v="8", "Chromium";v="148", "Google Chrome";v="148"';
     }
     if (requestHeaders['Sec-CH-UA-Mobile'] || requestHeaders['sec-ch-ua-mobile']) {
       const key = requestHeaders['Sec-CH-UA-Mobile'] ? 'Sec-CH-UA-Mobile' : 'sec-ch-ua-mobile';
@@ -1611,7 +1602,7 @@ function createTab(url = null, options = {}) {
   });
 
   // 伪装成 Chrome 浏览器，避免网页因检测到 Electron 而禁用功能
-  const chromeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  const chromeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
   view.webContents.setUserAgent(chromeUserAgent);
 
   const tab = {
@@ -1654,29 +1645,6 @@ function createTab(url = null, options = {}) {
   view.webContents.on('did-start-loading', () => {
     tab.loading = true;
     notifyTabUpdate(tabId, { loading: true });
-  });
-
-  // dom-ready: 在页面脚本执行前注入权限覆盖到主世界
-  // contextIsolation:true 下 preload 的 navigator 修改对页面不可见，必须用 executeJavaScript 注入主世界
-  view.webContents.on('dom-ready', () => {
-    view.webContents.executeJavaScript(`
-      (function() {
-        try {
-          if (navigator.permissions && navigator.permissions.query) {
-            var orig = navigator.permissions.query.bind(navigator.permissions);
-            if (!navigator.permissions.__fmPatched) {
-              navigator.permissions.__fmPatched = true;
-              navigator.permissions.query = function(desc) {
-                if (desc && (desc.name === 'local-network-access' || desc.name === 'local-network')) {
-                  return Promise.resolve({ state: 'granted', onchange: null });
-                }
-                return orig(desc);
-              };
-            }
-          }
-        } catch(e) {}
-      })();
-    `).catch(() => {});
   });
 
   view.webContents.on('did-stop-loading', () => {
@@ -1773,7 +1741,7 @@ function createTab(url = null, options = {}) {
         addLog('FRAME', '子框架加载完成', `url=${frameUrl.substring(0, 120)} routingId=${frameRoutingId}`);
 
         // 微信/QQ 登录 iframe 权限注入：伪造 local-network-access 权限
-        // Electron 28 支持 executeJavaScriptInFrame(frameRoutingId, code)
+        // Electron 42+ 支持 executeJavaScriptInFrame(frameRoutingId, code)
         if (frameUrl.includes('open.weixin.qq.com') || frameUrl.includes('wx.qq.com') || frameUrl.includes('qq.com')) {
           const permOverride = `
             (function() {
@@ -2168,7 +2136,7 @@ function createTab(url = null, options = {}) {
           var _realUA = navigator.userAgent;
           var _spoofedUA = _realUA.replace(/Electron\/[\d.]+\s?/g, '').replace(/Feimaotui-Browser\/[\d.]+\s?/g, '');
           Object.defineProperty(navigator, 'userAgent', {
-            get: function() { return _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'; }
+            get: function() { return _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'; }
           });
           Object.defineProperty(navigator, 'vendor', {
             get: function() { return 'Google Inc.'; }
