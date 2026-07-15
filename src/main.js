@@ -1129,23 +1129,9 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
   const filter = { urls: ['*://*/*'] };
   const label = partitionLabel || 'default';
 
-  // onBeforeRequest: 广告拦截 + 崩溃SDK拦截 + URL级媒体嗅探 + 微信PNA预检拦截
+  // onBeforeRequest: 广告拦截 + 崩溃SDK拦截 + URL级媒体嗅探
   sess.webRequest.onBeforeRequest(filter, (details, callback) => {
     const url = details.url;
-    // 微信快捷登录：拦截 localhost.weixin.qq.com 的 OPTIONS 预检请求
-    // Chromium 148 的 Private Network Access 会从公网页面向本地地址发 preflight
-    // 微信本地服务器不会响应这些预检，所以重定向到 data URL 返回 204 + 必要的 CORS 头
-    if (details.method === 'OPTIONS' && url.includes('localhost.weixin.qq.com')) {
-      const origin = details.requestHeaders && (details.requestHeaders.Origin || details.requestHeaders.origin);
-      const allowedOrigin = origin || 'https://open.weixin.qq.com';
-      const reqMethod = details.requestHeaders && (details.requestHeaders['Access-Control-Request-Method'] || details.requestHeaders['access-control-request-method']) || 'POST';
-      const reqHeaders = details.requestHeaders && (details.requestHeaders['Access-Control-Request-Headers'] || details.requestHeaders['access-control-request-headers']) || '';
-      addLog('WX', 'PNA预检拦截', `${details.method} ${url.substring(0, 80)} origin=${allowedOrigin}`);
-      // 用 data: URL 方式无法返回状态码 204，改用 protocol.handle 方式（在 ready 时注册）
-      // 这里先放行，实际拦截在 onHeadersReceived 中处理
-      callback({});
-      return;
-    }
     if (isAdUrl(url)) {
       callback({ cancel: true });
       return;
@@ -1758,78 +1744,74 @@ function createTab(url = null, options = {}) {
         } catch(e) {}
         addLog('FRAME', '子框架加载完成', `url=${frameUrl.substring(0, 120)} routingId=${frameRoutingId}`);
 
-        // 微信/QQ 登录 iframe 权限注入：绕过 Private Network Access 限制
-        // Chromium 148 的 PNA 会阻止公网页面向 localhost.weixin.qq.com 发请求
-        // 方案：重写 fetch 和 XMLHttpRequest，用 image 标签或 JSONP 方式绕过
-        if (frameUrl.includes('open.weixin.qq.com') || frameUrl.includes('wx.qq.com') || frameUrl.includes('qq.com')) {
-          const wxFixCode = `
-            (function() {
-              try {
-                // 1. 伪造 local-network-access 权限查询
-                if (navigator.permissions && navigator.permissions.query) {
-                  var origQuery = navigator.permissions.query.bind(navigator.permissions);
-                  if (!navigator.permissions.__fmPatched) {
-                    navigator.permissions.__fmPatched = true;
-                    navigator.permissions.query = function(desc) {
-                      if (desc && (desc.name === 'local-network-access' || desc.name === 'local-network')) {
-                        return Promise.resolve({ state: 'granted', onchange: null });
-                      }
-                      return origQuery(desc);
-                    };
-                  }
-                }
-
-                // 2. 重写 fetch：对 localhost.weixin.qq.com 的请求，
-                //    通过创建 img 标签触发请求（绕过 CORS/PNA），
-                //    实际数据通过主进程 IPC 获取（此处先尝试直接 fetch，
-                //    webSecurity:false 应该已经禁用了 PNA）
-                var _origFetch = window.fetch;
-                if (_origFetch && !window.__fmFetchPatched) {
-                  window.__fmFetchPatched = true;
-                  window.fetch = function(input, init) {
-                    var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
-                    // 微信本地请求：直接尝试用原始 fetch（webSecurity:false 应该已禁用 PNA）
-                    if (url.indexOf('localhost.weixin.qq.com') !== -1) {
-                      console.log('[WX-FIX] fetch to localhost.weixin.qq.com:', url);
-                    }
-                    return _origFetch.apply(this, arguments);
-                  };
-                }
-
-                // 3. 重写 XMLHttpRequest，同样记录调试信息
-                var _origXHR = window.XMLHttpRequest;
-                if (_origXHR && !window.__fmXHRPatched) {
-                  window.__fmXHRPatched = true;
-                  var WXXHR = function() {
-                    var xhr = new _origXHR();
-                    var _origOpen = xhr.open.bind(xhr);
-                    xhr.open = function(method, url) {
-                      if (url && url.indexOf('localhost.weixin.qq.com') !== -1) {
-                        console.log('[WX-FIX] XHR to localhost.weixin.qq.com:', method, url);
-                      }
-                      return _origOpen.apply(this, arguments);
-                    };
-                    return xhr;
-                  };
-                  WXXHR.prototype = _origXHR.prototype;
-                  WXXHR.UNSENT = _origXHR.UNSENT;
-                  WXXHR.OPENED = _origXHR.OPENED;
-                  WXXHR.HEADERS_RECEIVED = _origXHR.HEADERS_RECEIVED;
-                  WXXHR.LOADING = _origXHR.LOADING;
-                  WXXHR.DONE = _origXHR.DONE;
-                  window.XMLHttpRequest = WXXHR;
-                }
-              } catch(e) {
-                console.error('[WX-FIX] error:', e);
-              }
-            })();
-          `;
-          // 优先尝试在指定 frame 中执行
+        // 微信/QQ 登录 iframe：注入 JS 代理 fetch 到主进程绕过 PNA
+        if (frameUrl.includes('open.weixin.qq.com') || frameUrl.includes('wx.qq.com')) {
+          const wxProxyCode = `
+(function() {
+  try {
+    if (navigator.permissions && navigator.permissions.query && !navigator.permissions.__fm) {
+      navigator.permissions.__fm = true;
+      var _q = navigator.permissions.query.bind(navigator.permissions);
+      navigator.permissions.query = function(d) {
+        if (d && d.name === 'local-network-access') return Promise.resolve({state:'granted',onchange:null});
+        return _q(d);
+      };
+    }
+    if (!window.__fmFetch2) {
+      window.__fmFetch2 = true;
+      var _fetch = window.fetch;
+      var _rid = 0;
+      var _pending = {};
+      window.addEventListener('message', function(e) {
+        if (!e.data || e.data._wx !== true) return;
+        var p = _pending[e.data._id];
+        if (!p) return;
+        delete _pending[e.data._id];
+        if (e.data.error) { p.reject(new Error(e.data.error)); return; }
+        var r = e.data.response;
+        p.resolve(new Response(r.body, {status:r.status,statusText:r.statusText,headers:new Headers(r.headers)}));
+      });
+      window.fetch = function(input, init) {
+        var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        if (url.indexOf('localhost.weixin.qq.com') !== -1) {
+          return new Promise(function(resolve, reject) {
+            var id = ++_rid;
+            _pending[id] = {resolve:resolve, reject:reject};
+            window.parent.postMessage({_wx:true,_id:id,url:url,method:(init&&init.method)||'GET',headers:init&&init.headers||{},body:init&&init.body||''}, '*');
+            setTimeout(function() { if (_pending[id]) { delete _pending[id]; reject(new Error('wx_proxy_timeout')); } }, 5000);
+          });
+        }
+        return _fetch.apply(this, arguments);
+      };
+    }
+  } catch(e) { console.error('[WX]',e); }
+})();`;
           if (typeof view.webContents.executeJavaScriptInFrame === 'function') {
-            view.webContents.executeJavaScriptInFrame(frameRoutingId, wxFixCode).catch(() => {});
+            view.webContents.executeJavaScriptInFrame(frameRoutingId, wxProxyCode).catch(() => {});
           } else {
-            view.webContents.executeJavaScript(wxFixCode).catch(() => {});
+            view.webContents.executeJavaScript(wxProxyCode).catch(() => {});
           }
+        }
+        // 在父页面注入 postMessage 监听器（只注一次）
+        if (frameUrl.includes('sso.e.qq.com') || frameUrl.includes('open.weixin.qq.com')) {
+          const parentProxyCode = `
+(function() {
+  if (window.__wxParentProxy) return;
+  window.__wxParentProxy = true;
+  window.addEventListener('message', function(e) {
+    if (!e.data || e.data._wx !== true) return;
+    var req = e.data;
+    // 通过 electronAPI 代理请求
+    var api = window.electronAPI;
+    if (!api || !api.wxProxy) { e.source.postMessage({_wx:true,_id:req._id,error:'no_api'}, '*'); return; }
+    api.wxProxy(req).then(function(result) {
+      e.source.postMessage({_wx:true,_id:req._id,response:result}, '*');
+    }).catch(function(err) {
+      e.source.postMessage({_wx:true,_id:req._id,error:err.message||String(err)}, '*');
+    });
+  });
+})();`;
+          view.webContents.executeJavaScript(parentProxyCode).catch(() => {});
         }
       } catch(e) {
         addLog('FRAME', '子框架加载完成', `routingId=${frameRoutingId}`);
@@ -4582,75 +4564,62 @@ function createTray() {
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.feimaotui.browser');
 }
-// ==================== 微信快捷登录：拦截 localhost.weixin.qq.com 的 PNA 预检 ====================
-// Chromium 148 的 Private Network Access 会从公网页面向本地地址发 OPTIONS 预检
-// 微信本地服务器不会响应这些预检，导致快捷登录检测失败
-// 这里用 protocol.handle 拦截 HTTPS 请求，直接返回预检响应
-app.whenReady().then(() => {
-  try {
-    protocol.handle('https', async (request) => {
-      const url = request.url;
-      // 只拦截 localhost.weixin.qq.com 的请求
-      if (!url.includes('localhost.weixin.qq.com')) {
-        // 其他请求正常转发
-        return net.fetch(request, { bypassCustomProtocolHandlers: true });
-      }
+// ==================== 微信快捷登录：IPC 代理 localhost.weixin.qq.com 请求 ====================
+// Chromium 148 的 Private Network Access 在渲染层阻止公网→本地请求
+// 通过 IPC 代理：页面 JS -> preload -> IPC -> 主进程 net.fetch -> 微信本地服务器
+function setupWxProxy() {
+  ipcMain.handle('wx-proxy', async (event, req) => {
+    const url = req.url;
+    addLog('WX', '代理请求', `${req.method || 'GET'} ${url.substring(0, 80)}`);
+    try {
+      const https = require('https');
+      const http = require('http');
+      const parsedUrl = new URL(url);
+      const isHttps = parsedUrl.protocol === 'https:';
+      const agent = isHttps
+        ? new https.Agent({ rejectUnauthorized: false })
+        : new http.Agent();
 
-      // OPTIONS 预检请求：直接返回 204 + CORS + PNA 允许头
-      if (request.method === 'OPTIONS') {
-        const origin = request.headers.get('Origin') || 'https://open.weixin.qq.com';
-        const reqMethod = request.headers.get('Access-Control-Request-Method') || 'POST';
-        const reqHeaders = request.headers.get('Access-Control-Request-Headers') || '';
-        addLog('WX', 'PNA预检拦截', `OPTIONS ${url.substring(0, 80)} origin=${origin}`);
-        return new Response(null, {
-          status: 204,
-          headers: {
-            'Access-Control-Allow-Origin': origin,
-            'Access-Control-Allow-Methods': reqMethod,
-            'Access-Control-Allow-Headers': reqHeaders,
-            'Access-Control-Allow-Credentials': 'true',
-            'Access-Control-Allow-Private-Network': 'true',
-            'Access-Control-Max-Age': '86400'
-          }
+      const response = await new Promise((resolve, reject) => {
+        const options = {
+          hostname: parsedUrl.hostname,
+          port: parsedUrl.port || (isHttps ? 443 : 80),
+          path: parsedUrl.pathname + parsedUrl.search,
+          method: req.method || 'GET',
+          headers: req.headers || {},
+          agent: agent,
+          rejectUnauthorized: false
+        };
+        const lib = isHttps ? https : http;
+        const hreq = lib.request(options, (res) => {
+          let body = '';
+          res.on('data', chunk => body += chunk);
+          res.on('end', () => {
+            resolve({
+              status: res.statusCode,
+              statusText: res.statusMessage,
+              headers: res.headers,
+              body: body
+            });
+          });
         });
-      }
+        hreq.on('error', reject);
+        if (req.body) hreq.write(req.body);
+        hreq.end();
+        setTimeout(() => reject(new Error('request_timeout')), 5000);
+      });
 
-      // 非 OPTIONS 请求（实际的 POST 请求）：添加 CORS 头后转发给真实服务器
-      try {
-        addLog('WX', '本地请求转发', `${request.method} ${url.substring(0, 80)}`);
-        const response = await net.fetch(request, { bypassCustomProtocolHandlers: true });
-        // 给响应添加 CORS 头
-        const newHeaders = new Headers(response.headers);
-        const origin = request.headers.get('Origin') || 'https://open.weixin.qq.com';
-        newHeaders.set('Access-Control-Allow-Origin', origin);
-        newHeaders.set('Access-Control-Allow-Credentials', 'true');
-        newHeaders.set('Access-Control-Allow-Private-Network', 'true');
-        return new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: newHeaders
-        });
-      } catch (e) {
-        // 微信客户端没启动或端口不通，返回错误
-        addLog('WX', '本地请求失败', `${request.method} ${url.substring(0, 80)} error=${e.message}`);
-        return new Response(JSON.stringify({ error: 'wechat_not_running' }), {
-          status: 502,
-          headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': request.headers.get('Origin') || 'https://open.weixin.qq.com',
-            'Access-Control-Allow-Credentials': 'true',
-            'Access-Control-Allow-Private-Network': 'true'
-          }
-        });
-      }
-    });
-    addLog('INFO', '微信PNA拦截', '已注册 localhost.weixin.qq.com 协议拦截');
-  } catch (e) {
-    addLog('WARN', '微信PNA拦截', `注册失败: ${e.message}`);
-  }
-});
+      addLog('WX', '代理响应', `status=${response.status} size=${response.body.length}`);
+      return response;
+    } catch (e) {
+      addLog('WX', '代理失败', `error=${e.message}`);
+      return { status: 502, statusText: 'Bad Gateway', headers: {}, body: JSON.stringify({ error: e.message }) };
+    }
+  });
+}
 
 app.whenReady().then(() => {
+  setupWxProxy();
   loadData();
   createMainWindow();
   setupIPC();

@@ -477,6 +477,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // 事件监听
   onTabCreated: (callback) => ipcRenderer.on('tab-created', (event, data) => callback(data)),
+  // 微信代理
+  wxProxy: (options) => ipcRenderer.invoke('wx-proxy', options),
+  onWxProxyResponse: (callback) => ipcRenderer.on('wx-proxy-response', (event, data) => callback(data)),
   onTabClosed: (callback) => ipcRenderer.on('tab-closed', (event, data) => callback(data)),
   onTabActivated: (callback) => ipcRenderer.on('tab-activated', (event, data) => callback(data)),
   onTabUpdated: (callback) => ipcRenderer.on('tab-updated', (event, data) => callback(data)),
