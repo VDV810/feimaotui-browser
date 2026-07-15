@@ -1147,7 +1147,7 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
     callback({});
   });
 
-  // onBeforeSendHeaders: Range请求媒体嗅探
+  // onBeforeSendHeaders: Range请求媒体嗅探 + 伪装Sec-CH-UA头
   sess.webRequest.onBeforeSendHeaders(filter, (details, callback) => {
     const requestHeaders = details.requestHeaders || {};
     const rangeHeader = requestHeaders.Range || requestHeaders.range;
@@ -1157,6 +1157,19 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
         type: getMediaType(details.url),
         title: getFileNameFromUrl(details.url)
       });
+    }
+    // 伪装 Sec-CH-UA 头，让网站认为这是真正的 Chrome 浏览器
+    if (requestHeaders['Sec-CH-UA'] || requestHeaders['sec-ch-ua']) {
+      const key = requestHeaders['Sec-CH-UA'] ? 'Sec-CH-UA' : 'sec-ch-ua';
+      requestHeaders[key] = '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"';
+    }
+    if (requestHeaders['Sec-CH-UA-Mobile'] || requestHeaders['sec-ch-ua-mobile']) {
+      const key = requestHeaders['Sec-CH-UA-Mobile'] ? 'Sec-CH-UA-Mobile' : 'sec-ch-ua-mobile';
+      requestHeaders[key] = '?0';
+    }
+    if (requestHeaders['Sec-CH-UA-Platform'] || requestHeaders['sec-ch-ua-platform']) {
+      const key = requestHeaders['Sec-CH-UA-Platform'] ? 'Sec-CH-UA-Platform' : 'sec-ch-ua-platform';
+      requestHeaders[key] = '"Windows"';
     }
     callback({ requestHeaders });
   });
@@ -2049,8 +2062,17 @@ function createTab(url = null, options = {}) {
   // 允许 about: 协议（iframe 初始化需要 about:blank）
   const isUnknownProtocol = (url) => /^[a-z][a-z0-9+.-]*:/i.test(url) && !/^(https?|about):/i.test(url);
 
+  // 允许通过系统打开的外部协议白名单（微信、QQ、腾讯等）
+  const isExternalProtocol = (url) => /^(weixin|tencent|qq|mqq|alipays|mailto|tel|taobao|tmall):/i.test(url);
+
   // 调试日志：记录所有导航事件，帮助追踪 bytedance 弹窗来源
   view.webContents.on('will-navigate', (event, url) => {
+    if (isExternalProtocol(url)) {
+      event.preventDefault();
+      shell.openExternal(url).catch(() => {});
+      addLog('EXT', '通过系统打开外部协议(will-navigate)', url);
+      return;
+    }
     if (isUnknownProtocol(url)) {
       event.preventDefault();
       addLog('BLOCK', '拦截未知协议(will-navigate)', url);
@@ -2060,6 +2082,12 @@ function createTab(url = null, options = {}) {
   });
 
   view.webContents.on('did-start-navigation', (event, url, isInPlace, isMainFrame, frameProcessId, frameRoutingId) => {
+    if (isExternalProtocol(url)) {
+      event.preventDefault && event.preventDefault();
+      shell.openExternal(url).catch(() => {});
+      addLog('EXT', '通过系统打开外部协议(did-start-navigation)', `url=${url} isMainFrame=${isMainFrame}`);
+      return;
+    }
     if (isUnknownProtocol(url)) {
       event.preventDefault && event.preventDefault();
       addLog('BLOCK', '拦截未知协议(did-start-navigation)', `url=${url} isMainFrame=${isMainFrame}`);
@@ -2078,7 +2106,7 @@ function createTab(url = null, options = {}) {
           var _realUA = navigator.userAgent;
           var _spoofedUA = _realUA.replace(/Electron\/[\d.]+\s?/g, '').replace(/Feimaotui-Browser\/[\d.]+\s?/g, '');
           Object.defineProperty(navigator, 'userAgent', {
-            get: function() { return _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'; }
+            get: function() { return _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'; }
           });
           Object.defineProperty(navigator, 'vendor', {
             get: function() { return 'Google Inc.'; }
@@ -2125,6 +2153,12 @@ function createTab(url = null, options = {}) {
   });
 
   view.webContents.on('will-frame-navigate', (event, url, isMainFrame, frameProcessId, frameRoutingId) => {
+    if (isExternalProtocol(url)) {
+      event.preventDefault();
+      shell.openExternal(url).catch(() => {});
+      addLog('EXT', '通过系统打开外部协议(will-frame-navigate)', `url=${url} isMainFrame=${isMainFrame}`);
+      return;
+    }
     if (isUnknownProtocol(url)) {
       event.preventDefault();
       addLog('BLOCK', '拦截未知协议(will-frame-navigate)', `url=${url} isMainFrame=${isMainFrame}`);
@@ -2134,6 +2168,11 @@ function createTab(url = null, options = {}) {
   });
 
   view.webContents.setWindowOpenHandler(({ url, referrer, disposition, features }) => {
+    if (isExternalProtocol(url)) {
+      shell.openExternal(url).catch(() => {});
+      addLog('EXT', '通过系统打开外部协议(setWindowOpenHandler)', `url=${url} disposition=${disposition}`);
+      return { action: 'deny' };
+    }
     if (isUnknownProtocol(url)) {
       addLog('BLOCK', '拦截未知协议(setWindowOpenHandler)', `url=${url} disposition=${disposition}`);
       return { action: 'deny' };

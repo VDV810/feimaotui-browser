@@ -5,7 +5,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 const _realUA = navigator.userAgent;
 const _spoofedUA = _realUA.replace(/Electron\/[\d.]+\s?/g, '').replace(/Feimaotui-Browser\/[\d.]+\s?/g, '');
 Object.defineProperty(navigator, 'userAgent', {
-  get: () => _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+  get: () => _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 });
 Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
 Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
