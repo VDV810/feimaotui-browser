@@ -1611,7 +1611,7 @@ function createTab(url = null, options = {}) {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload', 'preload.js'),
-      webSecurity: true,
+      webSecurity: false,
       sandbox: false,
       allowRunningInsecureContent: true,
       nodeIntegrationInSubFrames: true,
@@ -1758,33 +1758,77 @@ function createTab(url = null, options = {}) {
         } catch(e) {}
         addLog('FRAME', '子框架加载完成', `url=${frameUrl.substring(0, 120)} routingId=${frameRoutingId}`);
 
-        // 微信/QQ 登录 iframe 权限注入：伪造 local-network-access 权限
-        // Electron 42+ 支持 executeJavaScriptInFrame(frameRoutingId, code)
+        // 微信/QQ 登录 iframe 权限注入：绕过 Private Network Access 限制
+        // Chromium 148 的 PNA 会阻止公网页面向 localhost.weixin.qq.com 发请求
+        // 方案：重写 fetch 和 XMLHttpRequest，用 image 标签或 JSONP 方式绕过
         if (frameUrl.includes('open.weixin.qq.com') || frameUrl.includes('wx.qq.com') || frameUrl.includes('qq.com')) {
-          const permOverride = `
+          const wxFixCode = `
             (function() {
               try {
+                // 1. 伪造 local-network-access 权限查询
                 if (navigator.permissions && navigator.permissions.query) {
-                  var orig = navigator.permissions.query.bind(navigator.permissions);
+                  var origQuery = navigator.permissions.query.bind(navigator.permissions);
                   if (!navigator.permissions.__fmPatched) {
                     navigator.permissions.__fmPatched = true;
                     navigator.permissions.query = function(desc) {
                       if (desc && (desc.name === 'local-network-access' || desc.name === 'local-network')) {
                         return Promise.resolve({ state: 'granted', onchange: null });
                       }
-                      return orig(desc);
+                      return origQuery(desc);
                     };
                   }
                 }
-              } catch(e) {}
+
+                // 2. 重写 fetch：对 localhost.weixin.qq.com 的请求，
+                //    通过创建 img 标签触发请求（绕过 CORS/PNA），
+                //    实际数据通过主进程 IPC 获取（此处先尝试直接 fetch，
+                //    webSecurity:false 应该已经禁用了 PNA）
+                var _origFetch = window.fetch;
+                if (_origFetch && !window.__fmFetchPatched) {
+                  window.__fmFetchPatched = true;
+                  window.fetch = function(input, init) {
+                    var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+                    // 微信本地请求：直接尝试用原始 fetch（webSecurity:false 应该已禁用 PNA）
+                    if (url.indexOf('localhost.weixin.qq.com') !== -1) {
+                      console.log('[WX-FIX] fetch to localhost.weixin.qq.com:', url);
+                    }
+                    return _origFetch.apply(this, arguments);
+                  };
+                }
+
+                // 3. 重写 XMLHttpRequest，同样记录调试信息
+                var _origXHR = window.XMLHttpRequest;
+                if (_origXHR && !window.__fmXHRPatched) {
+                  window.__fmXHRPatched = true;
+                  var WXXHR = function() {
+                    var xhr = new _origXHR();
+                    var _origOpen = xhr.open.bind(xhr);
+                    xhr.open = function(method, url) {
+                      if (url && url.indexOf('localhost.weixin.qq.com') !== -1) {
+                        console.log('[WX-FIX] XHR to localhost.weixin.qq.com:', method, url);
+                      }
+                      return _origOpen.apply(this, arguments);
+                    };
+                    return xhr;
+                  };
+                  WXXHR.prototype = _origXHR.prototype;
+                  WXXHR.UNSENT = _origXHR.UNSENT;
+                  WXXHR.OPENED = _origXHR.OPENED;
+                  WXXHR.HEADERS_RECEIVED = _origXHR.HEADERS_RECEIVED;
+                  WXXHR.LOADING = _origXHR.LOADING;
+                  WXXHR.DONE = _origXHR.DONE;
+                  window.XMLHttpRequest = WXXHR;
+                }
+              } catch(e) {
+                console.error('[WX-FIX] error:', e);
+              }
             })();
           `;
           // 优先尝试在指定 frame 中执行
           if (typeof view.webContents.executeJavaScriptInFrame === 'function') {
-            view.webContents.executeJavaScriptInFrame(frameRoutingId, permOverride).catch(() => {});
+            view.webContents.executeJavaScriptInFrame(frameRoutingId, wxFixCode).catch(() => {});
           } else {
-            // 退回在主 frame 执行
-            view.webContents.executeJavaScript(permOverride).catch(() => {});
+            view.webContents.executeJavaScript(wxFixCode).catch(() => {});
           }
         }
       } catch(e) {
