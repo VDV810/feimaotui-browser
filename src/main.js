@@ -1596,7 +1596,7 @@ function createTab(url = null, options = {}) {
       webSecurity: true,
       sandbox: false,
       allowRunningInsecureContent: true,
-      nodeIntegrationInSubFrames: false,
+      nodeIntegrationInSubFrames: true,
       partition: options.privacyMode ? 'persist:privacy' : 'persist:main'
     }
   });
@@ -1729,7 +1729,7 @@ function createTab(url = null, options = {}) {
   view.webContents.on('did-frame-finish-load', (event, isMainFrame, frameProcessId, frameRoutingId) => {
     if (!isMainFrame) {
       try {
-        // 尝试获取子 frame 的 URL（注意：部分 Electron 版本 getAllFrames 不可用）
+        // 尝试获取子 frame 的 URL
         let frameUrl = '';
         try {
           if (typeof view.webContents.getAllFrames === 'function') {
@@ -1739,6 +1739,28 @@ function createTab(url = null, options = {}) {
           }
         } catch(e) {}
         addLog('FRAME', '子框架加载完成', `url=${frameUrl.substring(0, 120)} routingId=${frameRoutingId}`);
+
+        // 微信/QQ 登录 iframe 权限注入：伪造 local-network-access 权限
+        if (frameUrl.includes('open.weixin.qq.com') || frameUrl.includes('wx.qq.com') || frameUrl.includes('qq.com')) {
+          view.webContents.executeJavaScriptInFrame || view.webContents.executeJavaScript(`
+            (function() {
+              try {
+                if (navigator.permissions && navigator.permissions.query) {
+                  var orig = navigator.permissions.query.bind(navigator.permissions);
+                  if (!navigator.permissions.__feimaotuiPatched) {
+                    navigator.permissions.__feimaotuiPatched = true;
+                    navigator.permissions.query = function(desc) {
+                      if (desc && desc.name === 'local-network-access') {
+                        return Promise.resolve({ state: 'granted', onchange: null });
+                      }
+                      return orig(desc);
+                    };
+                  }
+                }
+              } catch(e) {}
+            })();
+          `, true).catch(() => {});
+        }
       } catch(e) {
         addLog('FRAME', '子框架加载完成', `routingId=${frameRoutingId}`);
       }
