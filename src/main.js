@@ -20,6 +20,9 @@ app.commandLine.appendSwitch('allow-cross-origin-auth-prompt', 'true');
 app.commandLine.appendSwitch('disable-renderer-backgrounding', 'true');
 app.commandLine.appendSwitch('no-sandbox', 'true');
 
+// 允许本地 HTTPS 自签名证书（微信客户端检测需要访问 https://localhost.weixin.qq.com）
+app.commandLine.appendSwitch('ignore-certificate-errors');
+
 // ==================== 运行日志系统 ====================
 const MAX_LOG_LINES = 5000;
 let runtimeLogs = [];
@@ -2063,10 +2066,11 @@ function createTab(url = null, options = {}) {
     }
   });
 
-  // 监听证书错误
+  // 监听证书错误（微信客户端检测需要 localhost.weixin.qq.com 自签名证书）
   view.webContents.on('certificate-error', (event, url, error, certificate, callback) => {
-    addLog('WARN', '证书错误', `url=${url.substring(0, 80)} error=${error}`);
-    callback(false);
+    const isWeixinLocal = url.includes('localhost.weixin.qq.com');
+    addLog(isWeixinLocal ? 'INFO' : 'WARN', '证书错误', `url=${url.substring(0, 80)} error=${error} accepted=${isWeixinLocal}`);
+    callback(isWeixinLocal);
   });
 
   // 监听页面控制台消息，捕获 iframe 内的错误
