@@ -7,7 +7,8 @@ const { execFile } = require('child_process');
 // 启用 Chrome 实验性特性，提高网页兼容性
 app.commandLine.appendSwitch('enable-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass');
 app.commandLine.appendSwitch('enable-blink-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass');
-app.commandLine.appendSwitch('disable-features', 'IsolateOrigins,site-per-process');
+// 禁用 Private Network Access 限制，允许公网页面访问本地网络（微信客户端检测需要）
+app.commandLine.appendSwitch('disable-features', 'IsolateOrigins,site-per-process,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights,PrivateNetworkAccessRespectPreflightResults');
 
 // 提高下载性能：增加每个域名的最大并发连接数（默认6，改为16）
 app.commandLine.appendSwitch('max-connections-per-server', '16');
