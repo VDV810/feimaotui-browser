@@ -1,4 +1,4 @@
-const { app, BrowserWindow, BrowserView, ipcMain, dialog, session, shell, Menu, Tray, clipboard, desktopCapturer, globalShortcut } = require('electron');
+const { app, BrowserWindow, BrowserView, ipcMain, dialog, session, shell, Menu, Tray, clipboard, desktopCapturer, globalShortcut, net, protocol } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
@@ -1129,9 +1129,23 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
   const filter = { urls: ['*://*/*'] };
   const label = partitionLabel || 'default';
 
-  // onBeforeRequest: 广告拦截 + 崩溃SDK拦截 + URL级媒体嗅探
+  // onBeforeRequest: 广告拦截 + 崩溃SDK拦截 + URL级媒体嗅探 + 微信PNA预检拦截
   sess.webRequest.onBeforeRequest(filter, (details, callback) => {
     const url = details.url;
+    // 微信快捷登录：拦截 localhost.weixin.qq.com 的 OPTIONS 预检请求
+    // Chromium 148 的 Private Network Access 会从公网页面向本地地址发 preflight
+    // 微信本地服务器不会响应这些预检，所以重定向到 data URL 返回 204 + 必要的 CORS 头
+    if (details.method === 'OPTIONS' && url.includes('localhost.weixin.qq.com')) {
+      const origin = details.requestHeaders && (details.requestHeaders.Origin || details.requestHeaders.origin);
+      const allowedOrigin = origin || 'https://open.weixin.qq.com';
+      const reqMethod = details.requestHeaders && (details.requestHeaders['Access-Control-Request-Method'] || details.requestHeaders['access-control-request-method']) || 'POST';
+      const reqHeaders = details.requestHeaders && (details.requestHeaders['Access-Control-Request-Headers'] || details.requestHeaders['access-control-request-headers']) || '';
+      addLog('WX', 'PNA预检拦截', `${details.method} ${url.substring(0, 80)} origin=${allowedOrigin}`);
+      // 用 data: URL 方式无法返回状态码 204，改用 protocol.handle 方式（在 ready 时注册）
+      // 这里先放行，实际拦截在 onHeadersReceived 中处理
+      callback({});
+      return;
+    }
     if (isAdUrl(url)) {
       callback({ cancel: true });
       return;
@@ -4524,6 +4538,74 @@ function createTray() {
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.feimaotui.browser');
 }
+// ==================== 微信快捷登录：拦截 localhost.weixin.qq.com 的 PNA 预检 ====================
+// Chromium 148 的 Private Network Access 会从公网页面向本地地址发 OPTIONS 预检
+// 微信本地服务器不会响应这些预检，导致快捷登录检测失败
+// 这里用 protocol.handle 拦截 HTTPS 请求，直接返回预检响应
+app.whenReady().then(() => {
+  try {
+    protocol.handle('https', async (request) => {
+      const url = request.url;
+      // 只拦截 localhost.weixin.qq.com 的请求
+      if (!url.includes('localhost.weixin.qq.com')) {
+        // 其他请求正常转发
+        return net.fetch(request, { bypassCustomProtocolHandlers: true });
+      }
+
+      // OPTIONS 预检请求：直接返回 204 + CORS + PNA 允许头
+      if (request.method === 'OPTIONS') {
+        const origin = request.headers.get('Origin') || 'https://open.weixin.qq.com';
+        const reqMethod = request.headers.get('Access-Control-Request-Method') || 'POST';
+        const reqHeaders = request.headers.get('Access-Control-Request-Headers') || '';
+        addLog('WX', 'PNA预检拦截', `OPTIONS ${url.substring(0, 80)} origin=${origin}`);
+        return new Response(null, {
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Origin': origin,
+            'Access-Control-Allow-Methods': reqMethod,
+            'Access-Control-Allow-Headers': reqHeaders,
+            'Access-Control-Allow-Credentials': 'true',
+            'Access-Control-Allow-Private-Network': 'true',
+            'Access-Control-Max-Age': '86400'
+          }
+        });
+      }
+
+      // 非 OPTIONS 请求（实际的 POST 请求）：添加 CORS 头后转发给真实服务器
+      try {
+        addLog('WX', '本地请求转发', `${request.method} ${url.substring(0, 80)}`);
+        const response = await net.fetch(request, { bypassCustomProtocolHandlers: true });
+        // 给响应添加 CORS 头
+        const newHeaders = new Headers(response.headers);
+        const origin = request.headers.get('Origin') || 'https://open.weixin.qq.com';
+        newHeaders.set('Access-Control-Allow-Origin', origin);
+        newHeaders.set('Access-Control-Allow-Credentials', 'true');
+        newHeaders.set('Access-Control-Allow-Private-Network', 'true');
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: newHeaders
+        });
+      } catch (e) {
+        // 微信客户端没启动或端口不通，返回错误
+        addLog('WX', '本地请求失败', `${request.method} ${url.substring(0, 80)} error=${e.message}`);
+        return new Response(JSON.stringify({ error: 'wechat_not_running' }), {
+          status: 502,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': request.headers.get('Origin') || 'https://open.weixin.qq.com',
+            'Access-Control-Allow-Credentials': 'true',
+            'Access-Control-Allow-Private-Network': 'true'
+          }
+        });
+      }
+    });
+    addLog('INFO', '微信PNA拦截', '已注册 localhost.weixin.qq.com 协议拦截');
+  } catch (e) {
+    addLog('WARN', '微信PNA拦截', `注册失败: ${e.message}`);
+  }
+});
+
 app.whenReady().then(() => {
   loadData();
   createMainWindow();
