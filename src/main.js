@@ -553,13 +553,18 @@ function applyFontSizeToAllTabs() {
 function resetZoomForActiveTab(tabId = globalState.activeTabId) {
   const tab = globalState.tabs.get(tabId);
   if (!tab || !tab.webContents) return;
-  tab.zoomLevel = 0;
-  tab.webContents.setZoomLevel(0);
+  // 重置所有标签页的缩放（全局缩放）
+  const resetLevel = 0;
+  for (const t of globalState.tabs.values()) {
+    if (!t.webContents || t.webContents.isDestroyed()) continue;
+    t.zoomLevel = resetLevel;
+    t.webContents.setZoomLevel(resetLevel);
+  }
   if (globalState.settings) {
-    globalState.settings.defaultZoomLevel = 0;
+    globalState.settings.defaultZoomLevel = resetLevel;
     saveData();
   }
-  addLog('SETTINGS', '重置页面缩放', tab.url || tabId);
+  addLog('SETTINGS', '重置所有页面缩放', tab.url || tabId);
 }
 
 function applyZoomToTab(tab, nextLevel, reason = '页面缩放') {
@@ -1897,7 +1902,7 @@ function createTab(url = null, options = {}) {
     loading: false,
     canGoBack: false,
     canGoForward: false,
-    zoomLevel: 0,
+    zoomLevel: (globalState.settings && typeof globalState.settings.defaultZoomLevel === 'number') ? globalState.settings.defaultZoomLevel : 0,
     webContents: view.webContents,
     view: view,
     referrer: referrer,
@@ -1944,11 +1949,10 @@ function createTab(url = null, options = {}) {
     addLog('TAB', '页面加载完成', `${tab.title} | ${tab.url}`);
     notifyTabUpdate(tabId, { title: tab.title, url: tab.url });
     addToHistory(tab.url, tab.title);
-    // 不再强制重置缩放为0，使用保存的缩放级别
-    var savedZoom = (globalState.settings && typeof globalState.settings.defaultZoomLevel === 'number') ? globalState.settings.defaultZoomLevel : 0;
-    if (typeof tab.zoomLevel !== 'number') tab.zoomLevel = savedZoom;
+    // 使用保存的缩放级别，不再强制重置
+    // 注意：不调用 applyZoomToTab（会同步所有标签页），只在当前标签页应用缩放
     view.webContents.setZoomLevel(tab.zoomLevel);
-    applyZoomToTab(tab, tab.zoomLevel, '页面加载应用缩放');
+    addLog('TAB', '页面加载完成-应用缩放', `级别: ${tab.zoomLevel}`);
     applyFontSizeToTab(tab);
 
     // ==================== 注入微信快捷登录兼容脚本到主帧 ====================
@@ -4691,14 +4695,11 @@ function setupIPC() {
     menu.popup({ window: mainWindow });
   });
 
-  // 页面缩放
+  // 页面缩放 - 同步到所有标签页并持久化
   ipcMain.handle('set-zoom-level', (event, tabId, level) => {
     const tab = globalState.tabs.get(tabId);
     if (tab && tab.webContents) {
-      const normalizedLevel = Math.max(-3, Math.min(3, Number(level) || 0));
-      tab.zoomLevel = normalizedLevel;
-      tab.webContents.setZoomLevel(normalizedLevel);
-      addLog('SETTINGS', '页面缩放', `级别: ${normalizedLevel}`);
+      applyZoomToTab(tab, level, '渲染进程缩放');
     }
   });
 

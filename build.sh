@@ -19,7 +19,7 @@ if [ ! -f "$EXE_PATH" ]; then
     exit 1
 fi
 
-python3 /data/user/work/set_icon.py "$EXE_PATH" "$ICON_PATH"
+python3 build/set_icon.py "$EXE_PATH" "$ICON_PATH"
 
 echo "=== Step 3: Build NSIS installer from prepackaged directory ==="
 npx electron-builder --win nsis --x64 --prepackaged release/win-unpacked || true

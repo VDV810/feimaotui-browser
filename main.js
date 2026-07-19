@@ -1,24 +1,48 @@
-const { app, BrowserWindow, BrowserView, ipcMain, dialog, session, shell, Menu, Tray, clipboard, desktopCapturer, globalShortcut } = require('electron');
+const { app, BrowserWindow, BrowserView, ipcMain, dialog, session, shell, Menu, Tray, clipboard, desktopCapturer, globalShortcut, net, protocol } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
 const { execFile } = require('child_process');
 
+// ==================== 注册自定义特权协议（必须在 app ready 之前） ====================
+// wx-local: 用于代理 https://localhost.weixin.qq.com 请求，绕过 Chromium PNA 限制
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: 'wx-local',
+    privileges: {
+      standard: true,
+      secure: true,
+      bypassCSP: true,
+      allowServiceWorkers: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true
+    }
+  }
+]);
+
 // 启用 Chrome 实验性特性，提高网页兼容性
 app.commandLine.appendSwitch('enable-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass');
 app.commandLine.appendSwitch('enable-blink-features', 'CSSContainerQueries,CSSLayers,CSSHasPseudoClass');
-app.commandLine.appendSwitch('disable-features', 'IsolateOrigins,site-per-process');
+// 禁用 Private Network Access 限制，允许公网页面访问本地网络（微信客户端检测需要）
+// Chromium 148 需要禁用更多 PNA 相关特性
+app.commandLine.appendSwitch('disable-features', 'IsolateOrigins,site-per-process,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights,PrivateNetworkAccessRespectPreflightResults,PrivateNetworkAccess,PrivateNetworkAccessForWorkers,PrivateNetworkAccessForIframes');
+app.commandLine.appendSwitch('disable-web-security');
+app.commandLine.appendSwitch('allow-insecure-localhost');
+app.commandLine.appendSwitch('allow-running-insecure-content');
 
 // 提高下载性能：增加每个域名的最大并发连接数（默认6，改为16）
 app.commandLine.appendSwitch('max-connections-per-server', '16');
 
 // 修复跨域iframe兼容性（千问等阿里系网站需要）
 app.commandLine.appendSwitch('disable-site-isolation-trials', 'true');
-app.commandLine.appendSwitch('disable-web-security', 'true');
 app.commandLine.appendSwitch('allow-file-access-from-files', 'true');
 app.commandLine.appendSwitch('allow-cross-origin-auth-prompt', 'true');
 app.commandLine.appendSwitch('disable-renderer-backgrounding', 'true');
 app.commandLine.appendSwitch('no-sandbox', 'true');
+
+// 允许本地 HTTPS 自签名证书（微信客户端检测需要访问 https://localhost.weixin.qq.com）
+app.commandLine.appendSwitch('ignore-certificate-errors');
 
 // ==================== 运行日志系统 ====================
 const MAX_LOG_LINES = 5000;
@@ -529,13 +553,18 @@ function applyFontSizeToAllTabs() {
 function resetZoomForActiveTab(tabId = globalState.activeTabId) {
   const tab = globalState.tabs.get(tabId);
   if (!tab || !tab.webContents) return;
-  tab.zoomLevel = 0;
-  tab.webContents.setZoomLevel(0);
+  // 重置所有标签页的缩放（全局缩放）
+  const resetLevel = 0;
+  for (const t of globalState.tabs.values()) {
+    if (!t.webContents || t.webContents.isDestroyed()) continue;
+    t.zoomLevel = resetLevel;
+    t.webContents.setZoomLevel(resetLevel);
+  }
   if (globalState.settings) {
-    globalState.settings.defaultZoomLevel = 0;
+    globalState.settings.defaultZoomLevel = resetLevel;
     saveData();
   }
-  addLog('SETTINGS', '重置页面缩放', tab.url || tabId);
+  addLog('SETTINGS', '重置所有页面缩放', tab.url || tabId);
 }
 
 function applyZoomToTab(tab, nextLevel, reason = '页面缩放') {
@@ -1120,14 +1149,274 @@ function showPageContextMenu(tabId, params) {
   menu.popup({ window: mainWindow });
 }
 
+// ==================== 微信快捷登录兼容脚本注入 ====================
+// 在主帧注入：1) 修复权限API  2) 自动给微信iframe添加allow属性  3) 拦截fetch/XHR兜底
+function injectWxCompatibilityScript(webContents, pageUrl) {
+  if (!webContents || webContents.isDestroyed()) return;
+  // 只在可能包含微信登录的页面注入
+  if (!pageUrl || pageUrl === 'about:blank') return;
+
+  const script = `
+(function() {
+  if (window.__wxCompatInjected) return;
+  window.__wxCompatInjected = true;
+
+  try {
+    // 1. 修复 navigator.permissions.query：兼容 local-network-access 和 private-network-access
+    if (navigator.permissions && navigator.permissions.query) {
+      var _origQuery = navigator.permissions.query.bind(navigator.permissions);
+      navigator.permissions.query = function(desc) {
+        if (desc && (desc.name === 'local-network-access' || desc.name === 'private-network-access')) {
+          return Promise.resolve({ state: 'granted', onchange: null });
+        }
+        return _origQuery(desc);
+      };
+    }
+
+    // 2. 修复 document.featurePolicy / document.permissionsPolicy
+    function patchPolicy(policy) {
+      if (!policy) return;
+      var origAllowedFeatures = policy.allowedFeatures.bind(policy);
+      policy.allowedFeatures = function() {
+        var features = origAllowedFeatures();
+        if (features.indexOf('local-network-access') === -1) features.push('local-network-access');
+        if (features.indexOf('private-network-access') === -1) features.push('private-network-access');
+        return features;
+      };
+      var origAllowsFeature = policy.allowsFeature.bind(policy);
+      policy.allowsFeature = function(feature) {
+        if (feature === 'local-network-access' || feature === 'private-network-access') return true;
+        return origAllowsFeature.apply(this, arguments);
+      };
+    }
+    if (document.featurePolicy) patchPolicy(document.featurePolicy);
+    if (document.permissionsPolicy) patchPolicy(document.permissionsPolicy);
+
+    // 3. 自动给微信登录iframe添加allow属性（允许私网访问）
+    function fixWxIframe(iframe) {
+      if (!iframe || !iframe.getAttribute) return;
+      var src = iframe.getAttribute('src') || '';
+      if (src.indexOf('open.weixin.qq.com') !== -1 || src.indexOf('wx.qq.com') !== -1) {
+        var allow = iframe.getAttribute('allow') || '';
+        if (allow.indexOf('private-network-access') === -1 && allow.indexOf('local-network-access') === -1) {
+          iframe.setAttribute('allow', allow + '; private-network-access *; local-network-access *');
+        }
+      }
+    }
+    // 修复已有iframe
+    document.querySelectorAll('iframe').forEach(fixWxIframe);
+    // 监听新创建的iframe
+    var observer = new MutationObserver(function(mutations) {
+      mutations.forEach(function(m) {
+        m.addedNodes.forEach(function(node) {
+          if (node.tagName === 'IFRAME') fixWxIframe(node);
+          if (node.querySelectorAll) node.querySelectorAll('iframe').forEach(fixWxIframe);
+        });
+      });
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+
+    // 4. 兜底：在主帧拦截 fetch/XHR 对 localhost.weixin.qq.com 的请求，通过 electronAPI 代理
+    // （某些页面可能直接在主帧发起请求，而不是在iframe中）
+    if (window.electronAPI && window.electronAPI.wxProxy) {
+      var _origFetch = window.fetch;
+      window.fetch = function(input, init) {
+        var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        if (url && url.indexOf('localhost.weixin.qq.com') !== -1) {
+          var method = (init && init.method) || 'GET';
+          var headers = (init && init.headers) || {};
+          var body = (init && init.body) || '';
+          return window.electronAPI.wxProxy({ url: url, method: method, headers: headers, body: typeof body === 'string' ? body : '' })
+            .then(function(r) {
+              return new Response(r.body, { status: r.status, statusText: r.statusText, headers: r.headers });
+            });
+        }
+        return _origFetch.apply(this, arguments);
+      };
+    }
+
+    console.log('[WX] 微信快捷登录兼容脚本已注入');
+  } catch(e) {
+    console.error('[WX] 兼容脚本注入失败', e);
+  }
+})();`;
+
+  webContents.executeJavaScript(script).catch(() => {});
+}
+
 // ==================== 会话设置 ====================
 function setupSessionHandlersForPartition(sess, partitionLabel) {
-  const filter = { urls: ['*://*/*'] };
   const label = partitionLabel || 'default';
+
+  // ==================== wx-local 协议处理器：代理 localhost.weixin.qq.com 请求 ====================
+  // 在网络栈层拦截，完全绕过 Chromium 的 Private Network Access 检查
+  try {
+    sess.protocol.handle('wx-local', async (request) => {
+      // wx-local://<host>/<path> -> https://<host>/<path>
+      const url = request.url.replace('wx-local://', 'https://');
+      addLog('WX', '协议拦截', `${request.method} ${url.substring(0, 100)}`);
+
+      // CORS 预检验证直接返回 204（微信本地服务器不处理 OPTIONS）
+      if (request.method === 'OPTIONS') {
+        addLog('WX', '响应OPTIONS', url.substring(0, 80));
+        return new Response(null, {
+          status: 204,
+          statusText: 'No Content',
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
+            'Access-Control-Allow-Headers': '*',
+            'Access-Control-Allow-Private-Network': 'true',
+            'Access-Control-Max-Age': '86400',
+            'Content-Length': '0'
+          }
+        });
+      }
+
+      try {
+        const https = require('https');
+        const http = require('http');
+        const parsedUrl = new URL(url);
+        const isHttps = parsedUrl.protocol === 'https:';
+        const agent = isHttps
+          ? new https.Agent({ rejectUnauthorized: false })
+          : new http.Agent();
+
+        // 读取请求体
+        let bodyBuffer = null;
+        if (request.body) {
+          const chunks = [];
+          for await (const chunk of request.body) {
+            chunks.push(chunk);
+          }
+          if (chunks.length > 0) {
+            bodyBuffer = Buffer.concat(chunks);
+          }
+        }
+
+        const response = await new Promise((resolve, reject) => {
+          const reqHeaders = {};
+          // 复制请求头
+          if (request.headers) {
+            for (const [key, value] of Object.entries(request.headers)) {
+              const lowerKey = key.toLowerCase();
+              if (lowerKey === 'host') continue;
+              reqHeaders[key] = value;
+            }
+          }
+          reqHeaders['Host'] = parsedUrl.host;
+
+          const options = {
+            hostname: parsedUrl.hostname,
+            port: parsedUrl.port || (isHttps ? 443 : 80),
+            path: parsedUrl.pathname + parsedUrl.search,
+            method: request.method || 'GET',
+            headers: reqHeaders,
+            agent: agent,
+            rejectUnauthorized: false,
+            timeout: 8000
+          };
+
+          const lib = isHttps ? https : http;
+          const hreq = lib.request(options, (res) => {
+            const chunks = [];
+            res.on('data', chunk => chunks.push(chunk));
+            res.on('end', () => {
+              resolve({
+                status: res.statusCode,
+                statusText: res.statusMessage,
+                headers: res.headers,
+                body: Buffer.concat(chunks)
+              });
+            });
+          });
+          hreq.on('error', (err) => {
+            addLog('WX', '连接失败', `${err.message} (微信客户端可能未运行)`);
+            resolve({
+              status: 503,
+              statusText: 'Service Unavailable',
+              headers: {},
+              body: Buffer.from(JSON.stringify({ error: 'wechat_not_running', message: err.message }))
+            });
+          });
+          hreq.on('timeout', () => { hreq.destroy(); reject(new Error('timeout')); });
+          if (bodyBuffer) hreq.write(bodyBuffer);
+          hreq.end();
+        });
+
+        // 构造 CORS 友好的响应头
+        const respHeaders = {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
+          'Access-Control-Allow-Headers': '*',
+          'Access-Control-Allow-Private-Network': 'true'
+        };
+        // 复制原始响应头
+        if (response.headers) {
+          for (const [key, value] of Object.entries(response.headers)) {
+            const lowerKey = key.toLowerCase();
+            if (lowerKey === 'access-control-allow-origin') continue;
+            if (lowerKey === 'access-control-allow-private-network') continue;
+            respHeaders[key] = value;
+          }
+        }
+
+        addLog('WX', '协议响应', `status=${response.status} size=${response.body.length}`);
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: respHeaders
+        });
+      } catch (e) {
+        addLog('WX', '协议失败', `error=${e.message}`);
+        return new Response(JSON.stringify({ error: e.message }), {
+          status: 502,
+          statusText: 'Bad Gateway',
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          }
+        });
+      }
+    });
+    addLog('INFO', 'wx-local协议处理器已注册', label);
+  } catch(e) {
+    addLog('WARN', 'wx-local协议注册失败', e.message);
+  }
+
+  // 证书验证：信任微信本地自签名证书
+  sess.setCertificateVerifyProc((request, callback) => {
+    if (request.hostname && request.hostname.includes('localhost.weixin.qq.com')) {
+      callback(0); // 0 = 信任
+    } else {
+      callback(-3); // -3 = 使用默认验证
+    }
+  });
+
+  const filter = { urls: ['*://*/*'] };
+  // 微信本地请求过滤器
+  const wxFilter = { urls: ['*://localhost.weixin.qq.com/*', '*://localhost.weixin.qq.com:*/*', 'https://localhost.weixin.qq.com/*', 'wss://localhost.weixin.qq.com/*'] };
+
+  // ==================== 微信本地请求重定向到 wx-local 协议 ====================
+  // 最关键的一步：在 PNA 检查之前拦截请求，重定向到自定义协议（主进程处理）
+  sess.webRequest.onBeforeRequest(wxFilter, (details, callback) => {
+    const url = details.url;
+    addLog('WX', '拦截到微信本地请求', `${details.method} ${url.substring(0, 100)} type=${details.resourceType}`);
+
+    // 将 https://localhost.weixin.qq.com:PORT/PATH 重定向到 wx-local://localhost.weixin.qq.com:PORT/PATH
+    // wx-local 协议处理器会在主进程中发起请求，完全绕过 PNA 和证书错误
+    const redirectUrl = url.replace('https://', 'wx-local://').replace('http://', 'wx-local://');
+    callback({ redirectURL: redirectUrl });
+  });
 
   // onBeforeRequest: 广告拦截 + 崩溃SDK拦截 + URL级媒体嗅探
   sess.webRequest.onBeforeRequest(filter, (details, callback) => {
     const url = details.url;
+    // 跳过已经是 wx-local 协议的请求（防止无限循环）
+    if (url.startsWith('wx-local://')) {
+      callback({});
+      return;
+    }
     if (isAdUrl(url)) {
       callback({ cancel: true });
       return;
@@ -1147,7 +1436,7 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
     callback({});
   });
 
-  // onBeforeSendHeaders: Range请求媒体嗅探
+  // onBeforeSendHeaders: Range请求媒体嗅探 + 伪装Sec-CH-UA头
   sess.webRequest.onBeforeSendHeaders(filter, (details, callback) => {
     const requestHeaders = details.requestHeaders || {};
     const rangeHeader = requestHeaders.Range || requestHeaders.range;
@@ -1157,6 +1446,19 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
         type: getMediaType(details.url),
         title: getFileNameFromUrl(details.url)
       });
+    }
+    // 伪装 Sec-CH-UA 头，让网站认为这是真正的 Chrome 浏览器
+    if (requestHeaders['Sec-CH-UA'] || requestHeaders['sec-ch-ua']) {
+      const key = requestHeaders['Sec-CH-UA'] ? 'Sec-CH-UA' : 'sec-ch-ua';
+      requestHeaders[key] = '"Not_A Brand";v="8", "Chromium";v="148", "Google Chrome";v="148"';
+    }
+    if (requestHeaders['Sec-CH-UA-Mobile'] || requestHeaders['sec-ch-ua-mobile']) {
+      const key = requestHeaders['Sec-CH-UA-Mobile'] ? 'Sec-CH-UA-Mobile' : 'sec-ch-ua-mobile';
+      requestHeaders[key] = '?0';
+    }
+    if (requestHeaders['Sec-CH-UA-Platform'] || requestHeaders['sec-ch-ua-platform']) {
+      const key = requestHeaders['Sec-CH-UA-Platform'] ? 'Sec-CH-UA-Platform' : 'sec-ch-ua-platform';
+      requestHeaders[key] = '"Windows"';
     }
     callback({ requestHeaders });
   });
@@ -1580,16 +1882,16 @@ function createTab(url = null, options = {}) {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload', 'preload.js'),
-      webSecurity: true,
+      webSecurity: false,
       sandbox: false,
       allowRunningInsecureContent: true,
-      nodeIntegrationInSubFrames: false,
+      nodeIntegrationInSubFrames: true,
       partition: options.privacyMode ? 'persist:privacy' : 'persist:main'
     }
   });
 
   // 伪装成 Chrome 浏览器，避免网页因检测到 Electron 而禁用功能
-  const chromeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+  const chromeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
   view.webContents.setUserAgent(chromeUserAgent);
 
   const tab = {
@@ -1600,7 +1902,7 @@ function createTab(url = null, options = {}) {
     loading: false,
     canGoBack: false,
     canGoForward: false,
-    zoomLevel: 0,
+    zoomLevel: (globalState.settings && typeof globalState.settings.defaultZoomLevel === 'number') ? globalState.settings.defaultZoomLevel : 0,
     webContents: view.webContents,
     view: view,
     referrer: referrer,
@@ -1647,12 +1949,15 @@ function createTab(url = null, options = {}) {
     addLog('TAB', '页面加载完成', `${tab.title} | ${tab.url}`);
     notifyTabUpdate(tabId, { title: tab.title, url: tab.url });
     addToHistory(tab.url, tab.title);
-    // 不再强制重置缩放为0，使用保存的缩放级别
-    var savedZoom = (globalState.settings && typeof globalState.settings.defaultZoomLevel === 'number') ? globalState.settings.defaultZoomLevel : 0;
-    if (typeof tab.zoomLevel !== 'number') tab.zoomLevel = savedZoom;
+    // 使用保存的缩放级别，不再强制重置
+    // 注意：不调用 applyZoomToTab（会同步所有标签页），只在当前标签页应用缩放
     view.webContents.setZoomLevel(tab.zoomLevel);
-    applyZoomToTab(tab, tab.zoomLevel, '页面加载应用缩放');
+    addLog('TAB', '页面加载完成-应用缩放', `级别: ${tab.zoomLevel}`);
     applyFontSizeToTab(tab);
+
+    // ==================== 注入微信快捷登录兼容脚本到主帧 ====================
+    // 修复 Chromium 148 权限策略名称变更 + iframe allow 属性
+    injectWxCompatibilityScript(view.webContents, tab.url);
 
     // 如果深色模式开启，向新页面注入深色CSS
     const settings = globalState.settings || {};
@@ -1716,7 +2021,6 @@ function createTab(url = null, options = {}) {
   view.webContents.on('did-frame-finish-load', (event, isMainFrame, frameProcessId, frameRoutingId) => {
     if (!isMainFrame) {
       try {
-        // 尝试获取子 frame 的 URL（注意：部分 Electron 版本 getAllFrames 不可用）
         let frameUrl = '';
         try {
           if (typeof view.webContents.getAllFrames === 'function') {
@@ -1725,7 +2029,9 @@ function createTab(url = null, options = {}) {
             if (frame) frameUrl = frame.url;
           }
         } catch(e) {}
-        addLog('FRAME', '子框架加载完成', `url=${frameUrl.substring(0, 120)} routingId=${frameRoutingId}`);
+        if (frameUrl) {
+          addLog('FRAME', '子框架加载完成', `url=${frameUrl.substring(0, 120)} routingId=${frameRoutingId}`);
+        }
       } catch(e) {
         addLog('FRAME', '子框架加载完成', `routingId=${frameRoutingId}`);
       }
@@ -2020,10 +2326,11 @@ function createTab(url = null, options = {}) {
     }
   });
 
-  // 监听证书错误
+  // 监听证书错误（微信客户端检测需要 localhost.weixin.qq.com 自签名证书）
   view.webContents.on('certificate-error', (event, url, error, certificate, callback) => {
-    addLog('WARN', '证书错误', `url=${url.substring(0, 80)} error=${error}`);
-    callback(false);
+    const isWeixinLocal = url.includes('localhost.weixin.qq.com');
+    addLog(isWeixinLocal ? 'INFO' : 'WARN', '证书错误', `url=${url.substring(0, 80)} error=${error} accepted=${isWeixinLocal}`);
+    callback(isWeixinLocal);
   });
 
   // 监听页面控制台消息，捕获 iframe 内的错误
@@ -2049,8 +2356,17 @@ function createTab(url = null, options = {}) {
   // 允许 about: 协议（iframe 初始化需要 about:blank）
   const isUnknownProtocol = (url) => /^[a-z][a-z0-9+.-]*:/i.test(url) && !/^(https?|about):/i.test(url);
 
+  // 允许通过系统打开的外部协议白名单（微信、QQ、腾讯等）
+  const isExternalProtocol = (url) => /^(weixin|tencent|qq|mqq|alipays|mailto|tel|taobao|tmall):/i.test(url);
+
   // 调试日志：记录所有导航事件，帮助追踪 bytedance 弹窗来源
   view.webContents.on('will-navigate', (event, url) => {
+    if (isExternalProtocol(url)) {
+      event.preventDefault();
+      shell.openExternal(url).catch(() => {});
+      addLog('EXT', '通过系统打开外部协议(will-navigate)', url);
+      return;
+    }
     if (isUnknownProtocol(url)) {
       event.preventDefault();
       addLog('BLOCK', '拦截未知协议(will-navigate)', url);
@@ -2060,6 +2376,12 @@ function createTab(url = null, options = {}) {
   });
 
   view.webContents.on('did-start-navigation', (event, url, isInPlace, isMainFrame, frameProcessId, frameRoutingId) => {
+    if (isExternalProtocol(url)) {
+      event.preventDefault && event.preventDefault();
+      shell.openExternal(url).catch(() => {});
+      addLog('EXT', '通过系统打开外部协议(did-start-navigation)', `url=${url} isMainFrame=${isMainFrame}`);
+      return;
+    }
     if (isUnknownProtocol(url)) {
       event.preventDefault && event.preventDefault();
       addLog('BLOCK', '拦截未知协议(did-start-navigation)', `url=${url} isMainFrame=${isMainFrame}`);
@@ -2078,7 +2400,7 @@ function createTab(url = null, options = {}) {
           var _realUA = navigator.userAgent;
           var _spoofedUA = _realUA.replace(/Electron\/[\d.]+\s?/g, '').replace(/Feimaotui-Browser\/[\d.]+\s?/g, '');
           Object.defineProperty(navigator, 'userAgent', {
-            get: function() { return _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'; }
+            get: function() { return _spoofedUA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'; }
           });
           Object.defineProperty(navigator, 'vendor', {
             get: function() { return 'Google Inc.'; }
@@ -2125,6 +2447,12 @@ function createTab(url = null, options = {}) {
   });
 
   view.webContents.on('will-frame-navigate', (event, url, isMainFrame, frameProcessId, frameRoutingId) => {
+    if (isExternalProtocol(url)) {
+      event.preventDefault();
+      shell.openExternal(url).catch(() => {});
+      addLog('EXT', '通过系统打开外部协议(will-frame-navigate)', `url=${url} isMainFrame=${isMainFrame}`);
+      return;
+    }
     if (isUnknownProtocol(url)) {
       event.preventDefault();
       addLog('BLOCK', '拦截未知协议(will-frame-navigate)', `url=${url} isMainFrame=${isMainFrame}`);
@@ -2134,6 +2462,11 @@ function createTab(url = null, options = {}) {
   });
 
   view.webContents.setWindowOpenHandler(({ url, referrer, disposition, features }) => {
+    if (isExternalProtocol(url)) {
+      shell.openExternal(url).catch(() => {});
+      addLog('EXT', '通过系统打开外部协议(setWindowOpenHandler)', `url=${url} disposition=${disposition}`);
+      return { action: 'deny' };
+    }
     if (isUnknownProtocol(url)) {
       addLog('BLOCK', '拦截未知协议(setWindowOpenHandler)', `url=${url} disposition=${disposition}`);
       return { action: 'deny' };
@@ -4362,14 +4695,11 @@ function setupIPC() {
     menu.popup({ window: mainWindow });
   });
 
-  // 页面缩放
+  // 页面缩放 - 同步到所有标签页并持久化
   ipcMain.handle('set-zoom-level', (event, tabId, level) => {
     const tab = globalState.tabs.get(tabId);
     if (tab && tab.webContents) {
-      const normalizedLevel = Math.max(-3, Math.min(3, Number(level) || 0));
-      tab.zoomLevel = normalizedLevel;
-      tab.webContents.setZoomLevel(normalizedLevel);
-      addLog('SETTINGS', '页面缩放', `级别: ${normalizedLevel}`);
+      applyZoomToTab(tab, level, '渲染进程缩放');
     }
   });
 
@@ -4450,7 +4780,62 @@ function createTray() {
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.feimaotui.browser');
 }
+// ==================== 微信快捷登录：IPC 代理 localhost.weixin.qq.com 请求 ====================
+// Chromium 148 的 Private Network Access 在渲染层阻止公网→本地请求
+// 通过 IPC 代理：页面 JS -> preload -> IPC -> 主进程 net.fetch -> 微信本地服务器
+function setupWxProxy() {
+  ipcMain.handle('wx-proxy', async (event, req) => {
+    const url = req.url;
+    addLog('WX', '代理请求', `${req.method || 'GET'} ${url.substring(0, 80)}`);
+    try {
+      const https = require('https');
+      const http = require('http');
+      const parsedUrl = new URL(url);
+      const isHttps = parsedUrl.protocol === 'https:';
+      const agent = isHttps
+        ? new https.Agent({ rejectUnauthorized: false })
+        : new http.Agent();
+
+      const response = await new Promise((resolve, reject) => {
+        const options = {
+          hostname: parsedUrl.hostname,
+          port: parsedUrl.port || (isHttps ? 443 : 80),
+          path: parsedUrl.pathname + parsedUrl.search,
+          method: req.method || 'GET',
+          headers: req.headers || {},
+          agent: agent,
+          rejectUnauthorized: false
+        };
+        const lib = isHttps ? https : http;
+        const hreq = lib.request(options, (res) => {
+          let body = '';
+          res.on('data', chunk => body += chunk);
+          res.on('end', () => {
+            resolve({
+              status: res.statusCode,
+              statusText: res.statusMessage,
+              headers: res.headers,
+              body: body
+            });
+          });
+        });
+        hreq.on('error', reject);
+        if (req.body) hreq.write(req.body);
+        hreq.end();
+        setTimeout(() => reject(new Error('request_timeout')), 5000);
+      });
+
+      addLog('WX', '代理响应', `status=${response.status} size=${response.body.length}`);
+      return response;
+    } catch (e) {
+      addLog('WX', '代理失败', `error=${e.message}`);
+      return { status: 502, statusText: 'Bad Gateway', headers: {}, body: JSON.stringify({ error: e.message }) };
+    }
+  });
+}
+
 app.whenReady().then(() => {
+  setupWxProxy();
   loadData();
   createMainWindow();
   setupIPC();
