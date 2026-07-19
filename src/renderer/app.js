@@ -1602,11 +1602,8 @@ function renderBookmarkBar(bookmarks) {
 function checkBookmarkOverflow(bookmarks) {
     if (!elements.bookmarkOverflowBtn || !elements.bookmarkBarContent) return;
     
-    const bar = elements.bookmarkBarContent.parentElement;
-    if (!bar) return;
-    
-    // 书签栏可用宽度 = 总宽度 - 溢出按钮(24px) - 间距(4px)
-    let availableWidth = bar.clientWidth - 28;
+    // 书签栏内容区可用宽度 = 内容区自身宽度 - 溢出按钮(24px)
+    let availableWidth = elements.bookmarkBarContent.clientWidth - 24;
     if (availableWidth < 0) availableWidth = 0;
     
     const items = elements.bookmarkBarContent.querySelectorAll('.bookmark-bar-item');
