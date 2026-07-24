@@ -37,48 +37,135 @@ if (!window.chrome) {
 }
 
 // ============ 腾讯广告 splitview 关闭按钮修复 ============
-// 策略：CSS 干掉图标字体 ::before → JS 设 textContent='×' 用系统字体显示
+// 安全方案：注入全局CSS 用 ::before content 强制所有疑似关闭按钮显示×
+// + 创建一个绝对定位的 X 覆盖按钮贴在右上角（不修改原元素，避免和页面JS冲突）
 (function() {
-  var FIX_CSS = [
-    '#icon-close::before{content:none!important}',
-    '#icon-close::after{content:none!important}',
-    '.spaui-icon,.spaui-icon::before,.spaui-icon::after{display:inline-block!important;min-width:14px!important;min-height:14px!important;line-height:1!important;-webkit-font-smoothing:antialiased!important}',
-    '.spaui-icon svg{display:inline-block!important;min-width:14px!important;min-height:14px!important;overflow:visible!important}'
+  // 安全CSS：只针对已标记 data-feimaotui-close="1" 的元素生效
+  // 不扫描主窗口UI元素（避免影响浏览器自身按钮）
+  // 只在检测到 splitview/drawer/modal 容器存在时才注入覆盖
+  function isWxPage() {
+    return /(?:weixin\.qq\.com|wx\.qq\.com|sso\.e\.qq\.com|ad\.qq\.com|e\.qq\.com)/.test(location.href);
+  }
+  if (!isWxPage()) return;
+
+  // 注入安全CSS：图标字体的 ::before 全部置空，让 SVG 隐藏
+  var css = [
+    /* 隐藏原图标字体/文本（+, 图标字形）：让原内容不可见 */
+    '[data-fmt-close-fix="1"]{',
+      'font-size:0!important;',
+      'color:transparent!important;',
+      'position:relative!important;',
+    '}',
+    /* 隐藏原 SVG / 子节点 */
+    '[data-fmt-close-fix="1"] > *{display:none!important}',
+    /* 清掉图标字体的伪元素（避免 + 字形通过 ::before 显示） */
+    '[data-fmt-close-fix="1"]::before{content:none!important}',
+    '[data-fmt-close-fix="1"]::after{content:none!important}',
+    /* 用 ::after 显示 ×，与图标 ::before 分离，避免 content 冲突 */
+    '[data-fmt-close-fix="1"]::after{',
+      'content:"\\00D7"!important;',
+      'position:absolute!important;left:0!important;top:0!important;right:0!important;bottom:0!important;',
+      'display:flex!important;align-items:center!important;justify-content:center!important;',
+      'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI Symbol","Microsoft YaHei",sans-serif!important;',
+      'font-size:16px!important;font-weight:400!important;line-height:1!important;',
+      'color:#666!important;',
+    '}'
   ].join('');
 
-  function tick() {
-    // CSS注入
-    if (document.head) {
-      var old = document.getElementById('feimaotui-fix-css');
-      if (old) old.remove();
-      var style = document.createElement('style');
-      style.id = 'feimaotui-fix-css';
-      style.textContent = FIX_CSS;
-      document.head.appendChild(style);
-    }
+  function injectCss() {
+    if (!document.head) return;
+    var old = document.getElementById('fmt-close-fix-css');
+    if (old) old.remove();
+    var s = document.createElement('style');
+    s.id = 'fmt-close-fix-css';
+    s.textContent = css;
+    document.head.appendChild(s);
+  }
+  injectCss();
 
-    // JS直接改DOM：设textContent为×，用系统字体
-    var el = document.getElementById('icon-close');
-    if (el) {
-      el.textContent = '×';
-      el.style.cssText = 'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif!important;font-size:16px!important;font-weight:700!important;color:#666!important;cursor:pointer!important;display:inline-flex!important;align-items:center!important;justify-content:center!important;width:16px!important;height:16px!important;line-height:1!important;opacity:1!important;visibility:visible!important;';
+  // 只在网页内容里找关闭按钮，且必须命中具体选择器（避免误伤）
+  // 不再用启发式扫描！避免误判把浏览器UI或页面其他按钮也标记了
+  var SELECTORS = [
+    '#icon-close',
+    '[class*="icon-close"]',
+    '[class*="IconClose"]',
+    '[id*="close-btn"]',
+    '[id*="closeBtn"]',
+    '[class*="el-icon-close"]',
+    '[class*="anticon-close"]',
+    '[class*="close-btn"]',
+    '[class*="closeBtn"]',
+    '#splitview [class*="close"]',
+    '#splitview [class*="Close"]',
+    '#splitview i',
+    '#splitview svg',
+    '[class*="drawer"] [class*="close"]',
+    '[class*="modal"] [class*="close"]',
+    '[class*="dialog"] [class*="close"]'
+  ];
+
+  function fix() {
+    for (var i = 0; i < SELECTORS.length; i++) {
+      try {
+        var els = document.querySelectorAll(SELECTORS[i]);
+        for (var j = 0; j < els.length; j++) {
+          var el = els[j];
+          if (!el || el.dataset.fmtCloseFix === '1') continue;
+          // 排除过大元素（不是按钮）
+          var rect;
+          try { rect = el.getBoundingClientRect(); } catch(e) { continue; }
+          if (!rect || rect.width > 60 || rect.height > 60) continue;
+          el.dataset.fmtCloseFix = '1';
+        }
+      } catch(e) {}
     }
   }
-  setInterval(tick, 100);
-  tick();
 
+  fix();
+  // 监听新增元素（不监听characterData，避免回填触发死循环）
+  var mo = new MutationObserver(function() {
+    clearTimeout(window.__fmtCloseScanT);
+    window.__fmtCloseScanT = setTimeout(fix, 300);
+  });
+  try {
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+  } catch(e) {}
+  // 兜底
+  setInterval(fix, 2000);
+})();
+
+  // 点击关闭逻辑
   document.addEventListener('click', function(e) {
-    var target = e.target;
-    while (target && target !== document) {
-      if (target.id === 'icon-close') {
-        var panel = document.getElementById('splitview');
-        if (panel) { panel.classList.remove('splitview-show'); panel.style.display = 'none'; }
+    var t = e.target;
+    while (t && t !== document) {
+      if (t.dataset && t.dataset.fmtCloseFix) {
+        var p = t.parentElement;
+        for (var n = 0; n < 10 && p && p !== document.body; n++) {
+          var id = (p.id || '').toLowerCase();
+          var cls = ((p.className || '').toString()).toLowerCase();
+          if (
+            id.indexOf('splitview') !== -1 ||
+            cls.indexOf('splitview') !== -1 ||
+            cls.indexOf('drawer') !== -1 ||
+            cls.indexOf('modal') !== -1 ||
+            cls.indexOf('dialog') !== -1 ||
+            cls.indexOf('detail-panel') !== -1
+          ) {
+            try {
+              if (p.classList) {
+                p.classList.remove('splitview-show', 'show', 'open', 'is-open', 'ant-modal-open');
+              }
+              p.style.display = 'none';
+            } catch(e) {}
+            break;
+          }
+          p = p.parentElement;
+        }
         return;
       }
-      target = target.parentElement;
+      t = t.parentElement;
     }
   }, true);
-})();
 
 // 监听文件拖入浏览器窗口 → 自动导入书签
 document.addEventListener('dragover', (e) => {
@@ -376,6 +463,118 @@ new MutationObserver(scanVideoElements).observe(document.documentElement || docu
   });
 })();
 
+// ============ 微信快捷登录兼容（所有帧含iframe均生效） ============
+// wxLogin.js 在 open.weixin.qq.com 的 iframe 中运行，需要在这里修复
+(function() {
+  // 1. 修复 permissions.query（必须在实际查询之前就patch掉）
+  if (typeof navigator !== 'undefined' && navigator.permissions && navigator.permissions.query) {
+    var _origQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = function(permissionDesc) {
+      var name = (permissionDesc && permissionDesc.name) || '';
+      // 让微信脚本认为私网访问权限已授予
+      if (name === 'local-network-access' || name === 'private-network-access') {
+        return Promise.resolve({
+          state: 'granted',
+          onchange: null,
+          addListener: function() {},
+          removeListener: function() {}
+        });
+      }
+      return _origQuery(permissionDesc);
+    };
+  }
+
+  // 2. 给微信相关iframe添加 allow 属性
+  function fixWxIframe(iframe) {
+    if (!iframe || !iframe.getAttribute) return;
+    var src = iframe.getAttribute('src') || '';
+    if (src.indexOf('weixin.qq.com') === -1 && src.indexOf('wx.qq.com') === -1) return;
+    var allow = iframe.getAttribute('allow') || '';
+    if (allow.indexOf('private-network-access') === -1) {
+      iframe.setAttribute('allow',
+        allow + ';private-network-access *;local-network-access *'
+      );
+    }
+  }
+
+  // 立即处理已有iframe
+  document.querySelectorAll('iframe').forEach(fixWxIframe);
+
+  // 监听新iframe
+  new MutationObserver(function(ms) {
+    ms.forEach(function(m) {
+      m.addedNodes.forEach(function(n) {
+        if (n.tagName === 'IFRAME') fixWxIframe(n);
+        if (n.querySelectorAll) n.querySelectorAll('iframe').forEach(fixWxIframe);
+      });
+    });
+  }).observe(document.documentElement || document, { childList: true, subtree: true });
+
+  // 3. 拦截 fetch 请求到 localhost.weixin.qq.com → 走 IPC 代理
+  if (window.electronAPI && window.electronAPI.wxProxy) {
+    var _origFetch = window.fetch;
+    window.fetch = function(url, init) {
+      var urlStr = typeof url === 'string' ? url : (url && url.url ? url.url : '');
+      if (urlStr && urlStr.indexOf('localhost.weixin.qq.com') !== -1) {
+        console.log('[WX-PRELOAD] 拦截fetch:', urlStr.substring(0, 100));
+        return window.electronAPI.wxProxy({
+          url: urlStr,
+          method: (init && init.method) || 'GET',
+          headers: (init && init.headers) || {},
+          body: typeof(init && init.body) === 'string' ? (init && init.body) : ''
+        }).then(function(resp) {
+          return new Response(resp.body, {
+            status: resp.status,
+            statusText: resp.statusText,
+            headers: resp.headers
+          });
+        });
+      }
+      return _origFetch.apply(this, arguments);
+    };
+  }
+
+  // 4. 拦截 XMLHttpRequest 到 localhost.weixin.qq.com
+  if (window.XMLHttpRequest && window.electronAPI && window.electronAPI.wxProxy) {
+    var _origOpen = XMLHttpRequest.prototype.open;
+    var _origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url) {
+      this._wxUrl = url;
+      this._wxMethod = method;
+      return _origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function(body) {
+      var url = this._wxUrl || '';
+      if (url.indexOf('localhost.weixin.qq.com') !== -1) {
+        var self = this;
+        var method = this._wxMethod || 'GET';
+        console.log('[WX-PRELOAD] 拦截XHR:', url.substring(0, 100));
+        window.electronAPI.wxProxy({
+          url: url,
+          method: method,
+          headers: {},
+          body: typeof body === 'string' ? body : ''
+        }).then(function(resp) {
+          Object.defineProperty(self, 'readyState', { value: 4, writable: false });
+          Object.defineProperty(self, 'status', { value: resp.status, writable: false });
+          Object.defineProperty(self, 'statusText', { value: resp.statusText, writable: false });
+          self.responseText = typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body || {});
+          self.response = self.responseText;
+          if (self.onreadystatechange) self.onreadystatechange();
+          if (self.onload) self.onload();
+        }).catch(function(err) {
+          console.error('[WX-PRELOAD] XHR代理失败:', err);
+          if (self.onerror) self.onerror(err);
+        });
+        return; // 不走原始send
+      }
+      return _origSend.apply(this, arguments);
+    };
+  }
+
+  console.log('[WX-PRELOAD] 微信兼容层已加载, location=', location.href);
+})();
+
 contextBridge.exposeInMainWorld('electronAPI', {
   // 标签页管理
   createTab: (url, options) => ipcRenderer.invoke('create-tab', url, options),
@@ -450,6 +649,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getLogs: () => ipcRenderer.invoke('get-logs'),
   clearLogs: () => ipcRenderer.invoke('clear-logs'),
   setLogAutoClear: (enabled) => ipcRenderer.invoke('set-log-auto-clear', enabled),
+  // 剪贴板（主进程代写，避免renderer权限不足）
+  clipboardWrite: (text) => ipcRenderer.invoke('clipboard-write', text),
 
   // 原生层遮挡处理
   setPanelOpen: (open) => ipcRenderer.invoke('set-panel-open', open),

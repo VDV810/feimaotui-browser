@@ -1150,106 +1150,107 @@ function showPageContextMenu(tabId, params) {
 }
 
 // ==================== 微信快捷登录兼容脚本注入 ====================
-// 在主帧注入：1) 修复权限API  2) 自动给微信iframe添加allow属性  3) 拦截fetch/XHR兜底
+// 策略：不注入自定义UI，只修复Chromium限制让原生wxLogin.js正常工作
+// 原理（从Edge源码分析）：open.weixin.qq.com页面已有完整快捷登录UI，
+// wxLogin.js通过AJAX探测localhost.weixin.qq.com检测本地微信客户端，
+// 检测成功则自动显示快捷登录按钮。Edge能工作是因为允许了Private Network Access。
 function injectWxCompatibilityScript(webContents, pageUrl) {
   if (!webContents || webContents.isDestroyed()) return;
-  // 只在可能包含微信登录的页面注入
   if (!pageUrl || pageUrl === 'about:blank') return;
 
-  const script = `
-(function() {
-  if (window.__wxCompatInjected) return;
-  window.__wxCompatInjected = true;
+  // 只在包含微信登录的页面注入
+  var needsInject = pageUrl.indexOf('weixin.qq.com') !== -1 
+    || pageUrl.indexOf('wx.qq.com') !== -1
+    || pageUrl.indexOf('sso.e.qq.com') !== -1
+    || pageUrl.indexOf('ad.qq.com') !== -1;
+  
+  if (!needsInject) return;
 
-  try {
-    // 1. 修复 navigator.permissions.query：兼容 local-network-access 和 private-network-access
-    if (navigator.permissions && navigator.permissions.query) {
-      var _origQuery = navigator.permissions.query.bind(navigator.permissions);
-      navigator.permissions.query = function(desc) {
-        if (desc && (desc.name === 'local-network-access' || desc.name === 'private-network-access')) {
-          return Promise.resolve({ state: 'granted', onchange: null });
-        }
-        return _origQuery(desc);
-      };
-    }
+  addLog('WX', '注入兼容脚本', pageUrl);
 
-    // 2. 修复 document.featurePolicy / document.permissionsPolicy
-    function patchPolicy(policy) {
-      if (!policy) return;
-      var origAllowedFeatures = policy.allowedFeatures.bind(policy);
-      policy.allowedFeatures = function() {
-        var features = origAllowedFeatures();
-        if (features.indexOf('local-network-access') === -1) features.push('local-network-access');
-        if (features.indexOf('private-network-access') === -1) features.push('private-network-access');
-        return features;
-      };
-      var origAllowsFeature = policy.allowsFeature.bind(policy);
-      policy.allowsFeature = function(feature) {
-        if (feature === 'local-network-access' || feature === 'private-network-access') return true;
-        return origAllowsFeature.apply(this, arguments);
-      };
-    }
-    if (document.featurePolicy) patchPolicy(document.featurePolicy);
-    if (document.permissionsPolicy) patchPolicy(document.permissionsPolicy);
+  // 极简注入脚本 - 只修复权限API和iframe属性，不做任何UI操作
+  var code = [
+    '(function(){',
+    'if(window.__wxci)return;window.__wxci=true;',
+    'try{',
+    // 1. 修复 permissions.query (修复 "Unrecognized feature: local-network-access" 警告)
+    'if(navigator.permissions&&navigator.permissions.query){',
+    'var oq=navigator.permissions.query.bind(navigator.permissions);',
+    'navigator.permissions.query=function(d){',
+    'var n=d&&d.name?d.name:"";',
+    'if(n==="local-network-access"||n==="private-network-access")return Promise.resolve({state:"granted",onchange:null});',
+    'return oq(d);};}',
+    // 2. 给微信iframe添加allow属性(允许私网访问)
+    'function fixifr(iframe){',
+    'if(!iframe||!iframe.getAttribute)return;',
+    'var src=iframe.getAttribute("src")||"";',
+    'if(src.indexOf("weixin.qq.com")===-1&&src.indexOf("wx.qq.com")===-1)return;',
+    'var a=iframe.getAttribute("allow")||"";',
+    'if(a.indexOf("private-network-access")===-1){',
+    'iframe.setAttribute("allow",a+";private-network-access *;local-network-access *");}}',
+    'document.querySelectorAll("iframe").forEach(fixifr);',
+    'new MutationObserver(function(ms){ms.forEach(function(m){m.addedNodes.forEach(function(n){',
+    'if(n.tagName==="IFRAME")fixifr(n);',
+    'if(n.querySelectorAll)n.querySelectorAll("iframe").forEach(fixifr);});});})',
+    '.observe(document.documentElement,{childList:true,subtree:true});',
+    // 3. fetch代理(兜底：拦截对localhost.weixin.qq.com的请求通过IPC转发)
+    'if(window.electronAPI&&window.electronAPI.wxProxy){',
+    'var of=window.fetch;window.fetch=function(url,init){',
+    'var u=typeof url==="string"?url:(url&&url.url?url.url:"");',
+    'if(u&&u.indexOf("localhost.weixin.qq.com")!==-1){',
+    'return window.electronAPI.wxProxy({url:u,method:(init&&init.method)||"GET",headers:(init&&init.headers)||{},body:typeof(init&&init.body)==="string"?(init&&init.body):""})',
+    '.then(function(r){return new Response(r.body,{status:r.status,statusText:r.statusText,headers:r.headers});});}',
+    'return of.apply(this,arguments);};}',
+    'console.log("[WX] compat OK");',
+    '}catch(e){console.error("[WX] err",e);}',
+    '})();'
+  ].join('\n');
 
-    // 3. 自动给微信登录iframe添加allow属性（允许私网访问）
-    function fixWxIframe(iframe) {
-      if (!iframe || !iframe.getAttribute) return;
-      var src = iframe.getAttribute('src') || '';
-      if (src.indexOf('open.weixin.qq.com') !== -1 || src.indexOf('wx.qq.com') !== -1) {
-        var allow = iframe.getAttribute('allow') || '';
-        if (allow.indexOf('private-network-access') === -1 && allow.indexOf('local-network-access') === -1) {
-          iframe.setAttribute('allow', allow + '; private-network-access *; local-network-access *');
-        }
-      }
-    }
-    // 修复已有iframe
-    document.querySelectorAll('iframe').forEach(fixWxIframe);
-    // 监听新创建的iframe
-    var observer = new MutationObserver(function(mutations) {
-      mutations.forEach(function(m) {
-        m.addedNodes.forEach(function(node) {
-          if (node.tagName === 'IFRAME') fixWxIframe(node);
-          if (node.querySelectorAll) node.querySelectorAll('iframe').forEach(fixWxIframe);
-        });
-      });
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-
-    // 4. 兜底：在主帧拦截 fetch/XHR 对 localhost.weixin.qq.com 的请求，通过 electronAPI 代理
-    // （某些页面可能直接在主帧发起请求，而不是在iframe中）
-    if (window.electronAPI && window.electronAPI.wxProxy) {
-      var _origFetch = window.fetch;
-      window.fetch = function(input, init) {
-        var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
-        if (url && url.indexOf('localhost.weixin.qq.com') !== -1) {
-          var method = (init && init.method) || 'GET';
-          var headers = (init && init.headers) || {};
-          var body = (init && init.body) || '';
-          return window.electronAPI.wxProxy({ url: url, method: method, headers: headers, body: typeof body === 'string' ? body : '' })
-            .then(function(r) {
-              return new Response(r.body, { status: r.status, statusText: r.statusText, headers: r.headers });
-            });
-        }
-        return _origFetch.apply(this, arguments);
-      };
-    }
-
-    console.log('[WX] 微信快捷登录兼容脚本已注入');
-  } catch(e) {
-    console.error('[WX] 兼容脚本注入失败', e);
-  }
-})();`;
-
-  webContents.executeJavaScript(script).catch(() => {});
+  webContents.executeJavaScript(code).then(() => {
+    addLog('WX', '注入成功', pageUrl);
+  }).catch((err) => {
+    addLog('WX', '注入失败: ' + (err.message || err), pageUrl);
+  });
 }
 
 // ==================== 会话设置 ====================
 function setupSessionHandlersForPartition(sess, partitionLabel) {
   const label = partitionLabel || 'default';
 
+  // ==================== PNA权限放行：允许所有私网访问请求（微信登录需要） ====================
+  // Chromium 148+ 的 Private Network Access 限制会阻止iframe访问localhost.weixin.qq.com
+  // 这里全局放行，让原生wxLogin.js能正常探测本地微信客户端
+  try {
+    sess.setPermissionRequestHandler((webContents, permission, callback) => {
+      // 自动允许以下权限
+      if (permission === 'private-network-access' || 
+          permission === 'local-network-access' ||
+          permission === 'media' ||
+          permission === 'fullscreen' ||
+          permission === 'notifications') {
+        return callback(true);
+      }
+      // 其他权限默认拒绝
+      return callback(false);
+    });
+    addLog('WX', 'PNA权限处理器已注册', label);
+  } catch(e) {
+    addLog('WX', 'PNA权限处理器注册失败', e.message || e);
+  }
+
+  // ==================== webRequest: 放行 localhost.weixin.qq.com 的请求头 ====================
+  try {
+    sess.webRequest.onBeforeSendHeaders((details, callback) => {
+      const url = details.url || '';
+      if (url.indexOf('localhost.weixin.qq.com') !== -1) {
+        // 确保不修改这些请求的头
+        addLog('WX', 'webRequest放行', url.substring(0, 80));
+      }
+      callback({ requestHeaders: details.requestHeaders });
+    });
+  } catch(e) {}
+
   // ==================== wx-local 协议处理器：代理 localhost.weixin.qq.com 请求 ====================
-  // 在网络栈层拦截，完全绕过 Chromium 的 Private Network Access 检查
   try {
     sess.protocol.handle('wx-local', async (request) => {
       // wx-local://<host>/<path> -> https://<host>/<path>
@@ -1395,18 +1396,41 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
 
   const filter = { urls: ['*://*/*'] };
   // 微信本地请求过滤器
-  const wxFilter = { urls: ['*://localhost.weixin.qq.com/*', '*://localhost.weixin.qq.com:*/*', 'https://localhost.weixin.qq.com/*', 'wss://localhost.weixin.qq.com/*'] };
+  const wxFilter = { urls: [
+    'https://localhost.weixin.qq.com/*',
+    'http://localhost.weixin.qq.com/*',
+    'wss://localhost.weixin.qq.com/*',
+    'ws://localhost.weixin.qq.com/*'
+  ] };
 
+  // ==================== 微信本地请求重定向到 wx-local 协议 ====================
   // ==================== 微信本地请求重定向到 wx-local 协议 ====================
   // 最关键的一步：在 PNA 检查之前拦截请求，重定向到自定义协议（主进程处理）
   sess.webRequest.onBeforeRequest(wxFilter, (details, callback) => {
     const url = details.url;
     addLog('WX', '拦截到微信本地请求', `${details.method} ${url.substring(0, 100)} type=${details.resourceType}`);
-
     // 将 https://localhost.weixin.qq.com:PORT/PATH 重定向到 wx-local://localhost.weixin.qq.com:PORT/PATH
     // wx-local 协议处理器会在主进程中发起请求，完全绕过 PNA 和证书错误
     const redirectUrl = url.replace('https://', 'wx-local://').replace('http://', 'wx-local://');
     callback({ redirectURL: redirectUrl });
+  });
+
+  // 微信相关域名的诊断日志（只记录不重定向，安全）
+  // 扩到 127.0.0.1 / localhost，捕捉 wxLogin.js 经 DNS 解析后的真实请求
+  const wxDiagFilter = { urls: [
+    'https://localhost.weixin.qq.com/*',
+    'http://localhost.weixin.qq.com/*',
+    'https://open.weixin.qq.com/*',
+    'http://open.weixin.qq.com/*',
+    'http://127.0.0.1/*',
+    'https://127.0.0.1/*',
+    'http://localhost/*',
+    'https://localhost/*'
+  ] };
+  sess.webRequest.onBeforeRequest(wxDiagFilter, (details, callback) => {
+    const from = details.initiator || details.referrer || details.resourceType || 'unknown';
+    addLog('WX-DIAG', '检测到请求', `${details.method} ${details.url.substring(0, 110)} | from=${from}`);
+    callback({});
   });
 
   // onBeforeRequest: 广告拦截 + 崩溃SDK拦截 + URL级媒体嗅探
@@ -2335,7 +2359,8 @@ function createTab(url = null, options = {}) {
 
   // 监听页面控制台消息，捕获 iframe 内的错误
   view.webContents.on('console-message', (event, level, message, line, sourceId) => {
-    if (level >= 2) { // warn 和 error
+    // 显示 WX-PRELOAD/WX 相关的所有日志 + 原有 warn/error
+    if (level >= 2 || (typeof message === 'string' && (message.indexOf('[WX') !== -1 || message.indexOf('[CLOSE') !== -1))) {
       addLog('CONSOLE', `[${['debug','log','warn','error'][level] || '?'}]`, `${message} (${sourceId}:${line})`);
     }
   });
@@ -4515,6 +4540,15 @@ function setupIPC() {
   // 日志功能
   ipcMain.handle('get-logs', () => getLogs());
   ipcMain.handle('clear-logs', () => clearLogs());
+  // 剪贴板写入：renderer进程没有clipboard权限，通过IPC由主进程代写
+  ipcMain.handle('clipboard-write', (event, text) => {
+    try {
+      clipboard.writeText(String(text || ''));
+      return { success: true };
+    } catch(e) {
+      return { success: false, error: e.message };
+    }
+  });
   ipcMain.handle('set-log-auto-clear', (event, enabled) => {
     logAutoClear = enabled;
     addLog('SETTINGS', `退出自动清除日志: ${enabled ? '开启' : '关闭'}`);

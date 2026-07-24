@@ -370,7 +370,7 @@ body {
     border-bottom: 1px solid var(--border-color);
     display: flex;
     align-items: center;
-    padding: 0 260px 0 12px;  /* 右侧260px = 12px间距 + 248px工具栏按钮区 */
+    padding: 0 12px;
     flex-shrink: 0;
     overflow: visible;
     position: relative;
@@ -387,6 +387,7 @@ body {
     flex: 1;
     min-width: 0;
     overflow: hidden;
+    padding-right: 52px;  /* 溢出按钮(24px) + 留白(24px) + 按钮右边距(4px) */
 }
 
 .bookmark-bar-item {
@@ -430,7 +431,7 @@ body {
 .bookmark-overflow-btn {
     position: absolute;
     top: 4px;
-    right: 260px;  /* 对齐书签栏内容区右边界（蓝线位置） */
+    right: 4px;  /* 贴右侧，留4px视觉余量 */
     width: 24px;
     height: 24px;
     border-radius: 4px;

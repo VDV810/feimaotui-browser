@@ -1601,23 +1601,28 @@ function renderBookmarkBar(bookmarks) {
 // 检测溢出
 function checkBookmarkOverflow(bookmarks) {
     if (!elements.bookmarkOverflowBtn || !elements.bookmarkBarContent) return;
-    
-    // 书签栏内容区可用宽度 = 内容区自身宽度 - 溢出按钮(24px) - 留白(8px)
-    let availableWidth = elements.bookmarkBarContent.clientWidth - 24 - 8;
+
+    // 书签栏内容区可用宽度 = 内容区自身宽度 - 溢出按钮(24px) - 留白(24px)
+    let availableWidth = elements.bookmarkBarContent.clientWidth - 24 - 24;
     if (availableWidth < 0) availableWidth = 0;
-    
+
     const items = elements.bookmarkBarContent.querySelectorAll('.bookmark-bar-item');
     const overflowIndices = [];
     const barContentRect = elements.bookmarkBarContent.getBoundingClientRect();
-    
+
+    // 先重置所有项为可见
+    items.forEach(item => item.style.display = '');
+
     for (let i = 0; i < items.length; i++) {
         const rect = items[i].getBoundingClientRect();
         const itemRight = rect.right - barContentRect.left;
         if (itemRight > availableWidth) {
             overflowIndices.push(i);
+            // 实际隐藏溢出项，让留白生效
+            items[i].style.display = 'none';
         }
     }
-    
+
     if (overflowIndices.length > 0) {
         elements.bookmarkOverflowBtn.style.display = 'flex';
         appState.overflowBookmarkIds = overflowIndices.map(i => bookmarks[i]).filter(Boolean).map(b => b.id);
@@ -2502,7 +2507,8 @@ async function loadLogs() {
 async function copyLogs() {
     try {
         const logs = await window.electronAPI.getLogs();
-        await navigator.clipboard.writeText(logs);
+        // 使用IPC调用主进程clipboard API，避免renderer进程权限不足
+        await window.electronAPI.clipboardWrite(logs);
         // 不弹窗，改用按钮文字反馈
         var btn = document.getElementById('copyLogBtn');
         if (btn) {
