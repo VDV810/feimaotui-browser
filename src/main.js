@@ -1443,26 +1443,31 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
 
   const filter = { urls: ['*://*/*'] };
 
-  // ==================== 微信相关域名诊断日志 ====================
-  // 注意：PNA 已通过命令行参数禁用（disable-features 含 PrivateNetworkAccess*），
-  // 且 disable-web-security + allow-insecure-localhost 已开启。
-  // 因此 localhost.weixin.qq.com 的请求应能直连成功，不需要重定向/代理。
-  // 此处仅保留诊断日志用于排查问题。
+  // ==================== 微信相关域名：重定向到 wx-local 协议代理 ====================
+  // Chromium 的 PNA 限制在 Electron 42 (Chromium 148+) 中可能无法完全通过 --disable-features 禁用
+  // 特别是 iframe 中的跨私网请求（wxLogin.js 在 open.weixin.qq.com iframe 中请求 localhost.weixin.qq.com）
+  // 解决方案：将 localhost.weixin.qq.com 请求重定向到 wx-local 自定义协议，由主进程 Node.js http 模块直连
+  // 这样完全绕过 Chromium 网络栈的所有限制（PNA/CORS/混合内容等）
   const wxDiagFilter = { urls: [
     'https://localhost.weixin.qq.com/*',
     'http://localhost.weixin.qq.com/*',
     'https://open.weixin.qq.com/*',
     'http://open.weixin.qq.com/*',
-    'http://127.0.0.1/*',
-    'https://127.0.0.1/*',
-    'http://localhost/*',
-    'https://localhost/*'
+    'http://127.0.0.1:*/*',
+    'https://127.0.0.1:*/*'
   ] };
   sess.webRequest.onBeforeRequest(wxDiagFilter, (details, callback) => {
     const url = details.url;
     const from = details.initiator || details.referrer || details.resourceType || 'unknown';
-    addLog('WX-DIAG', '检测到请求', `${details.method} ${url.substring(0, 110)} | from=${from}`);
-    // 不做重定向，让请求直连（PNA已禁用，直连应正常工作）
+    addLog('WX-DIAG', '检测到请求', `${details.method} ${url.substring(0,110)} | from=${from}`);
+    // 将 localhost.weixin.qq.com / 127.0.0.1 请求重定向到 wx-local 协议代理
+    if (url.indexOf('localhost.weixin.qq.com') !== -1 || url.indexOf('127.0.0.1') !== -1) {
+      const proxyUrl = url.replace(/^https?:\/\/(localhost\.weixin\.qq\.com|127\.0\.0\.1)/, 'wx-local://$1');
+      addLog('WX-PROXY', '重定向到wx-local', `${url.substring(0,80)} -> ${proxyUrl.substring(0,80)}`);
+      callback({ redirectURL: proxyUrl });
+      return;
+    }
+    // open.weixin.qq.com 等其他微信域名放行直连
     callback({});
   });
 
@@ -4655,7 +4660,9 @@ function setupIPC() {
     const btnRect = (data && data.buttonRect) || {};
     const popW = 280;
     const itemH = 34;
-    const popH = Math.min(bookmarks.length * itemH + 16, 360);
+    // 动态计算弹层高度：根据窗口可用空间（按钮下方到窗口底部），不再硬编码360px上限
+    const availableH = content.height - (btnRect.bottom || 112) - 10;
+    const popH = Math.min(bookmarks.length * itemH + 16, Math.max(availableH, 200), 550);
     const content = mainWindow.getContentBounds();
     let x = content.x + (btnRect.left || 0);
     const y = content.y + (btnRect.bottom || 112) + 4;
