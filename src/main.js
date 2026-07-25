@@ -1285,17 +1285,8 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
     addLog('WX', 'PNA权限处理器注册失败', e.message || e);
   }
 
-  // ==================== webRequest: 放行 localhost.weixin.qq.com 的请求头 ====================
-  try {
-    sess.webRequest.onBeforeSendHeaders((details, callback) => {
-      const url = details.url || '';
-      if (url.indexOf('localhost.weixin.qq.com') !== -1) {
-        // 确保不修改这些请求的头
-        addLog('WX', 'webRequest放行', url.substring(0, 80));
-      }
-      callback({ requestHeaders: details.requestHeaders });
-    });
-  } catch(e) {}
+  // （已移除重复注册的 onBeforeSendHeaders——Electron 同一 session 只有最后一次注册生效，
+  //   重复注册会让前面的监听器全部失效，微信头处理已合并到统一监听器中）
 
   // ==================== wx-local 协议处理器：代理 localhost.weixin.qq.com 请求 ====================
   try {
@@ -1448,35 +1439,23 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
   // 特别是 iframe 中的跨私网请求（wxLogin.js 在 open.weixin.qq.com iframe 中请求 localhost.weixin.qq.com）
   // 解决方案：将 localhost.weixin.qq.com 请求重定向到 wx-local 自定义协议，由主进程 Node.js http 模块直连
   // 这样完全绕过 Chromium 网络栈的所有限制（PNA/CORS/混合内容等）
-  const wxDiagFilter = { urls: [
-    'https://localhost.weixin.qq.com/*',
-    'http://localhost.weixin.qq.com/*',
-    'https://open.weixin.qq.com/*',
-    'http://open.weixin.qq.com/*',
-    'http://127.0.0.1:*/*',
-    'https://127.0.0.1:*/*'
-  ] };
-  sess.webRequest.onBeforeRequest(wxDiagFilter, (details, callback) => {
-    const url = details.url;
-    const from = details.initiator || details.referrer || details.resourceType || 'unknown';
-    addLog('WX-DIAG', '检测到请求', `${details.method} ${url.substring(0,110)} | from=${from}`);
-    // 将 localhost.weixin.qq.com / 127.0.0.1 请求重定向到 wx-local 协议代理
-    if (url.indexOf('localhost.weixin.qq.com') !== -1 || url.indexOf('127.0.0.1') !== -1) {
-      const proxyUrl = url.replace(/^https?:\/\/(localhost\.weixin\.qq\.com|127\.0\.0\.1)/, 'wx-local://$1');
-      addLog('WX-PROXY', '重定向到wx-local', `${url.substring(0,80)} -> ${proxyUrl.substring(0,80)}`);
-      callback({ redirectURL: proxyUrl });
-      return;
-    }
-    // open.weixin.qq.com 等其他微信域名放行直连
-    callback({});
-  });
+  // 【重要】Electron 中同一 session 的 onBeforeRequest 只有"最后一次注册"生效！
+  // 因此微信重定向逻辑必须合并到下面这个唯一的主监听器中，不能单独注册。
 
-  // onBeforeRequest: 广告拦截 + 崩溃SDK拦截 + URL级媒体嗅探
+  // onBeforeRequest: 微信wx-local重定向 + 广告拦截 + 崩溃SDK拦截 + URL级媒体嗅探
   sess.webRequest.onBeforeRequest(filter, (details, callback) => {
     const url = details.url;
     // 跳过已经是 wx-local 协议的请求（防止无限循环）
     if (url.startsWith('wx-local://')) {
       callback({});
+      return;
+    }
+    // 将 localhost.weixin.qq.com / 127.0.0.1 请求重定向到 wx-local 协议代理，
+    // 由主进程 Node.js 直连微信客户端本地服务，绕过 Chromium PNA/CORS/混合内容限制
+    if (url.indexOf('localhost.weixin.qq.com') !== -1) {
+      const proxyUrl = url.replace(/^https?:\/\/localhost\.weixin\.qq\.com/, 'wx-local://localhost.weixin.qq.com');
+      addLog('WX-PROXY', '重定向到wx-local', `${url.substring(0, 80)} -> ${proxyUrl.substring(0, 80)}`);
+      callback({ redirectURL: proxyUrl });
       return;
     }
     // 微信登录相关域名必须跳过广告拦截！
@@ -4660,10 +4639,10 @@ function setupIPC() {
     const btnRect = (data && data.buttonRect) || {};
     const popW = 280;
     const itemH = 34;
+    const content = mainWindow.getContentBounds();
     // 动态计算弹层高度：根据窗口可用空间（按钮下方到窗口底部），不再硬编码360px上限
     const availableH = content.height - (btnRect.bottom || 112) - 10;
     const popH = Math.min(bookmarks.length * itemH + 16, Math.max(availableH, 200), 550);
-    const content = mainWindow.getContentBounds();
     let x = content.x + (btnRect.left || 0);
     const y = content.y + (btnRect.bottom || 112) + 4;
     // 边界检测：弹层不要超出窗口右边缘，留 8px 边距；也不要超出左边缘
