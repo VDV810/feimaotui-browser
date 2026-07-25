@@ -217,7 +217,7 @@ const wxEdgeProxy = {
   async wxFetch(url, method, headersObj, bodyText) {
     const ok = await this.ensureStarted();
     if (!ok) return { ok: false, error: 'edge_proxy_unavailable' };
-    const expr = '(async()=>{try{const r=await fetch(' + JSON.stringify(url) + ',{method:' + JSON.stringify(method || 'POST') + ',headers:' + JSON.stringify(headersObj || {}) + (bodyText ? ',body:' + JSON.stringify(bodyText) : '') + '});const t=await r.text();return{ok:true,status:r.status,body:t};}catch(e){return{ok:false,error:String(e&&e.message||e)};}})()';
+    const expr = '(async()=>{try{const r=await fetch(' + JSON.stringify(url) + ',{method:' + JSON.stringify(method || 'POST') + ',headers:' + JSON.stringify(headersObj || {}) + (bodyText ? ',body:' + JSON.stringify(bodyText) : '') + '});const t=await r.text();return{ok:true,status:r.status,body:t,contentType:r.headers.get("content-type")};}catch(e){return{ok:false,error:String(e&&e.message||e)};}})()';
     const result = await this.cdp('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true });
     const val = result && result.result && result.result.result ? result.result.result.value : null;
     if (!val) return { ok: false, error: 'cdp_no_result' };
@@ -1506,12 +1506,19 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
           'Access-Control-Allow-Credentials': 'true',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
           'Access-Control-Allow-Headers': '*',
-          'Access-Control-Allow-Private-Network': 'true',
-          'Content-Type': 'application/json'
+          'Access-Control-Allow-Private-Network': 'true'
         };
+        // 关键：微信本地服务真实响应【没有 Content-Type 头】（实测 contentType=null）。
+        // 之前我们强制设 application/json，导致 jQuery 把响应预解析成对象，
+        // 而微信脚本内部又对自己 JSON.parse(t) → 传入对象 → 抛 "[object Object]" is not valid JSON。
+        // 现改为透传微信真实响应头（无 contentType 时退化为 text/plain;charset=utf-8），
+        // 让 jQuery 行为与原生 Edge 完全一致，微信脚本才能正确解析。
+        const ct = (result.contentType && String(result.contentType).trim()) || 'text/plain; charset=utf-8';
+        respHeaders['Content-Type'] = ct;
         if (result.ok) {
-          addLog('WX', '协议响应(Edge)', `status=${result.status} size=${(result.body || '').length}`);
-          return new Response(result.body || '', { status: result.status || 200, headers: respHeaders });
+          const bodyStr = typeof result.body === 'string' ? result.body : JSON.stringify(result.body || {});
+          addLog('WX', '协议响应(Edge)', `status=${result.status} size=${bodyStr.length} ct=${ct}`);
+          return new Response(bodyStr, { status: result.status || 200, headers: respHeaders });
         }
         addLog('WX', 'Edge转发失败', String(result.error || 'unknown').substring(0, 120));
         return new Response(JSON.stringify({ error: 'wechat_not_running', message: result.error }), { status: 503, headers: respHeaders });
