@@ -247,6 +247,7 @@ let mainWindow = null;
 let tray = null;
 const TOP_OFFSET = 112;
 const PANEL_WIDTH = 380;
+let overflowReserveHeight = 0; // 展开书签弹层打开时，给 BrowserView 让出的竖向空间
 let rightPanelOpen = false;
 const processedDownloadItems = new WeakSet();
 const recentDownloadKeys = new Map();
@@ -496,13 +497,16 @@ function updateBrowserViewLayout() {
   // 所以面板打开时必须主动缩小 BrowserView，给右侧 DOM 面板让出空间。
   const reservedRightWidth = rightPanelOpen ? PANEL_WIDTH : 0;
   const viewWidth = Math.max(320, bounds.width - reservedRightWidth);
+  // 展开书签弹层是 renderer DOM，需要一个不被 BrowserView 遮挡的竖向空间，
+  // 因此弹层打开时把 BrowserView 整体下移到 TOP_OFFSET + overflowReserveHeight
+  const top = TOP_OFFSET + overflowReserveHeight;
   tab.view.setBounds({
     x: 0,
-    y: TOP_OFFSET,
+    y: top,
     width: viewWidth,
-    height: bounds.height - TOP_OFFSET
+    height: bounds.height - top
   });
-  addLog('TAB', '调整BrowserView尺寸', `x:0, y:${TOP_OFFSET}, w:${viewWidth}, h:${bounds.height - TOP_OFFSET}, rightPanel:${rightPanelOpen}`);
+  addLog('TAB', '调整BrowserView尺寸', `x:0, y:${top}, w:${viewWidth}, h:${bounds.height - top}, rightPanel:${rightPanelOpen}, overflowReserve:${overflowReserveHeight}`);
 }
 
 function getWheelDirection(inputEvent) {
@@ -1159,11 +1163,21 @@ function injectWxCompatibilityScript(webContents, pageUrl) {
   if (!pageUrl || pageUrl === 'about:blank') return;
 
   // 只在包含微信登录的页面注入
-  var needsInject = pageUrl.indexOf('weixin.qq.com') !== -1 
+  // 注意：不注入 sso.e.qq.com / open.weixin.qq.com！原因：
+  //   1. wxLogin.js 运行在跨域 iframe (open.weixin.qq.com) 中，executeJavaScript 只影响主框架
+  //   2. 即使注入成功，monkey-patch 的 XMLHttpRequest.prototype 无法影响 iframe 的独立 JS 环境
+  //   3. PNA 已通过命令行参数禁用 (--disable-features=PrivateNetworkAccess --disable-web-security)
+  //   4. EDGE 能成功登录就是因为没有任何注入干扰
+  //   5. 页面自身的 SyntaxError (Unexpected token ']') 也可能被注入脚本加剧
+  var needsInject = pageUrl.indexOf('weixin.qq.com') !== -1
     || pageUrl.indexOf('wx.qq.com') !== -1
-    || pageUrl.indexOf('sso.e.qq.com') !== -1
     || pageUrl.indexOf('ad.qq.com') !== -1;
-  
+
+  // 跳过微信登录相关页面（sso.e.qq.com 含登录 hub，open.weixin.qq.com 是 wxLogin.js 所在 iframe）
+  if (pageUrl.indexOf('sso.e.qq.com') !== -1 || pageUrl.indexOf('open.weixin.qq.com') !== -1) {
+    needsInject = false;
+  }
+
   if (!needsInject) return;
 
   addLog('WX', '注入兼容脚本', pageUrl);
@@ -1198,9 +1212,42 @@ function injectWxCompatibilityScript(webContents, pageUrl) {
     'var of=window.fetch;window.fetch=function(url,init){',
     'var u=typeof url==="string"?url:(url&&url.url?url.url:"");',
     'if(u&&u.indexOf("localhost.weixin.qq.com")!==-1){',
+    'console.log("[WX-EXE] 拦截fetch:",u.substring(0,120));',
     'return window.electronAPI.wxProxy({url:u,method:(init&&init.method)||"GET",headers:(init&&init.headers)||{},body:typeof(init&&init.body)==="string"?(init&&init.body):""})',
     '.then(function(r){return new Response(r.body,{status:r.status,statusText:r.statusText,headers:r.headers});});}',
     'return of.apply(this,arguments);};}',
+    // 4. XHR代理（关键路径：wxLogin.js 用 XHR 轮询 localhost.weixin.qq.com）
+    '(function(){if(!window.XMLHttpRequest)return;',
+    'var _o=XMLHttpRequest.prototype.open;',
+    'var _s=XMLHttpRequest.prototype.send;',
+    'XMLHttpRequest.prototype.open=function(m,u){this._wxU=u;this._wxM=m;return _o.apply(this,arguments);};',
+    'XMLHttpRequest.prototype.send=function(body){',
+    'var u=this._wxU||"";',
+    'if(u.indexOf("localhost.weixin.qq.com")!==-1){',
+    'var self=this;var m=this._wxM||"GET";',
+    'console.log("[WX-EXE] 拦截XHR:",String(u).substring(0,120));',
+    'window.electronAPI.wxProxy({url:u,method:m,headers:{},body:typeof body==="string"?body:""})',
+    '.then(function(resp){',
+    'var b=typeof resp.body==="string"?resp.body:JSON.stringify(resp.body||{});',
+    'var h=(typeof resp.headers==="object"&&resp.headers)||resp.headers||{};',
+    'Object.defineProperty(self,"readyState",{configurable:true,value:4});',
+    'Object.defineProperty(self,"status",{configurable:true,value:resp.status||200});',
+    'Object.defineProperty(self,"statusText",{configurable:true,value:resp.statusText||"OK"});',
+    'Object.defineProperty(self,"responseText",{configurable:true,value:b});',
+'try{if((self.responseType||"")==="json"&&b)Object.defineProperty(self,"response",{configurable:true,value:JSON.parse(b)});',
+    'else Object.defineProperty(self,"response",{configurable:true,value:b});}catch(e){}',
+    'self.getResponseHeader=function(n){if(!n)return null;var k=String(n).toLowerCase();var v=h[k]||h[n];return v?(Array.isArray(v)?v.join(", "):v):null;};',
+    'self.getAllResponseHeaders=function(){return Object.keys(h).map(function(k){var v=h[k];return k+": "+(Array.isArray(v)?v.join(", "):v);}).join("\\r\\n");};',
+    'function fire(t){try{if(self["on"+t])self["on"+t]();}catch(e){}try{self.dispatchEvent(new Event(t));}catch(e){}}',
+    'fire("readystatechange");fire("load");fire("loadend");',
+    '}).catch(function(err){',
+    'console.error("[WX-EXE] XHR代理失败:",err);',
+    'Object.defineProperty(self,"readyState",{configurable:true,value:4});',
+    'Object.defineProperty(self,"status",{configurable:true,value:0});',
+    'function fe(t){try{if(self["on"+t])self["on"+t]();}catch(e){}try{self.dispatchEvent(new Event(t));}catch(e){}}',
+    'fe("readystatechange");fe("error");fe("loadend");',
+    '});return;}',
+    'return _s.apply(this,arguments);};})();',
     'console.log("[WX] compat OK");',
     '}catch(e){console.error("[WX] err",e);}',
     '})();'
@@ -1395,28 +1442,12 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
   });
 
   const filter = { urls: ['*://*/*'] };
-  // 微信本地请求过滤器
-  const wxFilter = { urls: [
-    'https://localhost.weixin.qq.com/*',
-    'http://localhost.weixin.qq.com/*',
-    'wss://localhost.weixin.qq.com/*',
-    'ws://localhost.weixin.qq.com/*'
-  ] };
 
-  // ==================== 微信本地请求重定向到 wx-local 协议 ====================
-  // ==================== 微信本地请求重定向到 wx-local 协议 ====================
-  // 最关键的一步：在 PNA 检查之前拦截请求，重定向到自定义协议（主进程处理）
-  sess.webRequest.onBeforeRequest(wxFilter, (details, callback) => {
-    const url = details.url;
-    addLog('WX', '拦截到微信本地请求', `${details.method} ${url.substring(0, 100)} type=${details.resourceType}`);
-    // 将 https://localhost.weixin.qq.com:PORT/PATH 重定向到 wx-local://localhost.weixin.qq.com:PORT/PATH
-    // wx-local 协议处理器会在主进程中发起请求，完全绕过 PNA 和证书错误
-    const redirectUrl = url.replace('https://', 'wx-local://').replace('http://', 'wx-local://');
-    callback({ redirectURL: redirectUrl });
-  });
-
-  // 微信相关域名的诊断日志（只记录不重定向，安全）
-  // 扩到 127.0.0.1 / localhost，捕捉 wxLogin.js 经 DNS 解析后的真实请求
+  // ==================== 微信相关域名诊断日志 ====================
+  // 注意：PNA 已通过命令行参数禁用（disable-features 含 PrivateNetworkAccess*），
+  // 且 disable-web-security + allow-insecure-localhost 已开启。
+  // 因此 localhost.weixin.qq.com 的请求应能直连成功，不需要重定向/代理。
+  // 此处仅保留诊断日志用于排查问题。
   const wxDiagFilter = { urls: [
     'https://localhost.weixin.qq.com/*',
     'http://localhost.weixin.qq.com/*',
@@ -1428,8 +1459,10 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
     'https://localhost/*'
   ] };
   sess.webRequest.onBeforeRequest(wxDiagFilter, (details, callback) => {
+    const url = details.url;
     const from = details.initiator || details.referrer || details.resourceType || 'unknown';
-    addLog('WX-DIAG', '检测到请求', `${details.method} ${details.url.substring(0, 110)} | from=${from}`);
+    addLog('WX-DIAG', '检测到请求', `${details.method} ${url.substring(0, 110)} | from=${from}`);
+    // 不做重定向，让请求直连（PNA已禁用，直连应正常工作）
     callback({});
   });
 
@@ -1441,7 +1474,16 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
       callback({});
       return;
     }
-    if (isAdUrl(url)) {
+    // 微信登录相关域名必须跳过广告拦截！
+    // wxLogin.js 所在的 iframe（open.weixin.qq.com）及其依赖的脚本/图片资源一旦被
+    // 广告拦截规则误杀，iframe 就无法加载、wxLogin.js 不运行，导致永远 checkLogin_fail。
+    // EDGE 无广告拦截因此能正常关联登录。此处对微信登录域放行。
+    const isWxLoginDomain = url.indexOf('weixin.qq.com') !== -1
+      || url.indexOf('sso.e.qq.com') !== -1
+      || url.indexOf('qrconnect.qq.com') !== -1;
+    if (isWxLoginDomain) {
+      // 跳过广告拦截，继续后续处理（媒体嗅探等）
+    } else if (isAdUrl(url)) {
       callback({ cancel: true });
       return;
     }
@@ -4561,6 +4603,140 @@ function setupIPC() {
     addLog('SETTINGS', '右侧面板状态', rightPanelOpen ? '打开' : '关闭');
   });
 
+  // ==================== 展开书签弹层（独立原生子窗口方案）====================
+  // 关键：DOM 弹层在 Electron 中永远被 BrowserView（原生层）遮挡，若要让弹层可见
+  // 只能下移 BrowserView —— 这正是用户反感的“网页下移”。
+  // 改用独立 frameless 子窗口（parent=主窗口、不透明），它是原生层级，天然位于
+  // BrowserView 之上，网页完全不需要移动，效果与 EDGE 原生书签展开一致。
+  // 注意：之前用 transparent:true 在 Windows 上会出现透明渲染 bug（中间出现横线）
+  // 且事件穿透导致点不开；本方案改为不透明 + 有父窗口，规避这些问题。
+  let overflowPopupWin = null;
+
+  function generateOverflowPopupHTML(bookmarks) {
+    const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const items = bookmarks.map((b) => {
+      const t = esc(b.title);
+      const u = esc(b.url);
+      return '<div class="popup-item" data-id="' + b.id + '" data-url="' + u + '" data-title="' + t + '" draggable="true" title="' + t + '">' +
+        '<span class="popup-title">' + t + '</span></div>';
+    }).join('');
+    return '<!DOCTYPE html><html><head><meta charset="utf-8"><style>' +
+      '*{margin:0;padding:0;box-sizing:border-box}' +
+      'html,body{background:#ffffff;}' +
+      'body{font-family:-apple-system,"Microsoft YaHei",sans-serif;font-size:13px;overflow:hidden;user-select:none;height:100%;}' +
+      '.popup-item{padding:7px 14px;cursor:pointer;display:flex;align-items:center;white-space:nowrap;overflow:hidden;border-bottom:1px solid #f0f0f0;min-height:34px;}' +
+      '.popup-item:hover{background:#e8f4fd;}' +
+      '.popup-item:last-child{border-bottom:none;}' +
+      '.popup-title{overflow:hidden;text-overflow:ellipsis;}' +
+      '</style></head><body>' + items +
+      '<script>const {ipcRenderer}=require("electron");' +
+      'document.querySelectorAll(".popup-item").forEach(function(el){' +
+      'el.addEventListener("click",function(e){e.stopPropagation();ipcRenderer.send("overflow-action","click",{url:el.dataset.url});});' +
+      'el.addEventListener("contextmenu",function(e){e.preventDefault();e.stopPropagation();ipcRenderer.send("overflow-action","menu",{id:el.dataset.id});});' +
+      'el.addEventListener("dragstart",function(e){ipcRenderer.send("overflow-action","dragstart",{id:el.dataset.id,title:el.dataset.title,url:el.dataset.url});e.dataTransfer.effectAllowed="move";e.dataTransfer.setData("text/plain",el.dataset.url);el.style.opacity="0.5";});' +
+      'el.addEventListener("dragend",function(){el.style.opacity="1";ipcRenderer.send("overflow-action","dragend");});' +
+      '});' +
+      'document.body.addEventListener("click",function(e){if(e.target===document.body)ipcRenderer.send("overflow-action","close");});' +
+      'document.addEventListener("keydown",function(e){if(e.key==="Escape")ipcRenderer.send("overflow-action","close");});' +
+      '<\/script></body></html>';
+  }
+
+  function hideOverflowPopupWin() {
+    if (overflowPopupWin && !overflowPopupWin.isDestroyed()) {
+      overflowPopupWin.close();
+    }
+    overflowPopupWin = null;
+  }
+
+  ipcMain.handle('show-overflow-popup', async (event, data) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (overflowPopupWin && !overflowPopupWin.isDestroyed()) { try { overflowPopupWin.close(); } catch (e) {} }
+    const bookmarks = (data && data.bookmarks) || [];
+    const btnRect = (data && data.buttonRect) || {};
+    const popW = 280;
+    const itemH = 34;
+    const popH = Math.min(bookmarks.length * itemH + 16, 360);
+    const content = mainWindow.getContentBounds();
+    let x = content.x + (btnRect.left || 0);
+    const y = content.y + (btnRect.bottom || 112) + 4;
+    // 边界检测：弹层不要超出窗口右边缘，留 8px 边距；也不要超出左边缘
+    const rightEdge = x + popW;
+    if (rightEdge > content.x + content.width - 8) {
+      x = content.x + content.width - popW - 8;
+    }
+    if (x < content.x) { x = content.x; }
+    overflowPopupWin = new BrowserWindow({
+      parent: mainWindow,
+      modal: false,
+      frame: false,
+      transparent: false,
+      backgroundColor: '#ffffff',
+      alwaysOnTop: false,
+      resizable: false,
+      skipTaskbar: true,
+      hasShadow: true,
+      width: popW,
+      height: popH,
+      x: Math.round(x),
+      y: Math.round(y),
+      webPreferences: { nodeIntegration: true, contextIsolation: false }
+    });
+    await overflowPopupWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(generateOverflowPopupHTML(bookmarks)));
+    // 点主窗口任意位置（标签栏/网页/工具栏）→ 子窗口失焦 → 关闭
+    overflowPopupWin.on('blur', () => {
+      setTimeout(() => {
+        if (overflowPopupWin && !overflowPopupWin.isDestroyed() && !overflowPopupWin.isFocused() && !overflowPopupWin._dragging) {
+          hideOverflowPopupWin();
+        }
+      }, 80);
+    });
+    overflowPopupWin.on('closed', () => {
+      overflowPopupWin = null;
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('overflow-popup-closed');
+    });
+    addLog('BOOKMARK', '溢出弹层打开(子窗口)', bookmarks.length + '项');
+  });
+
+  ipcMain.handle('hide-overflow-popup', () => { hideOverflowPopupWin(); });
+
+  // 子窗口→主窗口→renderer 通信桥接
+  ipcMain.on('overflow-action', (event, action, payload) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (action === 'close') { hideOverflowPopupWin(); return; }
+    if (action === 'click' && payload && payload.url) {
+      mainWindow.webContents.send('cmd-create-tab', payload.url);
+      hideOverflowPopupWin();
+    } else if (action === 'menu' && payload && payload.id) {
+      const bookmark = globalState.bookmarks.find((b) => b.id === payload.id);
+      if (bookmark) {
+        const menu = Menu.buildFromTemplate([
+          { label: '打开书签', click: () => { createTab(bookmark.url); hideOverflowPopupWin(); } },
+          { label: '编辑书签', click: () => { showBookmarkEditModal(bookmark); hideOverflowPopupWin(); } },
+          { type: 'separator' },
+          { label: '删除书签', click: () => {
+            globalState.bookmarks = globalState.bookmarks.filter((b) => b.id !== payload.id);
+            saveData();
+            mainWindow.webContents.send('bookmarks-changed');
+            addLog('BOOKMARK', '删除书签', bookmark.title);
+            hideOverflowPopupWin();
+          } }
+        ]);
+        menu.popup({ window: mainWindow });
+      }
+    } else if (action === 'dragstart' && payload) {
+      mainWindow.webContents.send('set-drag-payload', payload);
+      if (overflowPopupWin) overflowPopupWin._dragging = true;
+    } else if (action === 'dragend') {
+      mainWindow.webContents.send('clear-drag-payload');
+      if (overflowPopupWin) { overflowPopupWin._dragging = false; hideOverflowPopupWin(); }
+    }
+  });
+
+  // renderer→主窗口→子窗口 通信桥接（保留）
+  ipcMain.on('cmd-create-tab', (_event, url) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('cmd-create-tab', url);
+  });
+
   // 书签栏右键菜单：必须使用 Electron 原生菜单，不能使用 DOM 菜单，否则会被 BrowserView 遮挡
   ipcMain.handle('show-bookmark-menu', async (event, bookmarkId) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -4832,14 +5008,17 @@ function setupWxProxy() {
 
       const response = await new Promise((resolve, reject) => {
         const options = {
-          hostname: parsedUrl.hostname,
+          // 直连 127.0.0.1，不依赖 localhost.weixin.qq.com 的 DNS 解析
+          host: '127.0.0.1',
           port: parsedUrl.port || (isHttps ? 443 : 80),
           path: parsedUrl.pathname + parsedUrl.search,
           method: req.method || 'GET',
-          headers: req.headers || {},
+          headers: Object.assign({}, req.headers || {}, { Host: parsedUrl.host }),
           agent: agent,
           rejectUnauthorized: false
         };
+        // HTTPS 时带上 SNI，让微信本地自签名证书通过校验
+        if (isHttps) options.servername = parsedUrl.hostname;
         const lib = isHttps ? https : http;
         const hreq = lib.request(options, (res) => {
           let body = '';

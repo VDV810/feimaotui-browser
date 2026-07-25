@@ -458,6 +458,44 @@ body {
     height: 14px;
 }
 
+/* ========== 展开书签弹层（向下展开，BrowserView下移让位，点击外部/ESC关闭） ========== */
+.bookmark-overflow-popup {
+    position: fixed;
+    width: 240px;
+    max-height: 320px;
+    overflow-y: auto;
+    background: var(--surface-color);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.28);
+    z-index: 50;
+    padding: 4px;
+}
+.bookmark-overflow-popup-item {
+    display: flex;
+    align-items: center;
+    height: 34px;
+    padding: 0 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-color);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    user-select: none;
+}
+.bookmark-overflow-popup-item:hover {
+    background: var(--hover-color);
+}
+.bookmark-overflow-popup-item:active {
+    cursor: grabbing;
+}
+.bookmark-overflow-popup-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 /* ========== 内容区域 ========== */
 .content-area {
     flex: 1;

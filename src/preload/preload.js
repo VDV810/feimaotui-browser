@@ -463,6 +463,50 @@ new MutationObserver(scanVideoElements).observe(document.documentElement || docu
   });
 })();
 
+// ============ 微信诊断探针（仅记录，不影响功能） ============
+// 用 PerformanceObserver 捕获 iframe 内 wxLogin.js 发出的所有资源请求
+(function() {
+  function isWxDiagUrl(u) {
+    return u && (u.indexOf('weixin') !== -1 || u.indexOf('127.0.0.1') !== -1 ||
+      u.indexOf('localhost') !== -1 || u.indexOf('[::1]') !== -1 || u.indexOf('wx.qq.com') !== -1);
+  }
+  if (typeof PerformanceObserver !== 'undefined') {
+    try {
+      var po = new PerformanceObserver(function(list) {
+        list.getEntries().forEach(function(entry) {
+          var u = entry.name || '';
+          if (isWxDiagUrl(u)) {
+            console.log('[WX-DIAG] resource', (entry.initiatorType || '?'), u.substring(0, 200));
+          }
+        });
+      });
+      po.observe({ entryTypes: ['resource'] });
+    } catch (e) {}
+  }
+  // 记录 Image 构造（wxLogin.js 可能用 new Image().src 探测本地服务）
+  if (typeof window !== 'undefined' && window.Image) {
+    var _OrigImage = window.Image;
+    var _srcDesc = Object.getOwnPropertyDescriptor(_OrigImage.prototype, 'src');
+    if (_srcDesc && _srcDesc.set) {
+      window.Image = function() {
+        var img = new _OrigImage();
+        try {
+          Object.defineProperty(img, 'src', {
+            configurable: true,
+            get: function() { return _srcDesc.get ? _srcDesc.get.call(this) : img.getAttribute('src'); },
+            set: function(v) {
+              if (isWxDiagUrl(v)) console.log('[WX-DIAG] new Image src:', String(v).substring(0, 200));
+              _srcDesc.set.call(this, v);
+            }
+          });
+        } catch (e) {}
+        return img;
+      };
+      window.Image.prototype = _OrigImage.prototype;
+    }
+  }
+})();
+
 // ============ 微信快捷登录兼容（所有帧含iframe均生效） ============
 // wxLogin.js 在 open.weixin.qq.com 的 iframe 中运行，需要在这里修复
 (function() {
@@ -471,13 +515,20 @@ new MutationObserver(scanVideoElements).observe(document.documentElement || docu
     var _origQuery = navigator.permissions.query.bind(navigator.permissions);
     navigator.permissions.query = function(permissionDesc) {
       var name = (permissionDesc && permissionDesc.name) || '';
+      // 记录微信探测了哪个权限
+      if (name.indexOf('network') !== -1 || name.indexOf('weixin') !== -1) {
+        console.log('[WX-DIAG] permissions.query:', name);
+      }
       // 让微信脚本认为私网访问权限已授予
       if (name === 'local-network-access' || name === 'private-network-access') {
         return Promise.resolve({
           state: 'granted',
           onchange: null,
+          addEventListener: function() {},
+          removeEventListener: function() {},
           addListener: function() {},
-          removeListener: function() {}
+          removeListener: function() {},
+          dispatchEvent: function() { return true; }
         });
       }
       return _origQuery(permissionDesc);
@@ -510,67 +561,8 @@ new MutationObserver(scanVideoElements).observe(document.documentElement || docu
     });
   }).observe(document.documentElement || document, { childList: true, subtree: true });
 
-  // 3. 拦截 fetch 请求到 localhost.weixin.qq.com → 走 IPC 代理
-  if (window.electronAPI && window.electronAPI.wxProxy) {
-    var _origFetch = window.fetch;
-    window.fetch = function(url, init) {
-      var urlStr = typeof url === 'string' ? url : (url && url.url ? url.url : '');
-      if (urlStr && urlStr.indexOf('localhost.weixin.qq.com') !== -1) {
-        console.log('[WX-PRELOAD] 拦截fetch:', urlStr.substring(0, 100));
-        return window.electronAPI.wxProxy({
-          url: urlStr,
-          method: (init && init.method) || 'GET',
-          headers: (init && init.headers) || {},
-          body: typeof(init && init.body) === 'string' ? (init && init.body) : ''
-        }).then(function(resp) {
-          return new Response(resp.body, {
-            status: resp.status,
-            statusText: resp.statusText,
-            headers: resp.headers
-          });
-        });
-      }
-      return _origFetch.apply(this, arguments);
-    };
-  }
-
-  // 4. 拦截 XMLHttpRequest 到 localhost.weixin.qq.com
-  if (window.XMLHttpRequest && window.electronAPI && window.electronAPI.wxProxy) {
-    var _origOpen = XMLHttpRequest.prototype.open;
-    var _origSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(method, url) {
-      this._wxUrl = url;
-      this._wxMethod = method;
-      return _origOpen.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.send = function(body) {
-      var url = this._wxUrl || '';
-      if (url.indexOf('localhost.weixin.qq.com') !== -1) {
-        var self = this;
-        var method = this._wxMethod || 'GET';
-        console.log('[WX-PRELOAD] 拦截XHR:', url.substring(0, 100));
-        window.electronAPI.wxProxy({
-          url: url,
-          method: method,
-          headers: {},
-          body: typeof body === 'string' ? body : ''
-        }).then(function(resp) {
-          Object.defineProperty(self, 'readyState', { value: 4, writable: false });
-          Object.defineProperty(self, 'status', { value: resp.status, writable: false });
-          Object.defineProperty(self, 'statusText', { value: resp.statusText, writable: false });
-          self.responseText = typeof resp.body === 'string' ? resp.body : JSON.stringify(resp.body || {});
-          self.response = self.responseText;
-          if (self.onreadystatechange) self.onreadystatechange();
-          if (self.onload) self.onload();
-        }).catch(function(err) {
-          console.error('[WX-PRELOAD] XHR代理失败:', err);
-          if (self.onerror) self.onerror(err);
-        });
-        return; // 不走原始send
-      }
-      return _origSend.apply(this, arguments);
-    };
-  }
+  // 3+4. （已移除隔离世界的 XHR/fetch 补丁——它们不影响主世界）
+  // 正确方案见下方：contextBridge.exposeInMainWorld 之后注入主世界脚本
 
   console.log('[WX-PRELOAD] 微信兼容层已加载, location=', location.href);
 })();
@@ -707,5 +699,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onAutoSniffPaused: (callback) => ipcRenderer.on('auto-sniff-paused', () => callback()),
   onAutoSniffResumed: (callback) => ipcRenderer.on('auto-sniff-resumed', () => callback()),
 
+  // 展开书签弹层（独立原生子窗口，网页不下移）
+  showOverflowPopup: (bookmarks, buttonRect) => ipcRenderer.invoke('show-overflow-popup', { bookmarks, buttonRect }),
+  hideOverflowPopup: () => ipcRenderer.invoke('hide-overflow-popup'),
+
+  // 通用主进程→renderer 事件监听（用于子窗口弹层通信等场景）
+  receive: (channel, callback) => ipcRenderer.on(channel, (_event, data) => callback(data)),
+
   removeAllListeners: (channel) => ipcRenderer.removeAllListeners(channel)
 });
+
+// ====== 微信登录主世界拦截说明 ======
+// ⚠️ 禁止在 preload 中往 DOM 注入 script 标签！
+// 原因：preload 在页面解析期间执行，此时往 document.head 追加 script 会同步执行，
+// 干扰浏览器 HTML 解析器导致 DOM 状态异常（v1.3.26~1.3.27 反复出现 createTreeWalker 报错、全页空白）。
+// 正确做法：在主进程 did-finish-load 后通过 webContents.executeJavaScript() 注入（见 main.js injectWxCompatibilityScript），
+// 此时页面已完全解析完毕，注入安全无副作用。

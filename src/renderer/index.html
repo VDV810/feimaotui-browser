@@ -125,6 +125,9 @@
             </div>
         </div>
 
+        <!-- 展开书签弹层（renderer DOM，打开时 BrowserView 下移让位，避免被遮挡） -->
+        <div class="bookmark-overflow-popup" id="bookmarkOverflowPopup" style="display: none;"></div>
+
         <!-- ========== 内容区域（BrowserView会覆盖这里） ========== -->
         <div class="content-area" id="contentArea">
             <div class="welcome-page" id="welcomePage">

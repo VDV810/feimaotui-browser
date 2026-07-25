@@ -19,6 +19,8 @@ const appState = {
     bookmarks: [],
     dragSrcEl: null,
     dragSrcIndex: null,
+    dragPayload: null,       // 从展开书签弹层拖出的书签对象
+    overflowPopupOpen: false, // 展开书签弹层（原生子窗口）是否已打开
     tabDragId: null,
     zoomLevels: new Map(),
     contextMenuVisible: false,
@@ -92,6 +94,7 @@ const elements = {
     chromiumVersion: document.getElementById('chromiumVersion'),
     bookmarkBarContent: document.getElementById('bookmarkBarContent'),
     bookmarkOverflowBtn: document.getElementById('bookmarkOverflowBtn'),
+    bookmarkOverflowPopup: document.getElementById('bookmarkOverflowPopup'),
     bookmarkOverflowDropdown: document.getElementById('bookmarkOverflowDropdown'),
     bookmarkOverflowList: document.getElementById('bookmarkOverflowList'),
     translateInput: document.getElementById('translateInput'),
@@ -949,6 +952,27 @@ function setupIPCEvents() {
             onAutoSniffCountUpdate(count);
         });
     }
+
+    // ========== 子窗口弹层通信（独立 BrowserWindow 弹层 ↔ renderer）==========
+    // 弹层中点击书签→创建新标签页
+    if (window.electronAPI.receive) {
+        window.electronAPI.receive('cmd-create-tab', (url) => {
+            createTab(url);
+        });
+        // 弹层中拖拽开始→设置拖拽数据
+        window.electronAPI.receive('set-drag-payload', (payload) => {
+            appState.dragPayload = payload;
+        });
+        // 弹层中拖拽结束→清除拖拽数据
+        window.electronAPI.receive('clear-drag-payload', () => {
+            appState.dragPayload = null;
+        });
+        // 弹层被关闭（用户点击外部或按ESC）
+        window.electronAPI.receive('overflow-popup-closed', () => {
+            appState.dragPayload = null;
+            appState.overflowPopupOpen = false;
+        });
+    }
 }
 
 // 检测英文网页自动翻译
@@ -1632,25 +1656,93 @@ function checkBookmarkOverflow(bookmarks) {
     }
 }
 
-// 溢出按钮点击 — 使用原生Menu避免被BrowserView遮挡
+// 溢出按钮点击 — 改为 DOM 弹层（打开时让 BrowserView 下移让位，避免被遮挡，且支持原生拖拽到书签栏）
 function setupBookmarkOverflow() {
     if (!elements.bookmarkOverflowBtn) return;
-    
+
     elements.bookmarkOverflowBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         if (!appState.overflowBookmarkIds || appState.overflowBookmarkIds.length === 0) return;
-        if (window.electronAPI.showBookmarkOverflowMenu) {
-            const rect = elements.bookmarkOverflowBtn.getBoundingClientRect();
-            await window.electronAPI.showBookmarkOverflowMenu(appState.overflowBookmarkIds, { x: rect.left, y: rect.bottom, width: rect.width, height: rect.height });
+        if (appState.overflowPopupOpen) {
+            closeBookmarkOverflow();
+        } else {
+            openBookmarkOverflow();
         }
     });
-    
-    // 窗口大小变化
+
+    // 书签栏空白处也可作为拖放目标：把弹层里的书签追加到末尾
+    if (elements.bookmarkBarContent) {
+        elements.bookmarkBarContent.addEventListener('dragover', (e) => {
+            if (appState.dragPayload) {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+            }
+        });
+        elements.bookmarkBarContent.addEventListener('drop', async (e) => {
+            if (!appState.dragPayload) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const bookmarks = [...appState.bookmarks];
+            const srcIndex = bookmarks.findIndex(b => b.id === appState.dragPayload.id);
+            if (srcIndex === -1) {
+                bookmarks.push(appState.dragPayload);
+            } else {
+                const [moved] = bookmarks.splice(srcIndex, 1);
+                bookmarks.push(moved);
+            }
+            appState.bookmarks = bookmarks;
+            appState.dragPayload = null;
+            renderBookmarkBar(bookmarks);
+            if (window.electronAPI.updateBookmarkOrder) {
+                await window.electronAPI.updateBookmarkOrder(bookmarks);
+            }
+            closeBookmarkOverflow();
+        });
+    }
+
+    // 窗口大小变化时关闭弹层（原生子窗口位置需重新计算，重新打开即可）
     window.addEventListener('resize', () => {
         if (appState.bookmarks.length > 0) {
             checkBookmarkOverflow(appState.bookmarks);
         }
+        closeBookmarkOverflow();
     });
+    // ESC 关闭弹层（焦点在主窗口时；子窗口内按 ESC 由子窗口自身处理）
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            closeBookmarkOverflow();
+        }
+    });
+}
+
+// 打开展开书签弹层（独立原生子窗口方案，网页不下移）
+function openBookmarkOverflow() {
+    if (!elements.bookmarkOverflowBtn) return;
+    const overflowBookmarks = appState.bookmarks.filter(b => appState.overflowBookmarkIds.includes(b.id));
+    if (overflowBookmarks.length === 0) return;
+
+    // 获取溢出按钮在主窗口内容区的位置，传给主进程用于定位子窗口
+    const rect = elements.bookmarkOverflowBtn.getBoundingClientRect();
+    if (window.electronAPI.showOverflowPopup) {
+        window.electronAPI.showOverflowPopup(overflowBookmarks, {
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+            left: rect.left,
+            width: rect.width,
+            height: rect.height
+        });
+        appState.overflowPopupOpen = true;
+    }
+}
+
+// 关闭展开书签弹层（通知主进程关闭原生子窗口）
+function closeBookmarkOverflow() {
+    if (window.electronAPI.hideOverflowPopup) {
+        window.electronAPI.hideOverflowPopup();
+    }
+    appState.dragPayload = null;
+    appState.overflowPopupOpen = false;
 }
 
 // 拖拽排序
@@ -1671,6 +1763,28 @@ function handleDragOver(e) {
 async function handleDrop(e) {
     e.stopPropagation();
     e.preventDefault();
+
+    // 情况A：从展开书签弹层拖入 → 插入到目标位置（书签本就在列表中，只是之前因宽度溢出被隐藏）
+    if (appState.dragPayload) {
+        const targetIndex = parseInt(this.dataset.index);
+        const bookmarks = [...appState.bookmarks];
+        const srcIndex = bookmarks.findIndex(b => b.id === appState.dragPayload.id);
+        if (srcIndex === -1) {
+            bookmarks.splice(targetIndex, 0, appState.dragPayload);
+        } else {
+            const [moved] = bookmarks.splice(srcIndex, 1);
+            bookmarks.splice(targetIndex, 0, moved);
+        }
+        appState.bookmarks = bookmarks;
+        appState.dragPayload = null;
+        renderBookmarkBar(bookmarks);
+        if (window.electronAPI.updateBookmarkOrder) {
+            await window.electronAPI.updateBookmarkOrder(bookmarks);
+        }
+        return false;
+    }
+
+    // 情况B：书签栏内部重排
     if (appState.dragSrcEl !== this) {
         const targetIndex = parseInt(this.dataset.index);
         const srcIndex = appState.dragSrcIndex;
