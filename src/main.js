@@ -1291,8 +1291,15 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
   // ==================== wx-local 协议处理器：代理 localhost.weixin.qq.com 请求 ====================
   try {
     sess.protocol.handle('wx-local', async (request) => {
-      // wx-local://<host>/<path> -> https://<host>/<path>
-      const url = request.url.replace('wx-local://', 'https://');
+      // wx-local://wxproxy.local/?target=<encodeURIComponent(真实URL含端口)>
+      // （端口不能放 authority——Chromium 重定向到自定义协议时会吞掉端口）
+      let url = request.url.replace('wx-local://', 'https://');
+      try {
+        const u = new URL(request.url);
+        const target = u.searchParams.get('target');
+        if (target) url = target;
+      } catch (e) {}
+      const reqOrigin = request.headers.get('origin') || '*';
       addLog('WX', '协议拦截', `${request.method} ${url.substring(0, 100)}`);
 
       // CORS 预检验证直接返回 204（微信本地服务器不处理 OPTIONS）
@@ -1302,7 +1309,8 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
           status: 204,
           statusText: 'No Content',
           headers: {
-            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Origin': reqOrigin,
+            'Access-Control-Allow-Credentials': 'true',
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
             'Access-Control-Allow-Headers': '*',
             'Access-Control-Allow-Private-Network': 'true',
@@ -1335,13 +1343,14 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
 
         const response = await new Promise((resolve, reject) => {
           const reqHeaders = {};
-          // 复制请求头
-          if (request.headers) {
-            for (const [key, value] of Object.entries(request.headers)) {
+          // 复制请求头（request.headers 是 Headers 对象，必须用 forEach 遍历，
+          // Object.entries 对它无效——之前会导致 Content-Type 等头全部丢失）
+          if (request.headers && typeof request.headers.forEach === 'function') {
+            request.headers.forEach((value, key) => {
               const lowerKey = key.toLowerCase();
-              if (lowerKey === 'host') continue;
+              if (lowerKey === 'host') return;
               reqHeaders[key] = value;
-            }
+            });
           }
           reqHeaders['Host'] = parsedUrl.host;
 
@@ -1383,9 +1392,10 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
           hreq.end();
         });
 
-        // 构造 CORS 友好的响应头
+        // 构造 CORS 友好的响应头（回显 Origin + 允许凭据，兼容 wxLogin.js 的 XHR）
         const respHeaders = {
-          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Origin': reqOrigin,
+          'Access-Control-Allow-Credentials': 'true',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
           'Access-Control-Allow-Headers': '*',
           'Access-Control-Allow-Private-Network': 'true'
@@ -1450,11 +1460,13 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
       callback({});
       return;
     }
-    // 将 localhost.weixin.qq.com / 127.0.0.1 请求重定向到 wx-local 协议代理，
-    // 由主进程 Node.js 直连微信客户端本地服务，绕过 Chromium PNA/CORS/混合内容限制
+    // 将 localhost.weixin.qq.com 请求重定向到 wx-local 协议代理，
+    // 由主进程 Node.js 直连微信客户端本地服务，绕过 Chromium PNA/CORS/混合内容限制。
+    // 【注意】完整目标URL必须编码进查询参数传递——若把端口放在 authority 中
+    // (wx-local://host:14013/...)，Chromium 在重定向/协议分发时会吞掉端口号！
     if (url.indexOf('localhost.weixin.qq.com') !== -1) {
-      const proxyUrl = url.replace(/^https?:\/\/localhost\.weixin\.qq\.com/, 'wx-local://localhost.weixin.qq.com');
-      addLog('WX-PROXY', '重定向到wx-local', `${url.substring(0, 80)} -> ${proxyUrl.substring(0, 80)}`);
+      const proxyUrl = 'wx-local://wxproxy.local/?target=' + encodeURIComponent(url);
+      addLog('WX-PROXY', '重定向到wx-local', url.substring(0, 90));
       callback({ redirectURL: proxyUrl });
       return;
     }
@@ -4607,7 +4619,11 @@ function setupIPC() {
     return '<!DOCTYPE html><html><head><meta charset="utf-8"><style>' +
       '*{margin:0;padding:0;box-sizing:border-box}' +
       'html,body{background:#ffffff;}' +
-      'body{font-family:-apple-system,"Microsoft YaHei",sans-serif;font-size:13px;overflow:hidden;user-select:none;height:100%;}' +
+      'body{font-family:-apple-system,"Microsoft YaHei",sans-serif;font-size:13px;overflow-y:auto;overflow-x:hidden;user-select:none;height:100%;overscroll-behavior:contain;}' +
+      '::-webkit-scrollbar{width:8px;}' +
+      '::-webkit-scrollbar-track{background:transparent;}' +
+      '::-webkit-scrollbar-thumb{background:#c1c1c1;border-radius:4px;}' +
+      '::-webkit-scrollbar-thumb:hover{background:#a0a0a0;}' +
       '.popup-item{padding:7px 14px;cursor:pointer;display:flex;align-items:center;white-space:nowrap;overflow:hidden;border-bottom:1px solid #f0f0f0;min-height:34px;}' +
       '.popup-item:hover{background:#e8f4fd;}' +
       '.popup-item:last-child{border-bottom:none;}' +
