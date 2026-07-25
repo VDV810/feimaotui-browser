@@ -123,13 +123,15 @@ const wxEdgeProxy = {
     if (!exe) { addLog('WX-EDGE', '未找到Edge安装', 'Edge通道不可用'); return false; }
     const { spawn } = require('child_process');
     const profileDir = path.join(app.getPath('userData'), 'edge-wx-proxy');
+    // 每次启动重建干净 profile（历史版本可能写入过 BLOCK 权限，必须清掉）
+    try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch (e) {}
     try { fs.mkdirSync(profileDir, { recursive: true }); } catch (e) {}
-    try { fs.unlinkSync(path.join(profileDir, 'DevToolsActivePort')); } catch (e) {}
     // 执行上下文页面：open.weixin.qq.com 源（满足微信服务器 CORS 的 ACAO 限制）
     const originPage = 'https://open.weixin.qq.com/connect/qrconnect?appid=wx708c87b4f90c2b12&scope=snsapi_login&redirect_uri=https%3A%2F%2Fsso.e.qq.com%2Flogin%2Fcallback&state=proxy&login_type=jssdk&self_redirect=true';
     this.edgeProc = spawn(exe, [
       '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
       '--mute-audio', '--disable-sync',
+      '--disable-features=LocalNetworkAccessChecks,LocalNetworkAccessChecksWarn,LocalNetworkAccess',
       '--remote-debugging-port=0',
       '--user-data-dir=' + profileDir,
       originPage
@@ -166,7 +168,9 @@ const wxEdgeProxy = {
         bws.onmessage = (ev) => {
           try { const m = JSON.parse(ev.data); if (m.id === bid) resolve(m); } catch (e) {}
         };
-        bws.send(JSON.stringify({ id: bid, method: 'Browser.grantPermissions', params: { origin: 'https://open.weixin.qq.com', permissions: ['loopbackNetwork', 'localNetworkAccess'] } }));
+        // 【关键】只授 localNetworkAccess！多传 'loopbackNetwork'（无效权限名）
+        // 会导致 profile 里 loopback_network 被写成 BLOCK（实测踩过的坑）
+        bws.send(JSON.stringify({ id: bid, method: 'Browser.grantPermissions', params: { origin: 'https://open.weixin.qq.com', permissions: ['localNetworkAccess'] } }));
         setTimeout(() => resolve({ error: 'timeout' }), 5000);
       });
       try { bws.close(); } catch (e) {}
