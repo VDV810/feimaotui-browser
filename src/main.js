@@ -68,6 +68,164 @@ function clearLogs() {
   addLog('INFO', '日志已手动清除');
 }
 
+// ==================== 微信 Edge CDP 代理 ====================
+// 背景（实测结论，2026-07-26）：
+// 1) 微信4.x本地服务(localhost.weixin.qq.com:14013等)在TLS层校验调用进程，仅放行真实签名的
+//    浏览器进程（如真实msedge.exe）；Node.js/curl/本浏览器进程直连均被RST(SSL_HANDSHAKE_ERROR)。
+// 2) Chromium 139+ 对"公网页面→本地回环"请求强制执行本地网络访问(LNA/loopbackNetwork)检查，
+//    未授权时预检直接失败(LocalNetworkAccessPermissionDenied)。
+// 3) 微信服务器对 check-login 的 CORS 仅放行 Origin: https://open.weixin.qq.com。
+// 解决方案：启动真实 Edge headless（微软签名，通过微信进程校验），浏览器级 CDP 授予
+// loopbackNetwork 权限（绕过 LNA），在 open.weixin.qq.com 源页面中转发请求（满足 CORS）。
+const wxEdgeProxy = {
+  edgeProc: null,
+  pageWs: null,
+  msgId: 0,
+  pending: new Map(),
+  starting: null,
+  cdpPort: 0,
+
+  findEdgeExe() {
+    const candidates = [
+      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+      process.env['ProgramFiles(x86)'] ? process.env['ProgramFiles(x86)'] + '\\Microsoft\\Edge\\Application\\msedge.exe' : null,
+      process.env.ProgramFiles ? process.env.ProgramFiles + '\\Microsoft\\Edge\\Application\\msedge.exe' : null
+    ].filter(Boolean);
+    for (const p of candidates) {
+      try { if (fs.existsSync(p)) return p; } catch (e) {}
+    }
+    return null;
+  },
+
+  httpJson(port, reqPath) {
+    return new Promise((resolve, reject) => {
+      const http = require('http');
+      http.get({ host: '127.0.0.1', port, path: reqPath }, (res) => {
+        let b = '';
+        res.on('data', c => b += c);
+        res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
+      }).on('error', reject);
+    });
+  },
+
+  async ensureStarted() {
+    if (this.pageWs && this.pageWs.readyState === 1) return true;
+    if (this.starting) return this.starting;
+    this.starting = this._start()
+      .then(ok => { this.starting = null; return ok; })
+      .catch((e) => { addLog('WX-EDGE', '启动异常', e.message); this.starting = null; return false; });
+    return this.starting;
+  },
+
+  async _start() {
+    const exe = this.findEdgeExe();
+    if (!exe) { addLog('WX-EDGE', '未找到Edge安装', 'Edge通道不可用'); return false; }
+    const { spawn } = require('child_process');
+    const profileDir = path.join(app.getPath('userData'), 'edge-wx-proxy');
+    try { fs.mkdirSync(profileDir, { recursive: true }); } catch (e) {}
+    try { fs.unlinkSync(path.join(profileDir, 'DevToolsActivePort')); } catch (e) {}
+    // 执行上下文页面：open.weixin.qq.com 源（满足微信服务器 CORS 的 ACAO 限制）
+    const originPage = 'https://open.weixin.qq.com/connect/qrconnect?appid=wx708c87b4f90c2b12&scope=snsapi_login&redirect_uri=https%3A%2F%2Fsso.e.qq.com%2Flogin%2Fcallback&state=proxy&login_type=jssdk&self_redirect=true';
+    this.edgeProc = spawn(exe, [
+      '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+      '--mute-audio', '--disable-sync',
+      '--remote-debugging-port=0',
+      '--user-data-dir=' + profileDir,
+      originPage
+    ], { stdio: 'ignore' });
+    this.edgeProc.on('exit', () => {
+      addLog('WX-EDGE', 'Edge进程退出', '下次请求时自动重启');
+      this.edgeProc = null;
+      if (this.pageWs) { try { this.pageWs.close(); } catch (e) {} }
+      this.pageWs = null;
+    });
+    addLog('WX-EDGE', 'Edge已启动', 'pid=' + this.edgeProc.pid);
+
+    // 等待 DevToolsActivePort 文件（端口自动分配，从该文件读取）
+    const portFile = path.join(profileDir, 'DevToolsActivePort');
+    let port = 0;
+    for (let i = 0; i < 50; i++) {
+      await new Promise(r => setTimeout(r, 200));
+      try {
+        port = parseInt(fs.readFileSync(portFile, 'utf8').split('\n')[0].trim(), 10);
+        if (port > 0) break;
+      } catch (e) {}
+      if (!this.edgeProc) return false;
+    }
+    if (!port) { addLog('WX-EDGE', 'DevTools端口获取失败', ''); return false; }
+    this.cdpPort = port;
+
+    // 浏览器级会话：授予 loopbackNetwork 权限（绕过 LNA 检查，实测必需的权限名）
+    try {
+      const ver = await this.httpJson(port, '/json/version');
+      const bws = new WebSocket(ver.webSocketDebuggerUrl);
+      await new Promise((res, rej) => { bws.onopen = res; bws.onerror = rej; });
+      const bid = 1001;
+      const gp = await new Promise((resolve) => {
+        bws.onmessage = (ev) => {
+          try { const m = JSON.parse(ev.data); if (m.id === bid) resolve(m); } catch (e) {}
+        };
+        bws.send(JSON.stringify({ id: bid, method: 'Browser.grantPermissions', params: { origin: 'https://open.weixin.qq.com', permissions: ['loopbackNetwork', 'localNetworkAccess'] } }));
+        setTimeout(() => resolve({ error: 'timeout' }), 5000);
+      });
+      try { bws.close(); } catch (e) {}
+      addLog('WX-EDGE', 'loopbackNetwork授权', gp.error ? ('失败:' + JSON.stringify(gp.error)) : '成功');
+    } catch (e) {
+      addLog('WX-EDGE', '授权异常', e.message);
+    }
+
+    // 等待并连接 open.weixin.qq.com 源页面
+    let page = null;
+    for (let i = 0; i < 25; i++) {
+      await new Promise(r => setTimeout(r, 400));
+      try {
+        const targets = await this.httpJson(port, '/json/list');
+        page = targets.find(t => t.type === 'page' && t.url.indexOf('open.weixin.qq.com') !== -1);
+        if (page) break;
+      } catch (e) {}
+    }
+    if (!page) { addLog('WX-EDGE', '未找到源页面', ''); return false; }
+    this.pageWs = new WebSocket(page.webSocketDebuggerUrl);
+    await new Promise((res, rej) => { this.pageWs.onopen = res; this.pageWs.onerror = rej; });
+    this.pageWs.onmessage = (ev) => {
+      try {
+        const m = JSON.parse(ev.data);
+        if (m.id && this.pending.has(m.id)) { this.pending.get(m.id)(m); this.pending.delete(m.id); }
+      } catch (e) {}
+    };
+    this.pageWs.onclose = () => { this.pageWs = null; };
+    addLog('WX-EDGE', 'CDP通道就绪', page.url.substring(0, 60));
+    return true;
+  },
+
+  cdp(method, params) {
+    return new Promise((resolve, reject) => {
+      if (!this.pageWs || this.pageWs.readyState !== 1) { reject(new Error('cdp_not_ready')); return; }
+      const id = ++this.msgId;
+      this.pending.set(id, resolve);
+      this.pageWs.send(JSON.stringify({ id, method, params }));
+      setTimeout(() => { if (this.pending.has(id)) { this.pending.delete(id); reject(new Error('cdp_timeout')); } }, 10000);
+    });
+  },
+
+  // 通过 Edge 页面上下文发起请求，返回 {ok,status,body} 或 {ok:false,error}
+  async wxFetch(url, method, headersObj, bodyText) {
+    const ok = await this.ensureStarted();
+    if (!ok) return { ok: false, error: 'edge_proxy_unavailable' };
+    const expr = '(async()=>{try{const r=await fetch(' + JSON.stringify(url) + ',{method:' + JSON.stringify(method || 'POST') + ',headers:' + JSON.stringify(headersObj || {}) + (bodyText ? ',body:' + JSON.stringify(bodyText) : '') + '});const t=await r.text();return{ok:true,status:r.status,body:t};}catch(e){return{ok:false,error:String(e&&e.message||e)};}})()';
+    const result = await this.cdp('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true });
+    const val = result && result.result && result.result.result ? result.result.result.value : null;
+    if (!val) return { ok: false, error: 'cdp_no_result' };
+    return val;
+  },
+
+  stop() {
+    if (this.pageWs) { try { this.pageWs.close(); } catch (e) {} this.pageWs = null; }
+    if (this.edgeProc) { try { this.edgeProc.kill(); } catch (e) {} this.edgeProc = null; }
+  }
+};
+
 // ==================== 广告拦截规则 ====================
 const AD_BLOCK_RULES = [
   '*://*.doubleclick.net/*',
@@ -1321,101 +1479,38 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
       }
 
       try {
-        const https = require('https');
-        const http = require('http');
-        const parsedUrl = new URL(url);
-        const isHttps = parsedUrl.protocol === 'https:';
-        const agent = isHttps
-          ? new https.Agent({ rejectUnauthorized: false })
-          : new http.Agent();
-
         // 读取请求体
-        let bodyBuffer = null;
+        let bodyText = null;
         if (request.body) {
           const chunks = [];
           for await (const chunk of request.body) {
             chunks.push(chunk);
           }
           if (chunks.length > 0) {
-            bodyBuffer = Buffer.concat(chunks);
+            bodyText = Buffer.concat(chunks).toString('utf8');
           }
         }
+        // 微信本地服务只需要 Content-Type（application/json）
+        const fwdHeaders = { 'Content-Type': request.headers.get('content-type') || 'application/json' };
 
-        const response = await new Promise((resolve, reject) => {
-          const reqHeaders = {};
-          // 复制请求头（request.headers 是 Headers 对象，必须用 forEach 遍历，
-          // Object.entries 对它无效——之前会导致 Content-Type 等头全部丢失）
-          if (request.headers && typeof request.headers.forEach === 'function') {
-            request.headers.forEach((value, key) => {
-              const lowerKey = key.toLowerCase();
-              if (lowerKey === 'host') return;
-              reqHeaders[key] = value;
-            });
-          }
-          reqHeaders['Host'] = parsedUrl.host;
+        // 通过真实 Edge（CDP）转发——微信4.x在TLS层校验调用进程签名，
+        // 本进程/Node直连均被拒绝，只有真实浏览器进程能通（实测验证）
+        const result = await wxEdgeProxy.wxFetch(url, request.method || 'POST', fwdHeaders, bodyText);
 
-          const options = {
-            hostname: parsedUrl.hostname,
-            port: parsedUrl.port || (isHttps ? 443 : 80),
-            path: parsedUrl.pathname + parsedUrl.search,
-            method: request.method || 'GET',
-            headers: reqHeaders,
-            agent: agent,
-            rejectUnauthorized: false,
-            timeout: 8000
-          };
-
-          const lib = isHttps ? https : http;
-          const hreq = lib.request(options, (res) => {
-            const chunks = [];
-            res.on('data', chunk => chunks.push(chunk));
-            res.on('end', () => {
-              resolve({
-                status: res.statusCode,
-                statusText: res.statusMessage,
-                headers: res.headers,
-                body: Buffer.concat(chunks)
-              });
-            });
-          });
-          hreq.on('error', (err) => {
-            addLog('WX', '连接失败', `${err.message} (微信客户端可能未运行)`);
-            resolve({
-              status: 503,
-              statusText: 'Service Unavailable',
-              headers: {},
-              body: Buffer.from(JSON.stringify({ error: 'wechat_not_running', message: err.message }))
-            });
-          });
-          hreq.on('timeout', () => { hreq.destroy(); reject(new Error('timeout')); });
-          if (bodyBuffer) hreq.write(bodyBuffer);
-          hreq.end();
-        });
-
-        // 构造 CORS 友好的响应头（回显 Origin + 允许凭据，兼容 wxLogin.js 的 XHR）
         const respHeaders = {
           'Access-Control-Allow-Origin': reqOrigin,
           'Access-Control-Allow-Credentials': 'true',
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, PUT, DELETE',
           'Access-Control-Allow-Headers': '*',
-          'Access-Control-Allow-Private-Network': 'true'
+          'Access-Control-Allow-Private-Network': 'true',
+          'Content-Type': 'application/json'
         };
-        // 复制原始响应头
-        if (response.headers) {
-          for (const [key, value] of Object.entries(response.headers)) {
-            const lowerKey = key.toLowerCase();
-            if (lowerKey === 'access-control-allow-origin') continue;
-            if (lowerKey === 'access-control-allow-private-network') continue;
-            respHeaders[key] = value;
-          }
+        if (result.ok) {
+          addLog('WX', '协议响应(Edge)', `status=${result.status} size=${(result.body || '').length}`);
+          return new Response(result.body || '', { status: result.status || 200, headers: respHeaders });
         }
-
-        addLog('WX', '协议响应', `status=${response.status} size=${response.body.length}`);
-        return new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: respHeaders
-        });
+        addLog('WX', 'Edge转发失败', String(result.error || 'unknown').substring(0, 120));
+        return new Response(JSON.stringify({ error: 'wechat_not_running', message: result.error }), { status: 503, headers: respHeaders });
       } catch (e) {
         addLog('WX', '协议失败', `error=${e.message}`);
         return new Response(JSON.stringify({ error: e.message }), {
@@ -5076,6 +5171,8 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   globalState.isQuitting = true;
+  // 关闭微信 Edge 代理进程
+  try { wxEdgeProxy.stop(); } catch (e) {}
   // 正常退出时清空会话，下次不自动恢复
   try {
     fs.writeFileSync(path.join(dataPath, 'tabs-session.json'), JSON.stringify([]));
