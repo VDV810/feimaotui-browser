@@ -121,6 +121,10 @@ const wxEdgeProxy = {
   async _start() {
     const exe = this.findEdgeExe();
     if (!exe) { addLog('WX-EDGE', '未找到Edge安装', 'Edge通道不可用'); return false; }
+    // 提前告知渲染端：即将调用系统 Edge 完成微信登录，避免安全软件误报时用户不明所以
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('wx-edge-starting', { msg: '正在调用系统 Edge 浏览器完成微信关联登录，如安全软件提示请点「允许」' });
+    }
     const { spawn } = require('child_process');
     const profileDir = path.join(app.getPath('userData'), 'edge-wx-proxy');
     // 每次启动重建干净 profile（历史版本可能写入过 BLOCK 权限，必须清掉）
@@ -135,7 +139,7 @@ const wxEdgeProxy = {
       '--remote-debugging-port=0',
       '--user-data-dir=' + profileDir,
       originPage
-    ], { stdio: 'ignore' });
+    ], { stdio: 'ignore', windowsHide: true });
     this.edgeProc.on('exit', () => {
       addLog('WX-EDGE', 'Edge进程退出', '下次请求时自动重启');
       this.edgeProc = null;

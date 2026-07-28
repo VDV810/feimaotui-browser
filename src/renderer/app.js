@@ -901,6 +901,17 @@ function setupIPCEvents() {
         });
     }
 
+    // 微信登录会临时调用系统 Edge 浏览器（CDP 代理），提前告知用户，避免被安全软件误报时困惑
+    if (window.electronAPI.onWxEdgeStarting) {
+        window.electronAPI.onWxEdgeStarting((data) => {
+            const toast = document.createElement('div');
+            toast.className = 'toast-notification';
+            toast.textContent = (data && data.msg) ? data.msg : '正在调用系统 Edge 浏览器完成微信关联登录';
+            document.body.appendChild(toast);
+            setTimeout(() => { if (toast.parentNode) toast.remove(); }, 4000);
+        });
+    }
+
     // BrowserView 是原生网页层，点击网页内容区不会触发上面的 document.mousedown。
     // 主进程捕获 BrowserView 的 mouseDown 后发回此事件，用统一逻辑关闭右侧面板。
     if (window.electronAPI.onBrowserViewClicked) {
