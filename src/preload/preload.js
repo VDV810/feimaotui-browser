@@ -97,8 +97,6 @@ if (!window.chrome) {
     '[class*="closeBtn"]',
     '#splitview [class*="close"]',
     '#splitview [class*="Close"]',
-    '#splitview i',
-    '#splitview svg',
     '[class*="drawer"] [class*="close"]',
     '[class*="modal"] [class*="close"]',
     '[class*="dialog"] [class*="close"]'

@@ -2498,6 +2498,11 @@ function createTab(url = null, options = {}) {
     }
   });
 
+  // 忽略页面的 beforeunload 阻止：允许导航继续，避免腾讯等页面 onbeforeunload 把"返回"卡在中间态
+  view.webContents.on('will-prevent-unload', (event) => {
+    event.preventDefault();
+  });
+
   // 监听证书错误（微信客户端检测需要 localhost.weixin.qq.com 自签名证书）
   view.webContents.on('certificate-error', (event, url, error, certificate, callback) => {
     const isWeixinLocal = url.includes('localhost.weixin.qq.com');
@@ -2614,6 +2619,9 @@ function createTab(url = null, options = {}) {
               storage: {}
             };
           }
+          // 屏蔽 window.close：防止页面（如腾讯广告的"返回"按钮）调用后关闭 webview/app
+          // 必须在主世界执行，preload 隔离世界覆盖无效
+          try { window.close = function() {}; } catch(e) {}
         })();
       `, true).catch(() => {});
     }
