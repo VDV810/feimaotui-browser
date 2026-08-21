@@ -532,6 +532,9 @@ function buildDownloadContextMenuItems(download) {
     if (download.state !== 'progressing') {
         items.push({ action: 'redownload', label: '重新下载' });
     }
+    if (download.filePath && download.state === 'completed') {
+        items.push({ action: 'open', label: '打开文件' });
+    }
     if (download.filePath) {
         items.push({ action: 'folder', label: '打开文件夹' });
     }
@@ -603,6 +606,11 @@ async function handleDownloadContextAction(action) {
     if (action === 'redownload') {
         const result = await window.electronAPI.redownload(download);
         if (!result || !result.success) alert(`重新下载失败：${result && result.error ? result.error : '未知错误'}`);
+        await refreshCurrentDownloadPanel();
+        return;
+    }
+    if (action === 'open') {
+        await openDownloadFile(download.filePath || '');
         await refreshCurrentDownloadPanel();
         return;
     }
@@ -1318,7 +1326,7 @@ async function renderDownloadList() {
             <div class="download-item" data-download-context-id="${safeDownloadId}">
                 <div class="download-icon">${statusIcon}</div>
                 <div class="download-info">
-                    <div class="download-name">${escapeHtml(download.fileName)}</div>
+                    <div class="download-name ${download.state === 'completed' ? 'download-name-openable' : ''}" data-action="open" data-file-path='${safeFilePath}' title="${download.state === 'completed' ? '点击打开文件' : escapeHtml(download.fileName)}">${escapeHtml(download.fileName)}</div>
                     <div class="download-meta">
                         <span class="download-time">${timeText}</span>
                     </div>
@@ -1329,6 +1337,9 @@ async function renderDownloadList() {
                 </div>
                 <div class="download-actions">
                     ${download.state === 'completed' ? `
+                        <button class="download-action-btn" data-action="open" data-file-path='${safeFilePath}' title="打开文件">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+                        </button>
                         <button class="download-action-btn" data-action="folder" data-file-path='${safeFilePath}' title="打开文件所在文件夹">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
                         </button>
@@ -1506,6 +1517,9 @@ function renderMediaItems(mediaList, isCompletedView) {
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
                     </button>` : ''}
                     ${mediaDownload && mediaDownload.state === 'completed' ? `
+                        <button class="download-action-btn" data-action="open-media-download" data-file-path='${escapeHtml(JSON.stringify(folderPath))}' title="打开文件">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+                        </button>
                         <button class="download-action-btn" data-action="folder-media-download" data-file-path='${escapeHtml(JSON.stringify(folderPath))}' title="打开文件所在文件夹">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
                         </button>
@@ -1990,6 +2004,18 @@ function updateMediaBadge() {
 // 下载项操作按钮
 function setupDownloadActionHandlers() {
     if (!elements.downloadList) return;
+
+    // 文件名点击直接打开（已完成项）
+    elements.downloadList.querySelectorAll('.download-name-openable').forEach(nameEl => {
+        nameEl.addEventListener('click', async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            let filePath = nameEl.dataset.filePath || '';
+            try { filePath = JSON.parse(filePath); } catch (e) {}
+            if (filePath) await openDownloadFile(filePath);
+        });
+    });
+
     elements.downloadList.querySelectorAll('.download-action-btn').forEach(btn => {
         btn.addEventListener('click', async (event) => {
             event.preventDefault();
@@ -2012,7 +2038,9 @@ function setupDownloadActionHandlers() {
                 alert('文件路径为空，无法操作');
                 return;
             }
-            if (action === 'folder') {
+            if (action === 'open') {
+                await openDownloadFile(filePath);
+            } else if (action === 'folder') {
                 await showInFolder(filePath);
             } else if (action === 'delete') {
                 await deleteDownload(downloadId, filePath);
@@ -2051,6 +2079,15 @@ function setupMediaActionHandlers() {
                 if (download.id === btn.dataset.downloadId) appState.mediaDownloads.delete(url);
             });
             renderMediaList();
+        });
+    });
+    elements.mediaList.querySelectorAll('[data-action="open-media-download"]').forEach(btn => {
+        btn.addEventListener('click', async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            let filePath = btn.dataset.filePath || '';
+            try { filePath = JSON.parse(filePath); } catch (e) {}
+            await openDownloadFile(filePath);
         });
     });
     elements.mediaList.querySelectorAll('[data-action="folder-media-download"]').forEach(btn => {
@@ -2129,6 +2166,14 @@ function showAddressBarContextMenu(x, y) {
         document.addEventListener('click', closeMenu);
         document.addEventListener('scroll', closeMenu);
     }, 10);
+}
+
+// 直接打开下载文件
+async function openDownloadFile(filePath) {
+    const result = await window.electronAPI.openDownload(filePath);
+    if (!result || !result.success) {
+        alert(`打开文件失败：${result && result.error ? result.error : '未知错误'}`);
+    }
 }
 
 // 在文件夹中显示
@@ -2588,8 +2633,25 @@ function getFileNameFromUrl(url) {
 function getMediaTypeLabel(type) {
     const labels = {
         'video/mp4': 'MP4 视频', 'video/webm': 'WebM 视频',
-        'application/x-mpegURL': 'M3U8 流媒体', 'audio/mp3': 'MP3 音频',
-        'audio/wav': 'WAV 音频', 'video/mp2t': 'TS 视频', 'video/unknown': '未知视频'
+        'video/quicktime': 'MOV 视频', 'video/x-matroska': 'MKV 视频',
+        'video/x-msvideo': 'AVI 视频', 'video/x-flv': 'FLV 视频',
+        'video/x-ms-wmv': 'WMV 视频', 'video/ogg': 'OGV 视频',
+        'video/mp2t': 'TS 视频', 'video/unknown': '未知视频',
+        'application/x-mpegURL': 'M3U8 流媒体', 'application/dash+xml': 'DASH 流媒体',
+        'audio/mpeg': 'MP3 音频', 'audio/wav': 'WAV 音频',
+        'audio/aac': 'AAC 音频', 'audio/flac': 'FLAC 音频',
+        'audio/ogg': 'OGG 音频', 'audio/mp4': 'M4A 音频', 'audio/unknown': '未知音频',
+        'image/png': 'PNG 图片', 'image/jpeg': 'JPG 图片',
+        'image/gif': 'GIF 图片', 'image/webp': 'WebP 图片',
+        'image/svg+xml': 'SVG 图片', 'image/bmp': 'BMP 图片',
+        'image/x-icon': 'ICO 图标', 'image/avif': 'AVIF 图片',
+        'image/tiff': 'TIFF 图片', 'image/unknown': '未知图片',
+        'application/pdf': 'PDF 文档',
+        'application/msword': 'Word 文档',
+        'application/vnd.ms-excel': 'Excel 表格',
+        'application/vnd.ms-powerpoint': 'PPT 演示文稿',
+        'application/archive': '压缩包',
+        'text/plain': '文本文件'
     };
     return labels[type] || type;
 }

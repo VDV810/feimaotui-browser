@@ -789,6 +789,16 @@ body {
     margin-bottom: 2px;
 }
 
+.download-name-openable {
+    color: var(--accent-color);
+    cursor: pointer;
+    text-decoration: none;
+}
+
+.download-name-openable:hover {
+    text-decoration: underline;
+}
+
 .download-meta {
     margin-bottom: 4px;
 }

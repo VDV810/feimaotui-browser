@@ -1658,7 +1658,7 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
       }
       registerMediaCandidate(details.webContentsId, details.url, {
         source: 'response-header',
-        type: contentType || getMediaType(details.url),
+        type: getMediaType(details.url, contentType),
         contentType,
         size: contentLength,
         title: getFileNameFromDisposition(contentDisposition) || getFileNameFromUrl(details.url)
@@ -1752,10 +1752,29 @@ function isMediaUrl(url) {
     /[?&](type|format|mime|content_type)=([^&]*)(video|mp4|m3u8|mov|webm)/i.test(lower);
 }
 
-function getMediaType(url) {
-  // 获取URL路径部分（去掉查询参数）
+function getMediaType(url, contentType = '') {
+  const ct = String(contentType || '').toLowerCase().split(';')[0].trim();
   const pathPart = String(url || '').split('?')[0].toLowerCase();
-  if (pathPart.endsWith('.mp4')) return 'video/mp4';
+
+  // 1. 优先信任明确的 Content-Type
+  if (ct && ct !== 'application/octet-stream' && ct !== 'binary/octet-stream') {
+    if (ct.startsWith('video/')) return ct;
+    if (ct.startsWith('audio/')) return ct;
+    if (ct.startsWith('image/')) return ct;
+    if (ct === 'application/pdf') return 'application/pdf';
+    if (ct === 'application/msword' || ct === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') return 'application/msword';
+    if (ct === 'application/vnd.ms-excel' || ct === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') return 'application/vnd.ms-excel';
+    if (ct === 'application/vnd.ms-powerpoint' || ct === 'application/vnd.openxmlformats-officedocument.presentationml.presentation') return 'application/vnd.ms-powerpoint';
+    if (ct.startsWith('text/')) return ct;
+    if (ct === 'application/zip' || ct === 'application/x-rar-compressed' || ct === 'application/x-7z-compressed') return 'application/archive';
+  }
+
+  // 2. 从 URL 路径/扩展名推断（兜底）
+  const extMatch = pathPart.match(/\.([a-z0-9]+)(?:\?|$|#)/);
+  const ext = extMatch ? extMatch[1] : '';
+
+  // 视频
+  if (/\.(mp4|m4v|3gp|3g2)(\?|$|#)/i.test(pathPart)) return 'video/mp4';
   if (pathPart.endsWith('.webm')) return 'video/webm';
   if (pathPart.endsWith('.m3u8')) return 'application/x-mpegURL';
   if (pathPart.endsWith('.mpd')) return 'application/dash+xml';
@@ -1763,6 +1782,48 @@ function getMediaType(url) {
   if (pathPart.endsWith('.mkv')) return 'video/x-matroska';
   if (pathPart.endsWith('.avi')) return 'video/x-msvideo';
   if (pathPart.endsWith('.flv')) return 'video/x-flv';
+  if (pathPart.endsWith('.wmv')) return 'video/x-ms-wmv';
+  if (pathPart.endsWith('.ogv')) return 'video/ogg';
+  if (/\.(mp4|webm|m3u8|mpd|mov|mkv|avi|flv|wmv|m4v|3gp|ogv|ts|m4s)(\?|$|#)/i.test(pathPart)) return 'video/unknown';
+
+  // 音频
+  if (pathPart.endsWith('.mp3')) return 'audio/mpeg';
+  if (pathPart.endsWith('.wav')) return 'audio/wav';
+  if (pathPart.endsWith('.aac')) return 'audio/aac';
+  if (pathPart.endsWith('.flac')) return 'audio/flac';
+  if (pathPart.endsWith('.ogg') || pathPart.endsWith('.oga')) return 'audio/ogg';
+  if (pathPart.endsWith('.m4a')) return 'audio/mp4';
+  if (/\.(mp3|wav|aac|flac|ogg|oga|m4a|wma)(\?|$|#)/i.test(pathPart)) return 'audio/unknown';
+
+  // 图片
+  if (pathPart.endsWith('.png')) return 'image/png';
+  if (pathPart.endsWith('.jpg') || pathPart.endsWith('.jpeg')) return 'image/jpeg';
+  if (pathPart.endsWith('.gif')) return 'image/gif';
+  if (pathPart.endsWith('.webp')) return 'image/webp';
+  if (pathPart.endsWith('.svg')) return 'image/svg+xml';
+  if (pathPart.endsWith('.bmp')) return 'image/bmp';
+  if (pathPart.endsWith('.ico')) return 'image/x-icon';
+  if (pathPart.endsWith('.avif')) return 'image/avif';
+  if (pathPart.endsWith('.tiff') || pathPart.endsWith('.tif')) return 'image/tiff';
+  if (/\.(png|jpe?g|gif|webp|svg|bmp|ico|avif|tiff?|heic|heif)(\?|$|#)/i.test(pathPart)) return 'image/unknown';
+
+  // 文档
+  if (pathPart.endsWith('.pdf')) return 'application/pdf';
+  if (/\.(doc|docx|dotx)(\?|$|#)/i.test(pathPart)) return 'application/msword';
+  if (/\.(xls|xlsx|xlsm|xltx)(\?|$|#)/i.test(pathPart)) return 'application/vnd.ms-excel';
+  if (/\.(ppt|pptx|potx)(\?|$|#)/i.test(pathPart)) return 'application/vnd.ms-powerpoint';
+
+  // 压缩包
+  if (/\.(zip|rar|7z|tar|gz|bz2|xz)(\?|$|#)/i.test(pathPart)) return 'application/archive';
+
+  // 文本
+  if (/\.(txt|md|json|xml|csv|log|js|css|html?)(\?|$|#)/i.test(pathPart)) return 'text/plain';
+
+  // 3. 若 Content-Type 是 application/octet-stream 但 URL 无明显扩展名，
+  //    且 contentType 本身以 video/ 开头，仍返回 video/*
+  if (ct.startsWith('video/')) return ct;
+  if (ct.startsWith('audio/')) return ct;
+
   return 'video/unknown';
 }
 
@@ -1818,7 +1879,19 @@ function isLikelyMediaResponse(url, contentType = '', contentDisposition = '', c
 
 function isValidVideoCandidate(url, meta = {}) {
   if (!url || isStaticAssetUrl(url) || isStaticAssetContentType(meta.contentType || meta.type || '')) return false;
-  
+
+  // 用更完整的类型推断再过滤一次：图片/文档/压缩包/文本等直接排除，避免被识别成"视频"
+  const inferredType = getMediaType(url, meta.contentType || meta.type || '');
+  if (inferredType.startsWith('image/') ||
+      inferredType.startsWith('application/pdf') ||
+      inferredType.startsWith('application/msword') ||
+      inferredType.startsWith('application/vnd.ms-excel') ||
+      inferredType.startsWith('application/vnd.ms-powerpoint') ||
+      inferredType === 'application/archive' ||
+      inferredType.startsWith('text/')) {
+    return false;
+  }
+
   // 过滤非媒体文件扩展名（.htm, .html, .json, .xml 等）
   const urlPath = String(url).split('?')[0].toLowerCase();
   if (/\.(html?|json|xml|css|js|txt|pdf|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|eot)(\?|$|#)/i.test(urlPath)) return false;
