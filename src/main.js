@@ -617,6 +617,13 @@ function createMainWindow() {
   });
 
   mainWindow.on('close', (event) => {
+    // 兜底保护：非用户主动退出（如页面 window.close 冒泡）时，绝不退出整个浏览器
+    // 仅隐藏/保持窗口，等待用户从托盘或菜单主动退出
+    if (!globalState.isQuitting) {
+      event.preventDefault();
+      addLog('CLOSE-FIX', 'mainWindow close 被拦截', '非主动关闭(疑似页面误触发)，浏览器保持运行');
+      return;
+    }
     globalState.isQuitting = true;
     saveData();
     // 正常关闭时清除会话文件，下次启动不恢复标签页
@@ -2501,6 +2508,14 @@ function createTab(url = null, options = {}) {
   // 忽略页面的 beforeunload 阻止：允许导航继续，避免腾讯等页面 onbeforeunload 把"返回"卡在中间态
   view.webContents.on('will-prevent-unload', (event) => {
     event.preventDefault();
+  });
+
+  // 兜底：拦截页面 window.close 触发的 webContents 关闭，防止误关掉当前标签页
+  // （腾讯广告充值成功页的"返回"按钮会调 window.close，经冒泡误关主窗口）
+  view.webContents.on('close', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    addLog('CLOSE-FIX', '拦截 webContents close', `阻止页面 window.close 关闭标签页 (${tabId})`);
   });
 
   // 监听证书错误（微信客户端检测需要 localhost.weixin.qq.com 自签名证书）
