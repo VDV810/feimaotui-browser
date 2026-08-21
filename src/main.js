@@ -617,13 +617,6 @@ function createMainWindow() {
   });
 
   mainWindow.on('close', (event) => {
-    // 兜底保护：非用户主动退出（如页面 window.close 冒泡）时，绝不退出整个浏览器
-    // 仅隐藏/保持窗口，等待用户从托盘或菜单主动退出
-    if (!globalState.isQuitting) {
-      event.preventDefault();
-      addLog('CLOSE-FIX', 'mainWindow close 被拦截', '非主动关闭(疑似页面误触发)，浏览器保持运行');
-      return;
-    }
     globalState.isQuitting = true;
     saveData();
     // 正常关闭时清除会话文件，下次启动不恢复标签页
