@@ -15,6 +15,7 @@
     "postbuild": "node scripts/fix-icon.js"
   },
   "build": {
+    "electronDist": "node_modules/electron/dist",
     "appId": "com.electron.browser",
     "productName": "飞毛腿浏览器",
     "icon": "build/icon.ico",
