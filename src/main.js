@@ -2577,10 +2577,10 @@ function createTab(url = null, options = {}) {
   });
 
   // 兜底：拦截页面 window.close 触发的 webContents 关闭，防止误关掉当前标签页
-  // （腾讯广告充值成功页的"返回"按钮会调 window.close，经冒泡误关主窗口）
+  // （腾讯广告充值成功页的"返回"按钮会调 window.close，误关标签页/主窗口）
+  // 注意：Electron 的 webContents 'close' 事件 event 只有 preventDefault，没有 stopPropagation
   view.webContents.on('close', (event) => {
     event.preventDefault();
-    event.stopPropagation();
     addLog('CLOSE-FIX', '拦截 webContents close', `阻止页面 window.close 关闭标签页 (${tabId})`);
   });
 
