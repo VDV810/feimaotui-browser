@@ -2752,6 +2752,14 @@ function createTab(url = null, options = {}) {
     addLog('NAV', 'new-window', `url=${url} disposition=${disposition}`);
   });
 
+  // setWindowOpenHandler 的 allow 分支会创建真正的子窗口（type 'window'，全局兜底放过），
+  // 拦截其子窗口的 window.close 冒泡，防止腾讯广告等页面关闭子窗口时连带退出整个 app。
+  view.webContents.on('did-create-window', (childWin) => {
+    try {
+      childWin.webContents.on('close', (e) => { e.preventDefault(); });
+    } catch (e) {}
+  });
+
   // 右键菜单：禁用 BrowserView 默认菜单，用自定义 context-menu 事件
   view.webContents.setIgnoreMenuShortcuts(true);
   view.webContents.on('context-menu', (e, params) => {
@@ -5269,8 +5277,27 @@ app.whenReady().then(() => {
   });
 });
 
+// 全局兜底：拦截所有"非主窗口"网页内容的 window.close 冒泡，
+// 防止腾讯广告等页面（含 setWindowOpenHandler 的 allow 分支创建的真窗口）调 window.close
+// 时冒泡关闭主窗口、连带退出整个浏览器。
+// 主窗口自身的 webContents 不拦截，保证用户点 X 能正常关闭浏览器。
+app.on('web-contents-created', (event, contents) => {
+  try {
+    // 主窗口自身的 webContents：不拦截（用户点 X 需能关闭）
+    if (mainWindow && contents === mainWindow.webContents) return;
+    // 合法 BrowserWindow（书签/截图/弹层等子窗口）为 type 'window'，不在此处拦，
+    // 它们的关闭由各自逻辑处理；此处只拦网页内容（BrowserView/allow 真窗口）。
+    if (typeof contents.getType === 'function' && contents.getType() === 'window') return;
+    contents.on('close', (e) => {
+      e.preventDefault();
+    });
+  } catch (e) {}
+});
+
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
+  // 仅当主窗口已不存在（用户主动关闭）才退出；否则保持运行，
+  // 防止任何子窗口/网页误关闭连带退出整个 app。
+  if (process.platform !== 'darwin' && (!mainWindow || globalState.isQuitting)) app.quit();
 });
 
 app.on('before-quit', () => {
