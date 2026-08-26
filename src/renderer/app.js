@@ -63,6 +63,7 @@ const elements = {
     settingsPanel: document.getElementById('settingsPanel'),
     downloadList: document.getElementById('downloadList'),
     mediaList: document.getElementById('mediaList'),
+    mediaSniffToggle: document.getElementById('mediaSniffToggle'),
     bookmarkList: document.getElementById('bookmarkList'),
     historyList: document.getElementById('historyList'),
     logContent: document.getElementById('logContent'),
@@ -342,6 +343,9 @@ function setupEventListeners() {
     }
     if (elements.adblockCheckbox) {
         elements.adblockCheckbox.addEventListener('change', updateSettings);
+    }
+    if (elements.mediaSniffToggle) {
+        elements.mediaSniffToggle.addEventListener('change', onMediaSniffToggleChange);
     }
     if (elements.darkModeCheckbox) {
         elements.darkModeCheckbox.addEventListener('change', updateSettings);
@@ -1404,6 +1408,9 @@ async function renderMediaList() {
     }
     // 按时间从新到旧排序
     mediaList.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+    // 媒体嗅探已关闭：显示提示横幅（不再捕获新视频）
+    const sniffOff = appState.settings && appState.settings.mediaSniffingEnabled === false;
     
     // 分离已下载和未下载
     const undownloaded = mediaList.filter(media => {
@@ -1416,11 +1423,14 @@ async function renderMediaList() {
     });
     
     if (undownloaded.length === 0 && downloaded.length === 0) {
-        elements.mediaList.innerHTML = '<div class="empty-state">当前页面未检测到媒体资源</div>';
+        elements.mediaList.innerHTML = sniffOff
+            ? '<div class="empty-state">媒体嗅探已关闭，开启上方开关后重新加载页面即可嗅探</div>'
+            : '<div class="empty-state">当前页面未检测到媒体资源</div>';
         return;
     }
     
     elements.mediaList.innerHTML = `
+        ${sniffOff ? '<div class="media-sniff-off-banner">媒体嗅探已关闭，已停止捕获新视频</div>' : ''}
         <div class="media-toolbar">
             <button class="media-sniff-btn${appState.showCompletedOnly ? '' : ' active'}" onclick="toggleSniffView()">嗅探列表 (${undownloaded.length})</button>
             <button class="media-downloaded-btn${appState.showCompletedOnly ? ' active' : ''}" onclick="toggleCompletedView()" title="切换显示已下载列表">已经下载 (${downloaded.length})</button>
@@ -1876,6 +1886,7 @@ async function loadSettings() {
         if (elements.fontSizeValue) elements.fontSizeValue.textContent = settings.fontSize || 16;
         applyFontSize(settings.fontSize || 16);
         if (elements.adblockCheckbox) elements.adblockCheckbox.checked = settings.adblockEnabled !== false;
+        if (elements.mediaSniffToggle) elements.mediaSniffToggle.checked = settings.mediaSniffingEnabled !== false;
         if (elements.darkModeCheckbox) elements.darkModeCheckbox.checked = settings.darkMode || false;
         if (elements.autoTranslateCheckbox) elements.autoTranslateCheckbox.checked = settings.autoTranslate !== false;
         if (elements.alwaysTranslateNonCjkCheckbox) elements.alwaysTranslateNonCjkCheckbox.checked = settings.alwaysTranslateNonCjk !== false;
@@ -1951,6 +1962,7 @@ async function updateSettings() {
             searchEngine: elements.searchEngineSelect ? elements.searchEngineSelect.value : 'baidu',
             fontSize: elements.fontSizeRange ? Number(elements.fontSizeRange.value) : 16,
             adblockEnabled: elements.adblockCheckbox ? elements.adblockCheckbox.checked : true,
+            mediaSniffingEnabled: elements.mediaSniffToggle ? elements.mediaSniffToggle.checked : true,
             darkMode: elements.darkModeCheckbox ? elements.darkModeCheckbox.checked : false,
             autoTranslate: elements.autoTranslateCheckbox ? elements.autoTranslateCheckbox.checked : true,
             alwaysTranslateNonCjk: elements.alwaysTranslateNonCjkCheckbox ? elements.alwaysTranslateNonCjkCheckbox.checked : true
@@ -1968,6 +1980,20 @@ async function updateSettings() {
         }
     } catch (error) {
         console.error('更新设置失败:', error);
+    }
+}
+
+// 媒体嗅探开关：持久化状态，关闭时清空已嗅探列表
+async function onMediaSniffToggleChange() {
+    try {
+        const enabled = elements.mediaSniffToggle ? elements.mediaSniffToggle.checked : true;
+        await updateSettings(); // 持久化（含 mediaSniffingEnabled）
+        if (!enabled) {
+            try { await window.electronAPI.clearMediaList({ clearType: 'sniff' }); } catch (e) {}
+        }
+        await renderMediaList();
+    } catch (error) {
+        console.error('切换媒体嗅探失败:', error);
     }
 }
 

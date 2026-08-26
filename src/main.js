@@ -304,6 +304,7 @@ const globalState = {
     darkMode: false,
     privacyMode: false,
     adblockEnabled: true,
+    mediaSniffingEnabled: true,
     fontSize: 16,
     autoTranslate: true,
     alwaysTranslateNonCjk: true
@@ -1939,6 +1940,7 @@ function getFileNameFromDisposition(contentDisposition = '') {
 }
 
 function registerMediaCandidate(webContentsId, url, meta = {}) {
+  if (!globalState.settings.mediaSniffingEnabled) return null;
   if (!url || String(url).startsWith('blob:') || String(url).startsWith('data:')) return null;
   if (!isValidVideoCandidate(url, meta)) return null;
   const tabId = getTabIdFromWebContents(webContentsId);
@@ -4700,6 +4702,7 @@ function setupIPC() {
   ipcMain.handle('start-auto-sniff-scroll', async (event, webContentsId, options = {}) => {
     const tabId = getTabIdFromWebContents(webContentsId);
     if (!tabId) return { success: false, error: '标签页不存在' };
+    if (!globalState.settings.mediaSniffingEnabled) return { success: false, error: '媒体嗅探已关闭' };
     const tab = globalState.tabs.get(tabId);
     if (!tab || !tab.webContents || tab.webContents.isDestroyed()) return { success: false, error: 'BrowserView 不存在' };
     const { startPos, pagePos } = options;
