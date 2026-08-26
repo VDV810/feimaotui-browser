@@ -617,6 +617,7 @@ function createMainWindow() {
   });
 
   mainWindow.on('close', (event) => {
+    addLog('QUIT-DIAG', 'mainWindow close 事件', `isQuitting=${globalState.isQuitting}`);
     globalState.isQuitting = true;
     saveData();
     // 正常关闭时清除会话文件，下次启动不恢复标签页
@@ -2733,6 +2734,12 @@ function createTab(url = null, options = {}) {
       addLog('BLOCK', '拦截未知协议(setWindowOpenHandler)', `url=${url} disposition=${disposition}`);
       return { action: 'deny' };
     }
+    // 拦截占位/脚本 URL：巨量引擎、千川等页面会 window.open('about:blank')
+    // 触发前台标签，被 createTab 成空白页；这里直接 deny，避免多出空白标签。
+    if (/^(about:blank|about:srcdoc|javascript:)/i.test(url)) {
+      addLog('BLOCK', '拦截占位URL(setWindowOpenHandler)', `url=${url} disposition=${disposition}`);
+      return { action: 'deny' };
+    }
     addLog('NAV', 'setWindowOpenHandler', `url=${url} disposition=${disposition}`);
     // 微信小店客服/平台相关页面：允许窗口正常打开，否则页面 JS 初始化会失败
     if (/platformkfim|shop\/kf|shop\/platform/i.test(url)) {
@@ -2756,7 +2763,10 @@ function createTab(url = null, options = {}) {
   // 拦截其子窗口的 window.close 冒泡，防止腾讯广告等页面关闭子窗口时连带退出整个 app。
   view.webContents.on('did-create-window', (childWin) => {
     try {
-      childWin.webContents.on('close', (e) => { e.preventDefault(); });
+      childWin.webContents.on('close', (e) => {
+        addLog('QUIT-DIAG', '拦截子窗口 close', `url=${childWin.webContents.getURL()}`);
+        e.preventDefault();
+      });
     } catch (e) {}
   });
 
@@ -2852,6 +2862,7 @@ function closeTab(tabId) {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.setBrowserView(null);
       }
+      addLog('QUIT-DIAG', '最后一个标签页关闭，主窗口保持打开', `tabs=${globalState.tabs.size}`);
     }
   }
 
@@ -4338,6 +4349,32 @@ function setupIPC() {
     }
   });
 
+  // 一键导出运行日志为 TXT
+  ipcMain.handle('export-logs', async (event) => {
+    try {
+      const logText = getLogs();
+      const { dialog } = require('electron');
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: '导出日志',
+        defaultPath: `飞毛腿浏览器日志-${ts}.txt`,
+        filters: [
+          { name: '文本文件', extensions: ['txt'] },
+          { name: '所有文件', extensions: ['*'] }
+        ]
+      });
+      if (result.canceled || !result.filePath) return { success: false, canceled: true };
+      fs.writeFileSync(result.filePath, logText, 'utf8');
+      addLog('LOG', '导出日志', `${logText.length} 字节 → ${result.filePath}`);
+      return { success: true, filePath: result.filePath, length: logText.length };
+    } catch (e) {
+      addLog('ERROR', '导出日志失败', e.message);
+      return { success: false, error: e.message };
+    }
+  });
+
   // 导入书签（支持飞毛腿格式和其他浏览器格式，按网址查重）
   ipcMain.handle('import-bookmarks', async (event) => {
     try {
@@ -5295,9 +5332,15 @@ app.on('web-contents-created', (event, contents) => {
 });
 
 app.on('window-all-closed', () => {
-  // 仅当主窗口已不存在（用户主动关闭）才退出；否则保持运行，
-  // 防止任何子窗口/网页误关闭连带退出整个 app。
-  if (process.platform !== 'darwin' && (!mainWindow || globalState.isQuitting)) app.quit();
+  // 终极兜底：只有用户主动退出（isQuitting=true）才退出进程；
+  // 去掉原先的 "!mainWindow" 条件，避免主窗口在某竞态下变为 null 时，
+  // 任意子窗口/网页关闭就连带退出整个浏览器（充值成功页"返回"必退的根因之一）。
+  if (process.platform !== 'darwin' && globalState.isQuitting) {
+    addLog('QUIT-DIAG', 'window-all-closed 触发退出', `isQuitting=${globalState.isQuitting}`);
+    app.quit();
+  } else {
+    addLog('QUIT-DIAG', 'window-all-closed 被拦截（非主动退出）', `isQuitting=${globalState.isQuitting} mainWindow=${!!mainWindow}`);
+  }
 });
 
 app.on('before-quit', () => {

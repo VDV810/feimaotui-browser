@@ -587,6 +587,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getBookmarks: () => ipcRenderer.invoke('get-bookmarks'),
   updateBookmarkOrder: (bookmarks) => ipcRenderer.invoke('update-bookmark-order', bookmarks),
   exportBookmarks: () => ipcRenderer.invoke('export-bookmarks'),
+  exportLogs: () => ipcRenderer.invoke('export-logs'),
   importBookmarks: () => ipcRenderer.invoke('import-bookmarks'),
   importBookmarksFromFile: (filePath) => ipcRenderer.invoke('import-bookmarks-from-file', filePath),
 

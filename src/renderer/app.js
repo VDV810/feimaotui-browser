@@ -73,6 +73,7 @@ const elements = {
     closeHistoryPanel: document.getElementById('closeHistoryPanel'),
     closeTranslatePanel: document.getElementById('closeTranslatePanel'),
     closeLogPanel: document.getElementById('closeLogPanel'),
+    exportLogBtn: document.getElementById('exportLogBtn'),
     closeSettingsPanel: document.getElementById('closeSettingsPanel'),
     homepageInput: document.getElementById('homepageInput'),
     searchEngineSelect: document.getElementById('searchEngineSelect'),
@@ -311,6 +312,9 @@ function setupEventListeners() {
     }
     if (elements.copyLogBtn) {
         elements.copyLogBtn.addEventListener('click', copyLogs);
+    }
+    if (elements.exportLogBtn) {
+        elements.exportLogBtn.addEventListener('click', exportLogs);
     }
     if (elements.clearLogBtn) {
         elements.clearLogBtn.addEventListener('click', clearLogs);
@@ -2714,6 +2718,29 @@ async function clearLogs() {
         if (elements.logContent) elements.logContent.innerHTML = '<div class="empty-state">日志已清空</div>';
     } catch (error) {
         alert('清空失败: ' + error.message);
+    }
+}
+
+async function exportLogs() {
+    try {
+        const btn = document.getElementById('exportLogBtn');
+        const origText = btn ? btn.textContent : '导出';
+        if (btn) { btn.disabled = true; btn.textContent = '导出中…'; }
+        const result = await window.electronAPI.exportLogs();
+        if (btn) { btn.disabled = false; btn.textContent = origText; }
+        if (result && result.canceled) return;
+        if (result && result.success) {
+            if (btn) {
+                btn.textContent = '已导出';
+                setTimeout(function () { btn.textContent = origText; }, 1500);
+            }
+        } else if (result && result.error) {
+            alert('导出失败: ' + result.error);
+        }
+    } catch (error) {
+        const btn = document.getElementById('exportLogBtn');
+        if (btn) { btn.disabled = false; btn.textContent = '导出'; }
+        alert('导出失败: ' + error.message);
     }
 }
 
