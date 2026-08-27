@@ -69,6 +69,16 @@ if (!window.chrome) {
       'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI Symbol","Microsoft YaHei",sans-serif!important;',
       'font-size:16px!important;font-weight:400!important;line-height:1!important;',
       'color:#666!important;',
+    '}',
+    /* 腾讯 spaui 标准 dialog 关闭按钮走原生 SVG，不被上面的规则隐藏/透明化 */
+    '.spaui-dialog__close,.spaui-dialog__close-x{',
+      'font-size:inherit!important;color:inherit!important;background:none!important;',
+    '}',
+    '.spaui-dialog__close[data-fmt-close-fix="1"] > i,.spaui-dialog__close[data-fmt-close-fix="1"] > svg,.spaui-dialog__close-x[data-fmt-close-fix="1"] > svg{',
+      'display:inline-block!important;',
+    '}',
+    '.spaui-dialog__close svg,.spaui-dialog__close-x svg,.spaui-dialog__close svg path,.spaui-dialog__close-x svg path{',
+      'fill:currentColor!important;color:inherit!important;opacity:1!important;visibility:visible!important;',
     '}'
   ].join('');
 
@@ -102,6 +112,20 @@ if (!window.chrome) {
     '[class*="dialog"] [class*="close"]'
   ];
 
+  function isSpauiDialogClose(el) {
+    // 腾讯广告管理后台的 spaui 标准 dialog 关闭按钮是原生 SVG，工作正常；
+    // 不需要用伪元素替换，否则 color:transparent 会让 fill=currentColor 的 SVG 变透明。
+    var cls = (el && el.className || '').toString();
+    if (/\bspaui-dialog__close(-x)?\b/.test(cls)) return true;
+    // 检查是否在 spaui-dialog 容器内（普通模态框）
+    var p = el && el.parentElement;
+    for (var k = 0; k < 8 && p && p !== document.body; k++) {
+      if (/(^|\s)spaui-dialog(\s|$)/.test((p.className || '').toString())) return true;
+      p = p.parentElement;
+    }
+    return false;
+  }
+
   function fix() {
     for (var i = 0; i < SELECTORS.length; i++) {
       try {
@@ -109,6 +133,8 @@ if (!window.chrome) {
         for (var j = 0; j < els.length; j++) {
           var el = els[j];
           if (!el || el.dataset.fmtCloseFix === '1') continue;
+          // 跳过腾讯 spaui 标准 dialog 关闭按钮（原生 SVG 正常，不需要替换）
+          if (isSpauiDialogClose(el)) continue;
           // 排除过大元素（不是按钮）
           var rect;
           try { rect = el.getBoundingClientRect(); } catch(e) { continue; }
