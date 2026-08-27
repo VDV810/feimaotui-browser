@@ -2,7 +2,12 @@ const { app, BrowserWindow, BrowserView, ipcMain, dialog, session, shell, Menu, 
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
+const os = require('os');
+
+// 内置翻译总开关：false = 完全关闭飞毛腿自带翻译（避免与"沉浸式翻译"扩展冲突），
+// 翻译统一交给用户安装的扩展（如 Immersive Translate）处理。
+const BUILTIN_TRANSLATE_ENABLED = false;
 
 // ==================== 注册自定义特权协议（必须在 app ready 之前） ====================
 // wx-local: 用于代理 https://localhost.weixin.qq.com 请求，绕过 Chromium PNA 限制
@@ -1307,10 +1312,13 @@ function showPageContextMenu(tabId, params) {
     }
   });
 
-  // 审查元素
+  // 审查元素：点击后 DevTools 自动定位到右键位置对应的 DOM 元素
   menuItems.push({
     label: '审查元素',
     click: () => {
+      try {
+        tab.webContents.inspectElement(params.x, params.y);
+      } catch(e) {}
       tab.webContents.openDevTools({ mode: 'right' });
     }
   });
@@ -2138,9 +2146,12 @@ function createTab(url = null, options = {}) {
     }
   });
 
-  // 伪装成 Chrome 浏览器，避免网页因检测到 Electron 而禁用功能
+  // 伪装成 Chrome/Edge 浏览器，避免网页因检测到 Electron 而禁用功能
+  // Edge 插件商店需要 UA 里带 Edg/ 令牌，否则虽然显示"兼容"但安装流程走不通
+  const isEdgeAddons = /microsoftedge\.microsoft\.com/i.test(targetUrl || '');
   const chromeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
-  view.webContents.setUserAgent(chromeUserAgent);
+  const edgeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/128.0.0.0';
+  view.webContents.setUserAgent(isEdgeAddons ? edgeUserAgent : chromeUserAgent);
 
   const tab = {
     id: tabId,
@@ -2233,7 +2244,7 @@ function createTab(url = null, options = {}) {
       }
     }
 
-        setTimeout(() => autoTranslatePageIfNeeded(tabId), 1200);
+        if (BUILTIN_TRANSLATE_ENABLED) setTimeout(() => autoTranslatePageIfNeeded(tabId), 1200);
 
     // ==================== go.php / 中转页兜底 ====================
     // 若页面仍然停留在 go.php?url=base64... 之类的中转地址(标题为"温馨提示"等)，
@@ -3624,6 +3635,7 @@ async function autoTranslateFullPage(tabId) {
 }
 
 async function autoTranslatePageIfNeeded(tabId) {
+  if (!BUILTIN_TRANSLATE_ENABLED) return;
   const tab = globalState.tabs.get(tabId);
   if (!tab || !tab.webContents || globalState.settings.autoTranslate === false) return;
   const url = tab.webContents.getURL();
@@ -3645,6 +3657,167 @@ async function autoTranslatePageIfNeeded(tabId) {
     addLog('TRANSLATE', '自动翻译异常', error.message);
   }
 }
+
+// ==================== 浏览器扩展管理（把 Edge/Chrome 扩展商店的扩展安装进飞毛腿内核） ====================
+// 思路：拦截扩展商店详情页的"获取"按钮 → 从商店更新接口下载 .crx → 剥离 CRX 头(剩余即 zip)
+// → 用系统 PowerShell Expand-Archive 解包 → session.loadExtension() 加载进 'persist:main' 会话
+// → 记录到 extensions.json 持久化，下次启动自动重新加载。翻译等能力由扩展(如沉浸式翻译)接管。
+function parseExtensionIdFromUrl(url) {
+  const m = String(url || '').match(/\/([a-p]{32})(?:[\/?#]|$)/);
+  return m ? m[1] : '';
+}
+
+function getExtensionCrxDownloadUrl(url, extId) {
+  if (/chrome\.google\.com\/webstore/i.test(url || '')) {
+    return `https://clients2.google.com/service/update2/crx?response=redirect&prodversion=120.0.0.0&acceptformat=crx2,crx3&x=id%3D${extId}%26uc`;
+  }
+  // 默认走 Edge 扩展商店更新接口（Edge Add-ons）
+  return `https://edge.microsoft.com/extensionwebstorebase/v1/crx?response=redirect&prod=chromium&prodchannel=stable&x=id%3D${extId}%26installsource%3Dondemand%26uc`;
+}
+
+// 剥离 CRX 文件头，返回内部 zip 数据（CRX3 / CRX2 均支持）
+function stripCrxHeader(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 12) throw new Error('CRX 文件过小或无效');
+  const magic = buf.readUInt32LE(0);
+  if (magic !== 0x34327243) throw new Error('不是有效的 CRX 文件 (magic 不匹配)');
+  const version = buf.readUInt32LE(4);
+  let zipStart;
+  if (version === 3) {
+    const headerLength = buf.readUInt32LE(8);
+    zipStart = 12 + headerLength;
+  } else if (version === 2) {
+    const pubKeyLength = buf.readUInt32LE(8);
+    const sigLength = buf.readUInt32LE(12);
+    zipStart = 16 + pubKeyLength + sigLength;
+  } else {
+    throw new Error('不支持的 CRX 版本: ' + version);
+  }
+  if (zipStart >= buf.length) throw new Error('CRX 头长度异常');
+  return buf.subarray(zipStart);
+}
+
+function extractZip(zipPath, destDir) {
+  return new Promise((resolve, reject) => {
+    const safeZip = String(zipPath).replace(/'/g, "''");
+    const safeDest = String(destDir).replace(/'/g, "''");
+    const cmd = `Expand-Archive -Force -LiteralPath '${safeZip}' -DestinationPath '${safeDest}'`;
+    let err = '';
+    const p = spawn('powershell.exe', ['-NoProfile', '-Command', cmd], { windowsHide: true });
+    if (p.stderr) p.stderr.on('data', d => { err += d; });
+    p.on('error', reject);
+    p.on('close', code => {
+      if (code === 0) resolve();
+      else reject(new Error(`解压失败 (exit ${code}): ${err}`));
+    });
+  });
+}
+
+function loadInstalledExtensions() {
+  try {
+    const p = path.join(dataPath, 'extensions.json');
+    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8')) || [];
+  } catch (e) {}
+  return [];
+}
+
+function saveInstalledExtensions(list) {
+  try {
+    fs.writeFileSync(path.join(dataPath, 'extensions.json'), JSON.stringify(list, null, 2));
+  } catch (e) {
+    addLog('EXT', '保存扩展列表失败', e.message);
+  }
+}
+
+// 把一个已解包的扩展目录加载进飞毛腿主会话；若已加载则跳过
+async function loadExtensionIntoMainSession(extDir, extId) {
+  const sess = session.fromPartition('persist:main');
+  const already = (typeof sess.getAllExtensions === 'function') ? sess.getAllExtensions() : [];
+  if (already.find(e => e.id === extId)) {
+    addLog('EXT', '扩展已加载，跳过', extId);
+    return already.find(e => e.id === extId);
+  }
+  return await sess.loadExtension(extDir, { allowFileAccess: true });
+}
+
+async function installExtensionFromStore(url, extId) {
+  const extDir = path.join(app.getPath('userData'), 'extensions', extId);
+  const manifestPath = path.join(extDir, 'manifest.json');
+  // 已存在则跳过下载，直接重新加载（支持重复点击"获取"）
+  if (!fs.existsSync(manifestPath)) {
+    const crxUrl = getExtensionCrxDownloadUrl(url, extId);
+    addLog('EXT', '开始下载扩展', `${extId} <- ${crxUrl}`);
+    const resp = await axios.get(crxUrl, {
+      responseType: 'arraybuffer',
+      maxRedirects: 8,
+      timeout: 30000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/128.0.0.0'
+      }
+    });
+    const buf = Buffer.from(resp.data);
+    const zipBuf = stripCrxHeader(buf);
+    const zipPath = path.join(os.tmpdir(), `feimaotui-ext-${extId}.zip`);
+    fs.writeFileSync(zipPath, zipBuf);
+    fs.mkdirSync(extDir, { recursive: true });
+    await extractZip(zipPath, extDir);
+    try { fs.unlinkSync(zipPath); } catch (e) {}
+    if (!fs.existsSync(manifestPath)) throw new Error('解包后未找到 manifest.json，可能不是标准扩展包');
+  }
+  const ext = await loadExtensionIntoMainSession(extDir, extId);
+  const name = (ext && ext.name) || extId;
+  const version = (ext && ext.version) || '?';
+  addLog('EXT', '扩展已加载', `${name} v${version} (${extId})`);
+  // 持久化
+  const list = loadInstalledExtensions();
+  if (!list.find(x => x.id === extId)) {
+    list.push({ id: extId, dir: extDir, name, url });
+    saveInstalledExtensions(list);
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('extension-installed', { id: extId, name });
+  }
+  dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: '扩展已安装',
+    message: `扩展「${name}」已安装到飞毛腿浏览器`,
+    detail: '刷新当前页面或重启浏览器后即可生效。\n翻译等能力将由该扩展（如沉浸式翻译）接管，内置翻译已停用避免冲突。'
+  });
+  return ext;
+}
+
+// 启动时为已安装的扩展重新加载进内核
+async function loadPersistedExtensionsOnStartup() {
+  const list = loadInstalledExtensions();
+  if (!list.length) return;
+  addLog('EXT', '启动加载已安装扩展', `${list.length} 个`);
+  for (const item of list) {
+    try {
+      if (fs.existsSync(path.join(item.dir, 'manifest.json'))) {
+        const ext = await loadExtensionIntoMainSession(item.dir, item.id);
+        addLog('EXT', '启动加载扩展成功', `${(ext && ext.name) || item.id}`);
+      } else {
+        addLog('EXT', '启动跳过缺失扩展', item.id);
+      }
+    } catch (e) {
+      addLog('EXT', '启动加载扩展失败', `${item.id}: ${e.message}`);
+    }
+  }
+}
+
+// 监听 preload：扩展商店"获取"按钮被点击 → 安装
+ipcMain.on('extension-store-install', (event, payload) => {
+  const url = (payload && payload.url) || '';
+  const extId = parseExtensionIdFromUrl(url);
+  if (!extId) {
+    dialog.showMessageBox(mainWindow, { type: 'warning', title: '无法识别扩展', message: '无法从当前页面 URL 解析出扩展 ID', detail: url });
+    return;
+  }
+  addLog('EXT', '收到安装请求', `${extId} <- ${url}`);
+  installExtensionFromStore(url, extId).catch(e => {
+    addLog('EXT', '安装失败', e.message);
+    dialog.showMessageBox(mainWindow, { type: 'error', title: '扩展安装失败', message: e.message, detail: url });
+  });
+});
 
 // ==================== 书签文件解析 ====================
 function parseBookmarkFile(content, filePath) {
@@ -4730,21 +4903,9 @@ function setupIPC() {
   ipcMain.handle('pause-download', (event, downloadId) => pauseDownload(downloadId));
   ipcMain.handle('resume-download', (event, downloadId) => resumeDownload(downloadId));
 
-  // 翻译
-  ipcMain.handle('translate-text', async (event, text, targetLang) => await translateText(text, targetLang));
-  ipcMain.handle('translate-page', async (event, tabId, targetLang) => {
-    const tab = globalState.tabs.get(tabId);
-    if (!tab || !tab.webContents) return { success: false, error: '标签页不存在' };
-    try {
-      targetLang = targetLang || 'zh';
-      const result = await translatePageContent(tab, targetLang, { force: true });
-      addLog('TRANSLATE', result.success ? '页面翻译完成' : '页面翻译失败', result.success ? `翻译了 ${result.translatedCount} 处` : result.error);
-      return result;
-    } catch (error) {
-      addLog('TRANSLATE', '页面翻译失败', error.message);
-      return { success: false, error: error.message };
-    }
-  });
+  // 翻译（内置翻译已停用，统一由"沉浸式翻译"等扩展接管；此处返回提示，避免报错）
+  ipcMain.handle('translate-text', async () => ({ success: false, disabled: true, error: '内置翻译已停用，请使用沉浸式翻译扩展' }));
+  ipcMain.handle('translate-page', async () => ({ success: false, disabled: true, error: '内置翻译已停用，请使用沉浸式翻译扩展' }));
 
   // 设置
   ipcMain.handle('get-settings', () => globalState.settings);
@@ -5303,6 +5464,9 @@ app.whenReady().then(() => {
   setupIPC();
   createTray();
   addLog('INFO', '飞毛腿浏览器启动完成');
+
+  // 启动时把已安装的浏览器扩展（如沉浸式翻译）重新加载进内核
+  loadPersistedExtensionsOnStartup().catch(e => addLog('EXT', '启动加载扩展异常', e.message));
 
   // 每30秒自动保存会话（防止直接关机/断电丢失）
   setInterval(() => {

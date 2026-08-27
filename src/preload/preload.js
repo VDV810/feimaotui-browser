@@ -746,3 +746,36 @@ contextBridge.exposeInMainWorld('electronAPI', {
 // 干扰浏览器 HTML 解析器导致 DOM 状态异常（v1.3.26~1.3.27 反复出现 createTreeWalker 报错、全页空白）。
 // 正确做法：在主进程 did-finish-load 后通过 webContents.executeJavaScript() 注入（见 main.js injectWxCompatibilityScript），
 // 此时页面已完全解析完毕，注入安全无副作用。
+
+// ============ Edge/Chrome 扩展商店："获取"按钮 → 安装到飞毛腿内核 ============
+// 拦截扩展商店详情页的"获取/安装/添加"按钮点击，转交给主进程下载并 loadExtension，
+// 而不是走商店自身的 ms-appinstaller 流程（Electron 不支持）。翻译等能力由此类扩展接管。
+(function() {
+  var isStoreDetail = /microsoftedge\.microsoft\.com\/(.*\/)?detail\//i.test(location.href)
+    || /chrome\.google\.com\/webstore\/detail\//i.test(location.href);
+  if (!isStoreDetail) return;
+
+  function isInstallTarget(el) {
+    if (!el || !el.getAttribute) return false;
+    var tag = (el.tagName || '').toLowerCase();
+    if (tag !== 'button' && tag !== 'a' && el.getAttribute('role') !== 'button') return false;
+    var txt = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim();
+    return /(获取|安装|添加|Get|Install|Add to|Add\b|添加到)/i.test(txt);
+  }
+
+  document.addEventListener('click', function(e) {
+    try {
+      var el = e.target;
+      while (el && el !== document) {
+        if (isInstallTarget(el)) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+          ipcRenderer.send('extension-store-install', { url: location.href });
+          return;
+        }
+        el = el.parentElement;
+      }
+    } catch (err) {}
+  }, true);
+})();
