@@ -92,6 +92,12 @@
                         <polyline points="12 6 12 12 16 14"/>
                     </svg>
                 </button>
+                <button id="extensionsBtn" class="toolbar-btn" title="扩展">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 7V4a2 2 0 00-4 0v3H4a2 2 0 00-2 2v2a2 2 0 002 2h2v3a2 2 0 002 2h2a2 2 0 002-2v-3h2a2 2 0 002-2V9a2 2 0 00-2-2h-2z"/>
+                        <circle cx="12" cy="12" r="2"/>
+                    </svg>
+                </button>
                 <button id="translateBtn" class="toolbar-btn" title="翻译">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M5 8l6 6M4 14l6-6 2-3M2 5h12M7 2h1M22 22l-5-10-5 10M14 17h6"/>
@@ -219,6 +225,14 @@
         <div class="panel media-panel" id="mediaPanel">
             <div class="panel-header"><h3>媒体嗅探</h3><label class="panel-switch" title="开启/关闭媒体嗅探（默认开启，状态会记住）"><input type="checkbox" id="mediaSniffToggle" checked><span class="slider"></span></label><button class="panel-close" id="closeMediaPanel"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
             <div class="panel-content" id="mediaList"><div class="empty-state">当前页面未检测到媒体资源</div></div>
+        </div>
+        <div class="panel extensions-panel" id="extensionsPanel">
+            <div class="panel-header"><h3>扩展</h3><button class="panel-close" id="closeExtensionsPanel"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+            <div class="panel-content" id="extensionsList"><div class="empty-state">正在加载扩展列表...</div></div>
+            <div class="panel-footer" style="padding:8px 12px;border-top:1px solid var(--border-color);display:flex;gap:8px;">
+                <button class="panel-action-btn" id="loadLocalExtensionBtn" style="flex:1;padding:6px 12px;background:var(--primary-color);color:#fff;border:none;border-radius:4px;cursor:pointer;">+ 安装本地扩展</button>
+                <button class="panel-action-btn" id="openExtensionStoreBtn" style="flex:1;padding:6px 12px;background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border-color);border-radius:4px;cursor:pointer;">Edge 扩展商店</button>
+            </div>
         </div>
         <div class="panel bookmark-panel" id="bookmarkPanel">
             <div class="panel-header"><h3>书签管理</h3><button class="panel-close" id="closeBookmarkPanel"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>

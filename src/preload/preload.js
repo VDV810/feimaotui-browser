@@ -641,6 +641,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getAllMediaUrls: () => ipcRenderer.invoke('get-all-media-urls'),
   deleteMediaUrl: (tabId, url) => ipcRenderer.invoke('delete-media-url', tabId, url),
   clearMediaList: (options) => ipcRenderer.invoke('clear-media-list', options || {}),
+
+  // 扩展管理
+  listLoadedExtensions: () => ipcRenderer.invoke('extension-list-loaded'),
+  removeExtension: (extId) => ipcRenderer.invoke('extension-remove', extId),
+  reloadExtension: (extId) => ipcRenderer.invoke('extension-reload', extId),
+  installLocalExtension: () => ipcRenderer.invoke('extension-install-local'),
   downloadMedia: (url, fileName, options) => ipcRenderer.invoke('download-media', url, fileName, options),
   downloadMediaList: (mediaList, options) => ipcRenderer.invoke('download-media-list', mediaList, options),
   startAutoSniffScroll: (webContentsId, options) => ipcRenderer.invoke('start-auto-sniff-scroll', webContentsId, options),

@@ -1,3 +1,32 @@
+// 强制默认配置 v4：必须写进 chrome.storage.local['fullLocalUserConfig'] 这个大对象！
+// 沉浸式翻译的用户配置全部存在 key='fullLocalUserConfig' 下（background 的 Pt()=U.local.get('fullLocalUserConfig',{...})），
+// 散落 set 顶层 key 扩展读不到。先读旧值再 merge，避免丢失用户已有配置。
+try {
+  if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+    var _imtFD_marker = '_imt_forced_v4';
+    chrome.storage.local.get([_imtFD_marker, 'fullLocalUserConfig'], function (_v) {
+      try {
+        if (_v && _v[_imtFD_marker]) return;
+        var _cfg = (_v && _v.fullLocalUserConfig && typeof _v.fullLocalUserConfig === 'object') ? _v.fullLocalUserConfig : {};
+        _cfg.translationMode = 'translation';
+        _cfg.targetLanguage = 'zh-CN';
+        _cfg.forceAutoTranslate = true;
+        if (!Array.isArray(_cfg.alwaysTranslateLanguages)) _cfg.alwaysTranslateLanguages = ['en'];
+        else if (_cfg.alwaysTranslateLanguages.indexOf('en') === -1) _cfg.alwaysTranslateLanguages.push('en');
+        var _setObj = {};
+        _setObj[_imtFD_marker] = true;
+        _setObj['fullLocalUserConfig'] = _cfg;
+        chrome.storage.local.set(_setObj, function () {
+          try { console.log('IMT_FORCE_DEFAULTS_V4 applied translation-only/zh-CN/auto-en -> fullLocalUserConfig'); } catch (e) {}
+        });
+      } catch (e) {}
+    });
+  }
+} catch (e) {}
+/*IMT_FORCE_DEFAULTS_V4*/
+
+
+
 // IMT sync fix snippet: Electron 没有 chrome.storage.sync/session，重定向到 local
 // 必须无 require/import；变量 _imtFix_ 前缀防撞；静默修复，不 throw
 try {

@@ -3878,16 +3878,19 @@ async function seedAndLoadBundledImmersiveTranslate() {
       fs.writeFileSync(BUNDLED_IMT_MARKER, srcFingerprint);
       addLog('EXT', '内置扩展已部署', 'Immersive Translate -> ' + tgt);
     }
-    // 清掉该扩展旧的 service worker 缓存，确保打补丁后的 background 脚本生效
-    // 加 5s 超时保护：clearStorageData 若挂起不能阻塞扩展加载
+    // 清掉该扩展旧的 service worker + IndexedDB 缓存，确保：1)打补丁后的 background 脚本生效 2)storage.local 旧值不再生效
+    // 5s 超时保护：clearStorageData 若挂起不能阻塞扩展加载
     try {
       const sess = session.fromPartition('persist:main');
       await Promise.race([
-        sess.clearStorageData({ origin: 'chrome-extension://' + BUNDLED_IMT_ID, storages: ['serviceworkers'] }),
+        sess.clearStorageData({
+          origin: 'chrome-extension://' + BUNDLED_IMT_ID,
+          storages: ['serviceworkers', 'indexdb', 'cachestorage', 'shadercache']
+        }),
         new Promise(r => setTimeout(r, 5000))
       ]);
     } catch (e) {
-      addLog('EXT', '清理SW缓存失败(不阻塞)', e.message);
+      addLog('EXT', '清理扩展缓存失败(不阻塞)', e.message);
     }
     const list = loadInstalledExtensions();
     if (!list.find(x => x.id === BUNDLED_IMT_ID)) {
@@ -3916,24 +3919,77 @@ ipcMain.on('extension-store-install', (event, payload) => {
   });
 });
 
-// 手动安装本地扩展（最稳的路径）：用户在本机从商店下到 .crx → 解压 → 在飞毛腿里选文件夹加载
-// 也支持直接从已解压的扩展目录加载。这条路不依赖商店下载接口，规避了网络/鉴权限制。
+// 手动安装本地扩展（最稳的路径）：支持 ① 已解压的扩展文件夹 ② .crx 文件 ③ .zip 压缩包
+// 这条路不依赖商店下载接口，规避了网络/鉴权限制。
 async function installLocalExtensionViaDialog() {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: '选择解压后的扩展文件夹（含 manifest.json）',
-    properties: ['openDirectory']
+    title: '选择扩展文件夹（含 manifest.json）、.crx 或 .zip 文件',
+    properties: ['openDirectory', 'openFile'],
+    filters: [
+      { name: '扩展文件', extensions: ['crx', 'zip'] },
+      { name: '所有文件', extensions: ['*'] }
+    ]
   });
   if (result.canceled || !result.filePaths || !result.filePaths.length) {
     return { success: false, canceled: true };
   }
-  const extDir = result.filePaths[0];
-  const manifestPath = path.join(extDir, 'manifest.json');
-  if (!fs.existsSync(manifestPath)) {
-    dialog.showMessageBox(mainWindow, { type: 'warning', title: '不是有效扩展', message: '所选目录内没有 manifest.json，无法作为扩展加载。' });
-    return { success: false, error: '缺少 manifest.json' };
-  }
+  const inputPath = result.filePaths[0];
+  let extDir = inputPath;
+  let cleanupDir = null; // 如果是从 .crx/.zip 解包出来的临时目录，需要在错误时清理
   try {
-    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const stat = fs.statSync(inputPath);
+    if (stat.isFile()) {
+      // 文件模式：判断是 .crx 还是 .zip
+      const lower = inputPath.toLowerCase();
+      let zipBuf;
+      if (lower.endsWith('.crx')) {
+        zipBuf = stripCrxHeader(fs.readFileSync(inputPath));
+      } else if (lower.endsWith('.zip')) {
+        zipBuf = fs.readFileSync(inputPath);
+      } else {
+        // 尝试按 CRX 解析（很多 .crx 没扩展名）
+        try { zipBuf = stripCrxHeader(fs.readFileSync(inputPath)); }
+        catch (e) { throw new Error('不是有效的 .crx 或 .zip 文件'); }
+      }
+      // 解压到 userData/extensions/<id> 或临时目录
+      const tmpZip = path.join(os.tmpdir(), `feimaotui-ext-${Date.now()}.zip`);
+      fs.writeFileSync(tmpZip, zipBuf);
+      const targetBase = path.join(app.getPath('userData'), 'extensions');
+      fs.mkdirSync(targetBase, { recursive: true });
+      // 临时解压到 tmp 目录，读 manifest.json 的 name 作为子目录
+      const tmpExtract = path.join(os.tmpdir(), `feimaotui-ext-extract-${Date.now()}`);
+      cleanupDir = tmpExtract;
+      await extractZip(tmpZip, tmpExtract);
+      try { fs.unlinkSync(tmpZip); } catch (e) {}
+      const manifestPath = path.join(tmpExtract, 'manifest.json');
+      if (!fs.existsSync(manifestPath)) {
+        throw new Error('压缩包内没有 manifest.json，不是有效的扩展');
+      }
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      const extId = manifest.id || ('local-' + manifest.name + '-' + Date.now());
+      const safeId = String(extId).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
+      const finalDir = path.join(targetBase, safeId);
+      // 已存在同 ID 目录则先清空
+      try { fs.rmSync(finalDir, { recursive: true, force: true }); } catch (e) {}
+      fs.mkdirSync(finalDir, { recursive: true });
+      // 移动解压的文件到 finalDir
+      for (const item of fs.readdirSync(tmpExtract)) {
+        const src = path.join(tmpExtract, item);
+        const dst = path.join(finalDir, item);
+        fs.renameSync(src, dst);
+      }
+      try { fs.rmSync(tmpExtract, { recursive: true, force: true }); } catch (e) {}
+      cleanupDir = null;
+      extDir = finalDir;
+    } else {
+      // 目录模式：直接检查 manifest.json
+      const manifestPath = path.join(extDir, 'manifest.json');
+      if (!fs.existsSync(manifestPath)) {
+        dialog.showMessageBox(mainWindow, { type: 'warning', title: '不是有效扩展', message: '所选目录内没有 manifest.json，无法作为扩展加载。' });
+        return { success: false, error: '缺少 manifest.json' };
+      }
+    }
+    const manifest = JSON.parse(fs.readFileSync(path.join(extDir, 'manifest.json'), 'utf8'));
     const extId = manifest.id || '';
     const ext = await loadExtensionIntoMainSession(extDir, extId);
     const name = (ext && ext.name) || (manifest.name) || extId || '未知扩展';
@@ -3952,6 +4008,7 @@ async function installLocalExtensionViaDialog() {
     });
     return { success: true, name, version };
   } catch (e) {
+    if (cleanupDir) { try { fs.rmSync(cleanupDir, { recursive: true, force: true }); } catch (e2) {} }
     addLog('EXT', '本地扩展加载失败', e.message);
     dialog.showMessageBox(mainWindow, { type: 'error', title: '扩展加载失败', message: e.message });
     return { success: false, error: e.message };
@@ -3960,6 +4017,81 @@ async function installLocalExtensionViaDialog() {
 
 ipcMain.handle('extension-install-local', async () => {
   return await installLocalExtensionViaDialog();
+});
+
+// 列出已加载的扩展（带 manifest 元信息：name/version/description/icons）
+ipcMain.handle('extension-list-loaded', async () => {
+  try {
+    const sess = session.fromPartition('persist:main');
+    const api = sess.extensions || sess;
+    const list = (api.getAllExtensions && api.getAllExtensions()) || [];
+    return list.map(ext => {
+      const result = {
+        id: ext.id,
+        name: ext.name,
+        version: ext.version,
+        path: ext.path,
+        enabled: true
+      };
+      try {
+        const manifestPath = path.join(ext.path || '', 'manifest.json');
+        if (fs.existsSync(manifestPath)) {
+          const m = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          result.description = m.description || '';
+          result.icons = m.icons || {};
+          result.shortName = m.short_name || m.name || ext.name;
+        }
+      } catch (e) {}
+      return result;
+    });
+  } catch (e) {
+    return [];
+  }
+});
+
+// 卸载扩展
+ipcMain.handle('extension-remove', async (event, extId) => {
+  try {
+    const sess = session.fromPartition('persist:main');
+    const api = sess.extensions || sess;
+    if (typeof api.removeExtension === 'function') {
+      await api.removeExtension(extId);
+    }
+    // 从持久化列表移除
+    const list = loadInstalledExtensions();
+    const filtered = list.filter(x => x.id !== extId);
+    if (filtered.length !== list.length) {
+      saveInstalledExtensions(filtered);
+    }
+    addLog('EXT', '扩展已卸载', extId);
+    return { success: true };
+  } catch (e) {
+    addLog('EXT', '卸载失败', e.message);
+    return { success: false, error: e.message };
+  }
+});
+
+// 重新加载扩展（等价于禁用→启用：removeExtension + loadExtension）
+ipcMain.handle('extension-reload', async (event, extId) => {
+  try {
+    const sess = session.fromPartition('persist:main');
+    const api = sess.extensions || sess;
+    const list = (api.getAllExtensions && api.getAllExtensions()) || [];
+    const ext = list.find(x => x.id === extId);
+    if (!ext) return { success: false, error: '未找到扩展' };
+    const extDir = ext.path;
+    if (typeof api.removeExtension === 'function') {
+      try { await api.removeExtension(extId); } catch (e) {}
+    }
+    // 短暂等待让卸载完成
+    await new Promise(r => setTimeout(r, 300));
+    await loadExtensionIntoMainSession(extDir, extId);
+    addLog('EXT', '扩展已重新加载', extId);
+    return { success: true };
+  } catch (e) {
+    addLog('EXT', '重新加载失败', e.message);
+    return { success: false, error: e.message };
+  }
 });
 
 // ==================== 书签文件解析 ====================

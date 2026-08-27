@@ -14,7 +14,8 @@ const appState = {
         history: false,
         translate: false,
         log: false,
-        settings: false
+        settings: false,
+        extensions: false
     },
     bookmarks: [],
     dragSrcEl: null,
@@ -260,6 +261,39 @@ function setupEventListeners() {
             e.stopPropagation();
             console.log('[APP] 点击历史按钮');
             togglePanel('history');
+        });
+    }
+    if (elements.extensionsBtn) {
+        elements.extensionsBtn.addEventListener('mousedown', (e) => {
+            e.stopPropagation();
+            console.log('[APP] 点击扩展按钮');
+            togglePanel('extensions');
+        });
+    }
+    if (elements.closeExtensionsPanel) {
+        elements.closeExtensionsPanel.addEventListener('mousedown', (e) => {
+            e.stopPropagation();
+            togglePanel('extensions');
+        });
+    }
+    if (elements.loadLocalExtensionBtn) {
+        elements.loadLocalExtensionBtn.addEventListener('mousedown', (e) => {
+            e.stopPropagation();
+            console.log('[APP] 点击安装本地扩展');
+            if (window.electronAPI && window.electronAPI.installLocalExtension) {
+                window.electronAPI.installLocalExtension();
+            } else {
+                alert('electronAPI 不可用');
+            }
+        });
+    }
+    if (elements.openExtensionStoreBtn) {
+        elements.openExtensionStoreBtn.addEventListener('mousedown', (e) => {
+            e.stopPropagation();
+            console.log('[APP] 点击 Edge 扩展商店');
+            if (window.electronAPI && window.electronAPI.createTab) {
+                window.electronAPI.createTab('https://microsoftedge.microsoft.com/addons/category/Extensions', { active: true });
+            }
         });
     }
     if (elements.translateBtn) {
@@ -1212,7 +1246,8 @@ function togglePanel(panelName) {
         'history': { panel: elements.historyPanel, btn: elements.historyBtn },
         'translate': { panel: elements.translatePanel, btn: elements.translateBtn },
         'log': { panel: elements.logPanel, btn: elements.logBtn },
-        'settings': { panel: elements.settingsPanel, btn: elements.settingsBtn }
+        'settings': { panel: elements.settingsPanel, btn: elements.settingsBtn },
+        'extensions': { panel: elements.extensionsPanel, btn: elements.extensionsBtn }
     };
 
     const target = panelMap[panelName];
@@ -1245,6 +1280,7 @@ function togglePanel(panelName) {
             case 'log': loadLogs(); break;
             case 'settings': loadSettings(); break;
             case 'translate': break;
+            case 'extensions': loadExtensionsList(); break;
         }
     }
 
@@ -1261,7 +1297,8 @@ function closePanel(panelName) {
         'history': { panel: elements.historyPanel, btn: elements.historyBtn },
         'translate': { panel: elements.translatePanel, btn: elements.translateBtn },
         'log': { panel: elements.logPanel, btn: elements.logBtn },
-        'settings': { panel: elements.settingsPanel, btn: elements.settingsBtn }
+        'settings': { panel: elements.settingsPanel, btn: elements.settingsBtn },
+        'extensions': { panel: elements.extensionsPanel, btn: elements.extensionsBtn }
     };
     const p = panelMap[panelName];
     if (p && p.panel) p.panel.classList.remove('open');
@@ -1278,7 +1315,8 @@ function closeAllPanels() {
         'history': { panel: elements.historyPanel, btn: elements.historyBtn },
         'translate': { panel: elements.translatePanel, btn: elements.translateBtn },
         'log': { panel: elements.logPanel, btn: elements.logBtn },
-        'settings': { panel: elements.settingsPanel, btn: elements.settingsBtn }
+        'settings': { panel: elements.settingsPanel, btn: elements.settingsBtn },
+        'extensions': { panel: elements.extensionsPanel, btn: elements.extensionsBtn }
     };
     Object.keys(appState.panels).forEach(key => {
         appState.panels[key] = false;
@@ -2774,6 +2812,81 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ==================== 扩展管理 ====================
+async function loadExtensionsList() {
+    const listEl = document.getElementById('extensionsList');
+    if (!listEl) return;
+    if (!window.electronAPI || !window.electronAPI.listLoadedExtensions) {
+        listEl.innerHTML = '<div class="empty-state">electronAPI 不可用</div>';
+        return;
+    }
+    listEl.innerHTML = '<div class="empty-state">加载中...</div>';
+    try {
+        const exts = await window.electronAPI.listLoadedExtensions();
+        renderExtensionsList(exts || []);
+    } catch (e) {
+        console.error('loadExtensionsList error:', e);
+        listEl.innerHTML = '<div class="empty-state">加载失败: ' + (e && e.message || e) + '</div>';
+    }
+}
+
+function renderExtensionsList(exts) {
+    const listEl = document.getElementById('extensionsList');
+    if (!listEl) return;
+    if (!exts.length) {
+        listEl.innerHTML = '<div class="empty-state">还没有已加载的扩展<br><br>点击下方"安装本地扩展"加载 .crx / .zip / 文件夹</div>';
+        return;
+    }
+    listEl.innerHTML = exts.map((ext, idx) => {
+        const icon = pickExtensionIcon(ext);
+        const isBuiltin = (ext.id || '').startsWith('amkb') || /Immersive Translate/.test(ext.name || '');
+        return `
+        <div class="extension-item" data-ext-id="${escapeAttr(ext.id || '')}" style="display:flex;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border-color);gap:10px;">
+            <img src="${icon}" alt="" style="width:32px;height:32px;border-radius:4px;background:#eee;flex-shrink:0;" onerror="this.style.display='none'">
+            <div style="flex:1;min-width:0;">
+                <div style="font-size:13px;font-weight:500;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(ext.name || '未命名扩展')}</div>
+                <div style="font-size:11px;color:var(--text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(ext.description || 'v' + (ext.version || '?'))}</div>
+            </div>
+            <button class="ext-remove-btn" data-ext-id="${escapeAttr(ext.id || '')}" data-ext-name="${escapeAttr(ext.name || '')}" style="padding:4px 10px;background:transparent;color:#d93025;border:1px solid #d93025;border-radius:3px;cursor:pointer;font-size:11px;flex-shrink:0;">移除</button>
+        </div>`;
+    }).join('');
+    // 绑定移除按钮
+    listEl.querySelectorAll('.ext-remove-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const extId = btn.dataset.extId;
+            const extName = btn.dataset.extName;
+            if (!extId) return;
+            if (!confirm(`确定要移除扩展「${extName}」吗？\n（内置扩展会在下次启动时自动重新部署）`)) return;
+            try {
+                const r = await window.electronAPI.removeExtension(extId);
+                if (r && r.success) {
+                    loadExtensionsList();
+                } else {
+                    alert('移除失败: ' + (r && r.error || '未知错误'));
+                }
+            } catch (e) { alert('移除异常: ' + e.message); }
+        });
+    });
+}
+
+function pickExtensionIcon(ext) {
+    const icons = ext.icons || {};
+    let rel = icons['128'] || icons['64'] || icons['48'] || icons['32'] || icons['16'] || '';
+    if (!rel) return '';
+    // manifest.icons 里的值是相对路径（如 "icons/128.png"），要拼成 chrome-extension://<id>/icons/128.png
+    if (rel.startsWith('http') || rel.startsWith('data:')) return rel;
+    if (rel.startsWith('/')) rel = rel.slice(1);
+    return 'chrome-extension://' + (ext.id || '') + '/' + rel;
+}
+
+function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function escapeAttr(s) {
+    return escapeHtml(s);
 }
 
 // 启动应用
