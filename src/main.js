@@ -3814,6 +3814,8 @@ async function loadPersistedExtensionsOnStartup() {
   if (!list.length) return;
   addLog('EXT', '启动加载已安装扩展', `${list.length} 个`);
   for (const item of list) {
+    // url==='bundled' 的内置扩展由 seedAndLoadBundledImmersiveTranslate 负责，跳过避免重复加载
+    if (item.url === 'bundled') continue;
     try {
       if (fs.existsSync(path.join(item.dir, 'manifest.json'))) {
         const ext = await loadExtensionIntoMainSession(item.dir, item.id);
@@ -3824,6 +3826,60 @@ async function loadPersistedExtensionsOnStartup() {
     } catch (e) {
       addLog('EXT', '启动加载扩展失败', `${item.id}: ${e.message}`);
     }
+  }
+}
+
+// ===== 内置扩展：沉浸式翻译 自动部署 =====
+// 扩展源位于仓库 extensions/immersive-translate（已内置补丁：Electron 未实现 chrome.storage.sync/session，
+// 已在源码层把 sync/session 重定向到 local，否则扩展后台/内容脚本全部初始化失败）。
+// 启动时：拷贝到 userData/extensions/<id> -> 清掉该扩展旧 service worker 缓存 -> 加入已安装列表 -> 加载。
+// 清 SW 缓存很关键：manifest 带 key 导致扩展 ID 固定，Electron 会按 ID 缓存 service worker，
+// 若之前加载过未打补丁的版本，后台脚本缓存会导致补丁不生效（表现为扩展始终初始化失败）。
+const BUNDLED_IMT_ID = 'amkbmndfnliijdhojkpoglbnaaahippg';
+const BUNDLED_IMT_MARKER = path.join(dataPath, 'extensions', BUNDLED_IMT_ID, '_imt_patch_v1');
+
+function getBundledImmersiveTranslateDir() {
+  // 打包后：resources/extensions/immersive-translate（extraResources）；开发态：仓库 extensions/immersive-translate
+  const inResources = path.join(process.resourcesPath, 'extensions', 'immersive-translate');
+  if (fs.existsSync(path.join(inResources, 'manifest.json'))) return inResources;
+  return path.join(app.getAppPath(), 'extensions', 'immersive-translate');
+}
+
+async function seedAndLoadBundledImmersiveTranslate() {
+  try {
+    const src = getBundledImmersiveTranslateDir();
+    if (!fs.existsSync(path.join(src, 'manifest.json'))) {
+      addLog('EXT', '内置扩展源缺失', 'extensions/immersive-translate');
+      return;
+    }
+    const tgt = path.join(dataPath, 'extensions', BUNDLED_IMT_ID);
+    if (!fs.existsSync(BUNDLED_IMT_MARKER)) {
+      try { fs.rmSync(tgt, { recursive: true, force: true }); } catch (e) {}
+      fs.mkdirSync(tgt, { recursive: true });
+      fs.cpSync(src, tgt, { recursive: true });
+      fs.writeFileSync(BUNDLED_IMT_MARKER, new Date().toISOString());
+      addLog('EXT', '内置扩展已部署', 'Immersive Translate -> ' + tgt);
+    }
+    // 清掉该扩展旧的 service worker 缓存，确保打补丁后的 background 脚本生效
+    // 加 5s 超时保护：clearStorageData 若挂起不能阻塞扩展加载
+    try {
+      const sess = session.fromPartition('persist:main');
+      await Promise.race([
+        sess.clearStorageData({ origin: 'chrome-extension://' + BUNDLED_IMT_ID, storages: ['serviceworkers'] }),
+        new Promise(r => setTimeout(r, 5000))
+      ]);
+    } catch (e) {
+      addLog('EXT', '清理SW缓存失败(不阻塞)', e.message);
+    }
+    const list = loadInstalledExtensions();
+    if (!list.find(x => x.id === BUNDLED_IMT_ID)) {
+      list.push({ id: BUNDLED_IMT_ID, dir: tgt, name: 'Immersive Translate', url: 'bundled' });
+      saveInstalledExtensions(list);
+    }
+    await loadExtensionIntoMainSession(tgt, BUNDLED_IMT_ID);
+    addLog('EXT', '内置扩展加载完成', 'Immersive Translate');
+  } catch (e) {
+    addLog('EXT', '内置扩展加载失败', e.message);
   }
 }
 
@@ -5526,7 +5582,7 @@ function setupWxProxy() {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   setupWxProxy();
   loadData();
   createMainWindow();
@@ -5535,6 +5591,8 @@ app.whenReady().then(() => {
   addLog('INFO', '飞毛腿浏览器启动完成');
 
   // 启动时把已安装的浏览器扩展（如沉浸式翻译）重新加载进内核
+  // 先等内置沉浸式翻译部署+加载完成，再加载已安装列表（避免竞态导致重复/遗漏）
+  await seedAndLoadBundledImmersiveTranslate();
   loadPersistedExtensionsOnStartup().catch(e => addLog('EXT', '启动加载扩展异常', e.message));
 
   // 每30秒自动保存会话（防止直接关机/断电丢失）

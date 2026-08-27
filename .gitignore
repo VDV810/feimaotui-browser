@@ -7,6 +7,12 @@ out/
 .DS_Store
 Thumbs.db
 
+# 测试脚手架（不入库）
+_ext_test/
+
+# 扩展备份目录（不入库）
+extensions/*.bak
+
 # Build artifacts
 *.exe
 *.7z
