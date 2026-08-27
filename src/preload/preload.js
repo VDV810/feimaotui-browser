@@ -71,13 +71,13 @@ if (!window.chrome) {
       'color:#666!important;',
     '}',
     /* 腾讯 spaui 标准 dialog 关闭按钮走原生 SVG，不被上面的规则隐藏/透明化 */
-    '.spaui-dialog__close,.spaui-dialog__close-x{',
+    '.spaui-dialog__close,.spaui-dialog__close-x,.spaui-dialog-close-icon{',
       'font-size:inherit!important;color:inherit!important;background:none!important;',
     '}',
-    '.spaui-dialog__close[data-fmt-close-fix="1"] > i,.spaui-dialog__close[data-fmt-close-fix="1"] > svg,.spaui-dialog__close-x[data-fmt-close-fix="1"] > svg{',
+    '.spaui-dialog__close[data-fmt-close-fix="1"] > i,.spaui-dialog__close[data-fmt-close-fix="1"] > svg,.spaui-dialog__close-x[data-fmt-close-fix="1"] > svg,.spaui-dialog-close-icon[data-fmt-close-fix="1"] > svg{',
       'display:inline-block!important;',
     '}',
-    '.spaui-dialog__close svg,.spaui-dialog__close-x svg,.spaui-dialog__close svg path,.spaui-dialog__close-x svg path{',
+    '.spaui-dialog__close svg,.spaui-dialog__close-x svg,.spaui-dialog-close-icon svg,.spaui-dialog__close svg path,.spaui-dialog__close-x svg path,.spaui-dialog-close-icon svg path{',
       'fill:currentColor!important;color:inherit!important;opacity:1!important;visibility:visible!important;',
     '}'
   ].join('');
@@ -116,11 +116,16 @@ if (!window.chrome) {
     // 腾讯广告管理后台的 spaui 标准 dialog 关闭按钮是原生 SVG，工作正常；
     // 不需要用伪元素替换，否则 color:transparent 会让 fill=currentColor 的 SVG 变透明。
     var cls = (el && el.className || '').toString();
+    // 关闭按钮本身，以及它内部包 SVG 的 i.spaui-dialog-close-icon
     if (/\bspaui-dialog__close(-x)?\b/.test(cls)) return true;
-    // 检查是否在 spaui-dialog 容器内（普通模态框）
+    if (/\bspaui-dialog-close-icon\b/.test(cls)) return true;
+    // 检查是否在 spaui-dialog 容器内（普通模态框），或在 spaui 关闭按钮内部
     var p = el && el.parentElement;
     for (var k = 0; k < 8 && p && p !== document.body; k++) {
-      if (/(^|\s)spaui-dialog(\s|$)/.test((p.className || '').toString())) return true;
+      var pcls = (p.className || '').toString();
+      if (/(^|\s)spaui-dialog(\s|$)/.test(pcls)) return true;
+      if (/\bspaui-dialog__close(-x)?\b/.test(pcls)) return true;
+      if (/\bspaui-dialog-close-icon\b/.test(pcls)) return true;
       p = p.parentElement;
     }
     return false;

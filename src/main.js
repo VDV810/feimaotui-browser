@@ -1307,9 +1307,9 @@ function showPageContextMenu(tabId, params) {
     }
   });
 
-  // 开发者工具
+  // 审查元素
   menuItems.push({
-    label: '开发者工具',
+    label: '审查元素',
     click: () => {
       tab.webContents.openDevTools({ mode: 'right' });
     }
