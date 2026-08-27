@@ -3838,6 +3838,21 @@ async function loadPersistedExtensionsOnStartup() {
 const BUNDLED_IMT_ID = 'amkbmndfnliijdhojkpoglbnaaahippg';
 const BUNDLED_IMT_MARKER = path.join(dataPath, 'extensions', BUNDLED_IMT_ID, '_imt_patch_v1');
 
+// 计算 bundled 扩展源的关键文件指纹：manifest.json 指纹 + 三个被打补丁的脚本第一行同步修复特征。
+// 仓库里这三个文件被修改时指纹会变，下一次启动自动重新部署到 userData，旧 marker 失效。
+function computeBundledExtFingerprint(src) {
+  try {
+    const crypto = require('crypto');
+    const files = ['manifest.json', 'background.js', 'content_main.js', 'content_guard.js', 'default_config.content.json'];
+    const hashes = files.map(f => {
+      try { return crypto.createHash('md5').update(fs.readFileSync(path.join(src, f))).digest('hex').slice(0, 8); } catch (e) { return '0'; }
+    });
+    return 'v1:' + hashes.join('-');
+  } catch (e) {
+    return 'v1:legacy-' + Date.now();
+  }
+}
+
 function getBundledImmersiveTranslateDir() {
   // 打包后：resources/extensions/immersive-translate（extraResources）；开发态：仓库 extensions/immersive-translate
   const inResources = path.join(process.resourcesPath, 'extensions', 'immersive-translate');
@@ -3853,11 +3868,14 @@ async function seedAndLoadBundledImmersiveTranslate() {
       return;
     }
     const tgt = path.join(dataPath, 'extensions', BUNDLED_IMT_ID);
-    if (!fs.existsSync(BUNDLED_IMT_MARKER)) {
+    // 用 bundled 源 manifest.json 的指纹作为部署版本：仓库扩展源码变化时指纹变化，旧部署自动刷新
+    const srcFingerprint = computeBundledExtFingerprint(src);
+    const existingFingerprint = (() => { try { return fs.readFileSync(BUNDLED_IMT_MARKER, 'utf8'); } catch (e) { return ''; } })();
+    if (srcFingerprint !== existingFingerprint) {
       try { fs.rmSync(tgt, { recursive: true, force: true }); } catch (e) {}
       fs.mkdirSync(tgt, { recursive: true });
       fs.cpSync(src, tgt, { recursive: true });
-      fs.writeFileSync(BUNDLED_IMT_MARKER, new Date().toISOString());
+      fs.writeFileSync(BUNDLED_IMT_MARKER, srcFingerprint);
       addLog('EXT', '内置扩展已部署', 'Immersive Translate -> ' + tgt);
     }
     // 清掉该扩展旧的 service worker 缓存，确保打补丁后的 background 脚本生效

@@ -660,16 +660,6 @@ body {
 .panel-switch input:checked + .slider::before {
     transform: translateX(14px);
 }
-.panel-switch input:checked + .slider::after {
-    content: "✓";
-    position: absolute;
-    left: 5px;
-    top: 50%;
-    transform: translateY(-50%);
-    font-size: 10px;
-    color: #fff;
-    line-height: 1;
-}
 
 .media-sniff-off-banner {
     padding: 8px 12px;
