@@ -1323,6 +1323,16 @@ function showPageContextMenu(tabId, params) {
     }
   });
 
+  // 安装本地扩展（手动选已解压的扩展文件夹，最稳的安装方式）
+  menuItems.push({
+    label: '安装本地扩展…',
+    click: () => {
+      installLocalExtensionViaDialog().catch(e => {
+        addLog('EXT', '本地扩展安装异常', e.message);
+      });
+    }
+  });
+
   const menu = Menu.buildFromTemplate(menuItems);
 
   addLog('INFO', '显示网页右键菜单', tab.url);
@@ -3728,15 +3738,28 @@ function saveInstalledExtensions(list) {
   }
 }
 
-// 把一个已解包的扩展目录加载进飞毛腿主会话；若已加载则跳过
+// 把一个已解包的扩展目录加载进飞毛腿主会话
+// 优先用 Electron 42 推荐的新 API session.extensions.loadExtension，降级到旧 session.loadExtension
 async function loadExtensionIntoMainSession(extDir, extId) {
   const sess = session.fromPartition('persist:main');
-  const already = (typeof sess.getAllExtensions === 'function') ? sess.getAllExtensions() : [];
-  if (already.find(e => e.id === extId)) {
-    addLog('EXT', '扩展已加载，跳过', extId);
-    return already.find(e => e.id === extId);
+  const loader = (sess.extensions && typeof sess.extensions.loadExtension === 'function')
+    ? sess.extensions.loadExtension.bind(sess.extensions)
+    : sess.loadExtension.bind(sess);
+  try {
+    const ext = await loader(extDir, { allowFileAccess: true });
+    addLog('EXT', '扩展加载成功', `${(ext && ext.name) || extId} v${(ext && ext.version) || '?'}`);
+    return ext;
+  } catch (e) {
+    // 已经加载过（重复点击/重启）时 Electron 会抛错，按已加载处理
+    if (/already|loaded|exist/i.test(e.message || '')) {
+      const all = (sess.extensions && typeof sess.extensions.getAllExtensions === 'function')
+        ? sess.extensions.getAllExtensions()
+        : (typeof sess.getAllExtensions === 'function' ? sess.getAllExtensions() : []);
+      const hit = all.find(x => x.id === extId) || all.find(x => x.path === extDir);
+      if (hit) { addLog('EXT', '扩展已加载，跳过', extId || extDir); return hit; }
+    }
+    throw e;
   }
-  return await sess.loadExtension(extDir, { allowFileAccess: true });
 }
 
 async function installExtensionFromStore(url, extId) {
@@ -3817,6 +3840,52 @@ ipcMain.on('extension-store-install', (event, payload) => {
     addLog('EXT', '安装失败', e.message);
     dialog.showMessageBox(mainWindow, { type: 'error', title: '扩展安装失败', message: e.message, detail: url });
   });
+});
+
+// 手动安装本地扩展（最稳的路径）：用户在本机从商店下到 .crx → 解压 → 在飞毛腿里选文件夹加载
+// 也支持直接从已解压的扩展目录加载。这条路不依赖商店下载接口，规避了网络/鉴权限制。
+async function installLocalExtensionViaDialog() {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择解压后的扩展文件夹（含 manifest.json）',
+    properties: ['openDirectory']
+  });
+  if (result.canceled || !result.filePaths || !result.filePaths.length) {
+    return { success: false, canceled: true };
+  }
+  const extDir = result.filePaths[0];
+  const manifestPath = path.join(extDir, 'manifest.json');
+  if (!fs.existsSync(manifestPath)) {
+    dialog.showMessageBox(mainWindow, { type: 'warning', title: '不是有效扩展', message: '所选目录内没有 manifest.json，无法作为扩展加载。' });
+    return { success: false, error: '缺少 manifest.json' };
+  }
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    const extId = manifest.id || '';
+    const ext = await loadExtensionIntoMainSession(extDir, extId);
+    const name = (ext && ext.name) || (manifest.name) || extId || '未知扩展';
+    const version = (ext && ext.version) || manifest.version || '?';
+    // 持久化
+    const list = loadInstalledExtensions();
+    const exist = list.find(x => x.dir === extDir);
+    if (!exist) { list.push({ id: extId, dir: extDir, name, url: '' }); saveInstalledExtensions(list); }
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('extension-installed', { id: extId, name });
+    addLog('EXT', '本地扩展已加载', `${name} v${version} (${extDir})`);
+    dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      title: '扩展已安装',
+      message: `扩展「${name}」已安装到飞毛腿浏览器`,
+      detail: '刷新当前页面或重启浏览器后即可生效。\n翻译等能力将由该扩展（如沉浸式翻译）接管，内置翻译已停用避免冲突。'
+    });
+    return { success: true, name, version };
+  } catch (e) {
+    addLog('EXT', '本地扩展加载失败', e.message);
+    dialog.showMessageBox(mainWindow, { type: 'error', title: '扩展加载失败', message: e.message });
+    return { success: false, error: e.message };
+  }
+}
+
+ipcMain.handle('extension-install-local', async () => {
+  return await installLocalExtensionViaDialog();
 });
 
 // ==================== 书签文件解析 ====================
