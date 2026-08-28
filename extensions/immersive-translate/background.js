@@ -1,29 +1,43 @@
-// 强制默认配置 v4：必须写进 chrome.storage.local['fullLocalUserConfig'] 这个大对象！
-// 沉浸式翻译的用户配置全部存在 key='fullLocalUserConfig' 下（background 的 Pt()=U.local.get('fullLocalUserConfig',{...})），
-// 散落 set 顶层 key 扩展读不到。先读旧值再 merge，避免丢失用户已有配置。
+// 沉浸式翻译默认配置 V5：回退到"点一下才翻"+"中英对照"，并强制用免费翻译服务
+// V3(散 key 失败) → V4(写对 fullLocalUserConfig,单语自动翻译) → V5(回退:双语手动,强制Bing防登录墙)
+// 用户反馈:Bing 接口曾 2 个月后失效;为免沉浸式翻译弹"登录后继续"强制锁定 translationService=bing
+// 重要:沉浸式翻译有 token/计费服务时弹登录墙,锁定为免费 Bing(公开接口)可避免
 try {
   if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-    var _imtFD_marker = '_imt_forced_v4';
+    var _imtFD_marker = '_imt_forced_v5';
     chrome.storage.local.get([_imtFD_marker, 'fullLocalUserConfig'], function (_v) {
       try {
         if (_v && _v[_imtFD_marker]) return;
         var _cfg = (_v && _v.fullLocalUserConfig && typeof _v.fullLocalUserConfig === 'object') ? _v.fullLocalUserConfig : {};
-        _cfg.translationMode = 'translation';
-        _cfg.targetLanguage = 'zh-CN';
-        _cfg.forceAutoTranslate = true;
-        if (!Array.isArray(_cfg.alwaysTranslateLanguages)) _cfg.alwaysTranslateLanguages = ['en'];
-        else if (_cfg.alwaysTranslateLanguages.indexOf('en') === -1) _cfg.alwaysTranslateLanguages.push('en');
+        _cfg.translationMode = 'dual';      // 中英对照(回退:用户要求)
+        _cfg.targetLanguage = 'zh-CN';      // 翻译目标中文
+        _cfg.forceAutoTranslate = false;    // 点一下才翻(回退:用户要求)
+        // 移除 V4 强制加的 alwaysTranslateLanguages(避免每页面自动翻)
+        if (Array.isArray(_cfg.alwaysTranslateLanguages)) {
+          _cfg.alwaysTranslateLanguages = [];
+        }
+        // 强制用免费 Bing 翻译(公开接口,无需 token/登录),避免被其它服务触发登录墙
+        _cfg.translationService = 'bing';
+        // 同步:确保 userTranslationServices 里有 bing(悬浮球切引擎时用到)
+        if (!_cfg.userTranslationServices || typeof _cfg.userTranslationServices !== 'object') {
+          _cfg.userTranslationServices = {};
+        }
+        if (!_cfg.userTranslationServices.bing) {
+          _cfg.userTranslationServices.bing = { serviceType: 'bing' };
+        }
         var _setObj = {};
         _setObj[_imtFD_marker] = true;
         _setObj['fullLocalUserConfig'] = _cfg;
         chrome.storage.local.set(_setObj, function () {
-          try { console.log('IMT_FORCE_DEFAULTS_V4 applied translation-only/zh-CN/auto-en -> fullLocalUserConfig'); } catch (e) {}
+          try { console.log('IMT_FORCE_DEFAULTS_V5 applied dual+manual+bing-only -> fullLocalUserConfig'); } catch (e) {}
         });
       } catch (e) {}
     });
   }
 } catch (e) {}
-/*IMT_FORCE_DEFAULTS_V4*/
+/*IMT_FORCE_DEFAULTS_V5*/
+
+
 
 
 
