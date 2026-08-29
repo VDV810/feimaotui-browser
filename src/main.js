@@ -5512,8 +5512,6 @@ function setupIPC() {
     }
     return { success: false, error: '当前翻译引擎不可用' };
   });
-    return { success: false, error: '当前翻译引擎不可用' };
-  });
 
   // 设置
   ipcMain.handle('get-settings', () => globalState.settings);
