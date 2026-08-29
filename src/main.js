@@ -5,9 +5,10 @@ const axios = require('axios');
 const { execFile, spawn } = require('child_process');
 const os = require('os');
 
-// 内置翻译总开关：false = 完全关闭飞毛腿自带翻译（避免与"沉浸式翻译"扩展冲突），
-// 翻译统一交给用户安装的扩展（如 Immersive Translate）处理。
-const BUILTIN_TRANSLATE_ENABLED = false;
+// 内置翻译总开关：内置翻译（EdgeTranslate/MyMemory 直连）成为"翻译引擎"之一。
+// 仅当用户选择的翻译引擎为"内置"（settings.translationEngine === 'builtin'）时才会实际触发，
+// 避免与"沉浸式翻译"等扩展引擎同时生效（每次只用一个引擎）。
+const BUILTIN_TRANSLATE_ENABLED = true;
 
 // ==================== 注册自定义特权协议（必须在 app ready 之前） ====================
 // wx-local: 用于代理 https://localhost.weixin.qq.com 请求，绕过 Chromium PNA 限制
@@ -2254,7 +2255,7 @@ function createTab(url = null, options = {}) {
       }
     }
 
-        if (BUILTIN_TRANSLATE_ENABLED) setTimeout(() => autoTranslatePageIfNeeded(tabId), 1200);
+        if (BUILTIN_TRANSLATE_ENABLED && isBuiltinTranslateActive()) setTimeout(() => autoTranslatePageIfNeeded(tabId), 1200);
 
     // ==================== go.php / 中转页兜底 ====================
     // 若页面仍然停留在 go.php?url=base64... 之类的中转地址(标题为"温馨提示"等)，
@@ -3436,11 +3437,97 @@ function withTimeout(promise, timeoutMs, label) {
   ]);
 }
 
+// ==================== 翻译引擎轮换（多引擎，每次只用一个，配额耗尽自动切换/跳过） ====================
+// 当前翻译引擎：settings.translationEngine
+//   'builtin' 内置直连（EdgeTranslate/MyMemory，带本地兜底）
+//   'imt' 沉浸式翻译  'youdao' 有道  'volcano' 火山  'subtitle' 字幕精灵  'qy' 轻氧翻译
+function getActiveTranslationEngine() {
+  const e = globalState.settings.translationEngine || 'imt';
+  if (e === 'builtin') return 'builtin';
+  return TRANSLATION_EXTENSIONS.some(x => x.engine === e) ? e : 'imt';
+}
+
+// 内置引擎是否生效（仅当用户选中"内置"时）
+function isBuiltinTranslateActive() {
+  return getActiveTranslationEngine() === 'builtin';
+}
+
+function getTodayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// 今日已用尽的内置 provider 列表（跨天自动清空）
+function getExhaustedTranslateProviders() {
+  const info = globalState.settings.translationExhausted || {};
+  if (info.date !== getTodayStr()) return [];
+  return Array.isArray(info.providers) ? info.providers : [];
+}
+
+function markTranslateProviderExhausted(name, reason) {
+  const today = getTodayStr();
+  const info = globalState.settings.translationExhausted || {};
+  const providers = (info.date === today && Array.isArray(info.providers)) ? info.providers : [];
+  if (!providers.includes(name)) providers.push(name);
+  globalState.settings.translationExhausted = { date: today, providers };
+  saveData();
+  addLog('TRANSLATE', '翻译引擎今日配额耗尽，自动跳过', `${name} (${reason})`);
+}
+
+function isQuotaError(error) {
+  const status = (error && error.response && error.response.status) || 0;
+  if (status === 429 || status === 403) return true;
+  const msg = String((error && (error.message || error)) || '').toLowerCase();
+  return /quota|limit|too many|429|exhaust|rate.?limit|额度|已用尽|请稍后|throttl/.test(msg);
+}
+
+// 打开指定扩展的 popup 浮窗，让用户在该扩展自己的界面里触发翻译
+function openExtensionPopup(extId) {
+  try {
+    let popupPath = 'popup.html';
+    try {
+      const sess = session.fromPartition('persist:main');
+      const all = (sess.extensions && typeof sess.extensions.getAllExtensions === 'function')
+        ? sess.extensions.getAllExtensions() : [];
+      const ext = all.find(x => x.id === extId);
+      if (ext && ext.manifest && ext.manifest.action && ext.manifest.action.default_popup) {
+        popupPath = ext.manifest.action.default_popup;
+      } else if (ext && ext.manifest && ext.manifest.browser_action && ext.manifest.browser_action.default_popup) {
+        popupPath = ext.manifest.browser_action.default_popup;
+      }
+    } catch (e) {}
+    const url = `chrome-extension://${extId}/${popupPath}`;
+    const win = new BrowserWindow({
+      width: 430,
+      height: 600,
+      resizable: true,
+      frame: false,
+      autoHideMenuBar: true,
+      title: '翻译引擎',
+      webPreferences: { partition: 'persist:main', contextIsolation: true }
+    });
+    win.webContents.on('before-input-event', (event, input) => {
+      if (input.type === 'keyDown' && input.key === 'Escape') win.close();
+    });
+    win.loadURL(url).catch(() => {});
+    addLog('TRANSLATE', '打开翻译引擎面板', url);
+    return { success: true, url };
+  } catch (e) {
+    addLog('TRANSLATE', '打开翻译引擎面板失败', e.message);
+    return { success: false, error: e.message };
+  }
+}
+
 async function translateText(text, targetLang = 'zh') {
   const sourceText = String(text || '').trim();
   if (!sourceText) return { success: true, text: '', sourceLang: 'auto', targetLang };
 
+  const exhausted = getExhaustedTranslateProviders();
   for (const provider of TRANSLATE_PROVIDERS) {
+    if (exhausted.includes(provider.name)) {
+      addLog('TRANSLATE', '跳过今日已用尽的引擎', provider.name);
+      continue;
+    }
     try {
       const translated = await withTimeout(provider.request(sourceText, targetLang), TRANSLATE_TIMEOUT + 1000, provider.name);
       if (translated && translated.trim() && translated.trim() !== sourceText) {
@@ -3450,6 +3537,7 @@ async function translateText(text, targetLang = 'zh') {
       addLog('TRANSLATE', `${provider.name} 翻译结果为空或未变化`, sourceText.substring(0, 30));
     } catch (error) {
       addLog('TRANSLATE', `${provider.name} 翻译失败`, error.message);
+      if (isQuotaError(error)) markTranslateProviderExhausted(provider.name, error.message);
     }
   }
 
@@ -3493,6 +3581,7 @@ async function translateTextBatchEdgeTranslate(texts, targetLang = 'zh') {
       addLog('TRANSLATE', 'EdgeTranslate 批量翻译成功', `本批 ${batch.length} 条`);
     } catch (error) {
       addLog('TRANSLATE', 'EdgeTranslate 批量翻译失败，改用本地兜底', error.message);
+      if (isQuotaError(error)) markTranslateProviderExhausted('EdgeTranslate', error.message);
       batch.forEach(text => {
         const translated = fallbackLocalTranslate(text, targetLang);
         if (translated && translated !== text) results.push({ original: text, translated });
@@ -3645,7 +3734,7 @@ async function autoTranslateFullPage(tabId) {
 }
 
 async function autoTranslatePageIfNeeded(tabId) {
-  if (!BUILTIN_TRANSLATE_ENABLED) return;
+  if (!BUILTIN_TRANSLATE_ENABLED || !isBuiltinTranslateActive()) return;
   const tab = globalState.tabs.get(tabId);
   if (!tab || !tab.webContents || globalState.settings.autoTranslate === false) return;
   const url = tab.webContents.getURL();
@@ -3860,6 +3949,118 @@ function getBundledImmersiveTranslateDir() {
   return path.join(app.getAppPath(), 'extensions', 'immersive-translate');
 }
 
+// ===== 翻译引擎注册表（多引擎轮换：每次只用一个，用量用完自动/手动切换） =====
+// 每个引擎对应一个 Edge/Chrome 翻译扩展。
+// - 沉浸式翻译已打进安装包(extraResources)，由 seedAndLoadBundledImmersiveTranslate 部署；
+// - 其余 4 个引擎（有道/火山/字幕精灵/轻氧）在启动时尝试从本机 Edge/Chrome 复制到
+//   userData/extensions/<id> 后加载（不增加安装包体积，本机浏览器有装即可用）。
+// id 必须与 Edge 商店里的扩展 ID 一致；dirName 为仓库/打包目录名（仅 bundled 用到）。
+const TRANSLATION_EXTENSIONS = [
+  { id: 'amkbmndfnliijdhojkpoglbnaaahippg', name: '沉浸式翻译', dirName: 'immersive-translate', bundled: true, engine: 'imt' },
+  { id: 'memhacajcfhmibggbgilihlmiiddeggo', name: '有道翻译', dirName: 'youdao-translate', bundled: false, engine: 'youdao' },
+  { id: 'jmnhemdajboodicneejdlpanmijclhef', name: '火山翻译', dirName: 'volcano-translate', bundled: false, engine: 'volcano' },
+  { id: 'hodednmbnoemidigafhfpbfcafhjlkki', name: '字幕精灵', dirName: 'subtitle-elf', bundled: false, engine: 'subtitle' },
+  { id: 'gldjnohpkhoipopkgkoepimoaoekhioo', name: '轻氧翻译', dirName: 'qy-translate', bundled: false, engine: 'qy' }
+];
+
+// 在本地 Edge/Chrome 的所有配置目录里，按扩展 ID 查找已安装的扩展目录（返回含 manifest.json 的版本目录）
+function findExtensionInLocalBrowsers(extId) {
+  const candidates = [];
+  const localAppData = process.env.LOCALAPPDATA || 'C:\\Users\\' + (process.env.USERNAME || '') + '\\AppData\\Local';
+  for (const browser of ['Microsoft\\Edge', 'Google\\Chrome']) {
+    const userData = path.join(localAppData, browser, 'User Data');
+    if (!fs.existsSync(userData)) continue;
+    try {
+      // 扫描所有配置目录（Default / Profile 1 / Profile 2 ...）
+      for (const entry of fs.readdirSync(userData)) {
+        const extRoot = path.join(userData, entry, 'Extensions');
+        if (fs.existsSync(extRoot)) candidates.push(extRoot);
+      }
+    } catch (e) {}
+  }
+  for (const extRoot of candidates) {
+    const idDir = path.join(extRoot, extId);
+    if (!fs.existsSync(idDir)) continue;
+    try {
+      for (const version of fs.readdirSync(idDir)) {
+        const manifestPath = path.join(idDir, version, 'manifest.json');
+        if (fs.existsSync(manifestPath)) return path.join(idDir, version);
+      }
+    } catch (e) {}
+  }
+  return null;
+}
+
+// Electron 尚未实现 chrome.storage.sync/session，把这类调用重定向到 chrome.storage.local
+// （与内置沉浸式翻译的源码层补丁同一思路；仅对已知用到的扩展按需打补丁，幂等安全）
+function patchExtensionForElectron(tgtDir, extId) {
+  const PATCH_MAP = {
+    'gldjnohpkhoipopkgkoepimoaoekhioo': ['chrome.storage.sync', 'chrome.storage.session'] // 轻氧翻译
+  };
+  const targets = PATCH_MAP[extId];
+  if (!targets) return;
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir)) {
+      const full = path.join(dir, entry);
+      if (fs.statSync(full).isDirectory()) {
+        walk(full);
+      } else if (entry.endsWith('.js') || entry.endsWith('.mjs')) {
+        try {
+          let content = fs.readFileSync(full, 'utf8');
+          let changed = false;
+          for (const needle of targets) {
+            if (content.includes(needle)) {
+              content = content.split(needle).join('chrome.storage.local');
+              changed = true;
+            }
+          }
+          if (changed) {
+            fs.writeFileSync(full, content);
+            addLog('EXT', '已为 Electron 打补丁(chrome.storage)', `${extId} ${entry}`);
+          }
+        } catch (e) {}
+      }
+    }
+  };
+  try { walk(tgtDir); } catch (e) {}
+}
+
+// 部署并持久化 4 个非内置翻译扩展（有道/火山/字幕精灵/轻氧）：已部署则跳过，
+// 未部署时优先从本机 Edge/Chrome 复制；复制不到则记录日志（用户可去设置里手动装）。
+// 注意：本函数只部署+持久化，不负责 loadExtension（统一由 loadPersistedExtensionsOnStartup 加载，避免重复加载竞态）。
+async function seedAndLoadTranslationExtensions() {
+  const list = loadInstalledExtensions();
+  for (const item of TRANSLATION_EXTENSIONS) {
+    if (item.bundled) continue; // 沉浸式翻译由 seedAndLoadBundledImmersiveTranslate 负责
+    const tgt = path.join(dataPath, 'extensions', item.id);
+    try {
+      const manifestPath = path.join(tgt, 'manifest.json');
+      let deployed = fs.existsSync(manifestPath);
+      if (!deployed) {
+        const src = findExtensionInLocalBrowsers(item.id);
+        if (src) {
+          fs.mkdirSync(tgt, { recursive: true });
+          fs.cpSync(src, tgt, { recursive: true });
+          // Electron 兼容补丁（如 chrome.storage.sync → local），幂等
+          patchExtensionForElectron(tgt, item.id);
+          deployed = true;
+          addLog('EXT', '已从本机浏览器复制翻译扩展', `${item.name} (${item.id})`);
+        } else {
+          addLog('EXT', '未找到本地扩展源', `${item.name} (${item.id})，可在设置中手动安装`);
+        }
+      }
+      if (!deployed) continue;
+      if (!list.find(x => x.id === item.id)) {
+        list.push({ id: item.id, dir: tgt, name: item.name, url: 'local' });
+        saveInstalledExtensions(list);
+        addLog('EXT', '已登记翻译扩展', `${item.name} (${item.id})`);
+      }
+    } catch (e) {
+      addLog('EXT', '部署翻译扩展失败', `${item.name}: ${e.message}`);
+    }
+  }
+}
+
 async function seedAndLoadBundledImmersiveTranslate() {
   try {
     const src = getBundledImmersiveTranslateDir();
@@ -3879,19 +4080,14 @@ async function seedAndLoadBundledImmersiveTranslate() {
       addLog('EXT', '内置扩展已部署', 'Immersive Translate -> ' + tgt);
     }
     // 清掉该扩展旧的 service worker + IndexedDB 缓存，确保：1)打补丁后的 background 脚本生效 2)storage.local 旧值不再生效
-    // 5s 超时保护：clearStorageData 若挂起不能阻塞扩展加载
+    // 后台执行、不 await：避免极端环境（如受限沙箱）下 clearStorageData 阻塞主进程导致启动卡死/退出
     try {
       const sess = session.fromPartition('persist:main');
-      await Promise.race([
-        sess.clearStorageData({
-          origin: 'chrome-extension://' + BUNDLED_IMT_ID,
-          storages: ['serviceworkers', 'indexdb', 'cachestorage', 'shadercache']
-        }),
-        new Promise(r => setTimeout(r, 5000))
-      ]);
-    } catch (e) {
-      addLog('EXT', '清理扩展缓存失败(不阻塞)', e.message);
-    }
+      sess.clearStorageData({
+        origin: 'chrome-extension://' + BUNDLED_IMT_ID,
+        storages: ['serviceworkers', 'indexdb', 'cachestorage', 'shadercache']
+      }).catch(() => {});
+    } catch (e) {}
     const list = loadInstalledExtensions();
     if (!list.find(x => x.id === BUNDLED_IMT_ID)) {
       list.push({ id: BUNDLED_IMT_ID, dir: tgt, name: 'Immersive Translate', url: 'bundled' });
@@ -5178,9 +5374,76 @@ function setupIPC() {
   ipcMain.handle('pause-download', (event, downloadId) => pauseDownload(downloadId));
   ipcMain.handle('resume-download', (event, downloadId) => resumeDownload(downloadId));
 
-  // 翻译（内置翻译已停用，统一由"沉浸式翻译"等扩展接管；此处返回提示，避免报错）
-  ipcMain.handle('translate-text', async () => ({ success: false, disabled: true, error: '内置翻译已停用，请使用沉浸式翻译扩展' }));
-  ipcMain.handle('translate-page', async () => ({ success: false, disabled: true, error: '内置翻译已停用，请使用沉浸式翻译扩展' }));
+  // 翻译引擎列表 + 当前引擎（供渲染层渲染引擎切换器）
+  ipcMain.handle('get-translation-engines', () => {
+    const installed = loadInstalledExtensions();
+    const installedIds = new Set(installed.map(x => x.id));
+    const engines = TRANSLATION_EXTENSIONS.map(x => ({
+      engine: x.engine,
+      name: x.name,
+      id: x.id,
+      bundled: Boolean(x.bundled),
+      loaded: x.bundled ? true : installedIds.has(x.id)
+    }));
+    return { engines, active: getActiveTranslationEngine() };
+  });
+
+  // 切换当前翻译引擎（每次只用一个）
+  ipcMain.handle('set-translation-engine', (event, engineId) => {
+    const valid = engineId === 'builtin' || TRANSLATION_EXTENSIONS.some(x => x.engine === engineId);
+    if (!valid) return { success: false, error: '未知翻译引擎' };
+    globalState.settings.translationEngine = engineId;
+    saveData();
+    addLog('TRANSLATE', '切换翻译引擎', engineId);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('translation-engine-changed', engineId);
+    }
+    return { success: true, active: engineId };
+  });
+
+  // 文本翻译：按当前引擎分发。内置 → 直连翻译；扩展引擎 → 打开该扩展面板
+  ipcMain.handle('translate-text', async (event, text, targetLang) => {
+    const engine = getActiveTranslationEngine();
+    if (engine === 'builtin') {
+      return await translateText(String(text || ''), targetLang || 'zh');
+    }
+    const item = TRANSLATION_EXTENSIONS.find(x => x.engine === engine);
+    if (item) {
+      const opened = openExtensionPopup(item.id);
+      return {
+        success: false,
+        engine,
+        hint: opened.success
+          ? `已打开「${item.name}」面板，请在弹出的扩展窗口里完成翻译`
+          : `当前引擎「${item.name}」为浏览器扩展，请使用扩展自带的翻译入口`
+      };
+    }
+    return { success: false, error: '当前翻译引擎不可用' };
+  });
+
+  // 页面翻译：按当前引擎分发。内置 → 页面 DOM 就地替换；扩展引擎 → 打开该扩展面板
+  ipcMain.handle('translate-page', async (event, tabId, targetLang) => {
+    const engine = getActiveTranslationEngine();
+    const tab = globalState.tabs.get(tabId);
+    if (!tab || !tab.webContents || tab.webContents.isDestroyed()) {
+      return { success: false, error: '页面不存在或已关闭' };
+    }
+    if (engine === 'builtin') {
+      return await translatePageContent(tab, targetLang || 'zh', { force: false });
+    }
+    const item = TRANSLATION_EXTENSIONS.find(x => x.engine === engine);
+    if (item) {
+      const opened = openExtensionPopup(item.id);
+      return {
+        success: false,
+        engine,
+        hint: opened.success
+          ? `已打开「${item.name}」面板，请在弹出的扩展窗口里触发页面翻译`
+          : `当前引擎「${item.name}」为浏览器扩展，请使用扩展自带的翻译入口`
+      };
+    }
+    return { success: false, error: '当前翻译引擎不可用' };
+  });
 
   // 设置
   ipcMain.handle('get-settings', () => globalState.settings);
@@ -5741,8 +6004,10 @@ app.whenReady().then(async () => {
   addLog('INFO', '飞毛腿浏览器启动完成');
 
   // 启动时把已安装的浏览器扩展（如沉浸式翻译）重新加载进内核
-  // 先等内置沉浸式翻译部署+加载完成，再加载已安装列表（避免竞态导致重复/遗漏）
+  // 先等内置沉浸式翻译部署+加载完成，再部署有道/火山/字幕精灵/轻氧（从本机 Edge 复制），
+  // 最后统一加载已安装列表（避免竞态导致重复/遗漏）
   await seedAndLoadBundledImmersiveTranslate();
+  await seedAndLoadTranslationExtensions();
   loadPersistedExtensionsOnStartup().catch(e => addLog('EXT', '启动加载扩展异常', e.message));
 
   // 每30秒自动保存会话（防止直接关机/断电丢失）

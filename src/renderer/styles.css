@@ -1527,6 +1527,50 @@ body {
     color: var(--text-color);
 }
 
+/* 翻译引擎切换器 */
+.translate-engine-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+
+.translate-engine-chip {
+    padding: 5px 12px;
+    border-radius: 14px;
+    border: 1px solid var(--border-color);
+    background: var(--surface-color);
+    color: var(--text-color);
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1.4;
+    user-select: none;
+    transition: all 0.15s;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.translate-engine-chip:hover {
+    border-color: var(--primary-color);
+    color: var(--primary-color);
+}
+
+.translate-engine-chip.active {
+    background: var(--primary-color);
+    border-color: var(--primary-color);
+    color: #fff;
+}
+
+.translate-engine-chip .eng-status {
+    font-size: 10px;
+    opacity: 0.75;
+}
+
+.translate-engine-chip.active .eng-status {
+    opacity: 0.9;
+}
+
 .translate-input-wrapper,
 .translate-result-wrapper {
     margin-bottom: 12px;

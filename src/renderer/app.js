@@ -106,6 +106,8 @@ const elements = {
     translatePageBtn: document.getElementById('translatePageBtn'),
     translateTargetLang: document.getElementById('translateTargetLang'),
     pageTranslateLang: document.getElementById('pageTranslateLang'),
+    translateEngineList: document.getElementById('translateEngineList'),
+    settingsEngineList: document.getElementById('settingsEngineList'),
     refreshLogBtn: document.getElementById('refreshLogBtn'),
     copyLogBtn: document.getElementById('copyLogBtn'),
     clearLogBtn: document.getElementById('clearLogBtn'),
@@ -127,6 +129,10 @@ async function init() {
     await createInitialTab();
     await loadBookmarks();
     await loadSettings();
+    // 翻译引擎在主进程被切换时同步刷新 UI
+    if (window.electronAPI.onTranslationEngineChanged) {
+        window.electronAPI.onTranslationEngineChanged(() => renderTranslationEngines());
+    }
     console.log('[APP] 初始化完成');
 }
 
@@ -468,8 +474,10 @@ function setupEventListeners() {
                 const result = await window.electronAPI.translateText(text, targetLang);
                 if (result.success) {
                     elements.translateResult.value = result.text;
+                } else if (result.hint) {
+                    elements.translateResult.value = result.hint;
                 } else {
-                    elements.translateResult.value = '翻译失败: ' + result.error;
+                    elements.translateResult.value = '翻译失败: ' + (result.error || '未知错误');
                 }
             } catch (error) {
                 elements.translateResult.value = '翻译失败: ' + error.message;
@@ -493,8 +501,10 @@ function setupEventListeners() {
                 const result = await window.electronAPI.translatePage(appState.activeTabId, targetLang);
                 if (result.success) {
                     alert(`页面翻译完成，共翻译 ${result.translatedCount} 处文本`);
+                } else if (result.hint) {
+                    alert(result.hint);
                 } else {
-                    alert('页面翻译失败: ' + result.error);
+                    alert('页面翻译失败: ' + (result.error || '未知错误'));
                 }
             } catch (error) {
                 alert('页面翻译失败: ' + error.message);
@@ -1279,7 +1289,7 @@ function togglePanel(panelName) {
             case 'history': loadHistory(); break;
             case 'log': loadLogs(); break;
             case 'settings': loadSettings(); break;
-            case 'translate': break;
+            case 'translate': renderTranslationEngines(); break;
             case 'extensions': loadExtensionsList(); break;
         }
     }
@@ -1946,8 +1956,46 @@ async function loadSettings() {
         }
         // 加载已标记广告规则
         await loadCustomAdRules();
+        // 加载翻译引擎列表
+        await renderTranslationEngines();
     } catch (error) {
         console.error('加载设置失败:', error);
+    }
+}
+
+// 渲染翻译引擎切换器（翻译面板 + 设置面板共用；每次只用一个引擎）
+async function renderTranslationEngines() {
+    const listContainers = [elements.translateEngineList, elements.settingsEngineList].filter(Boolean);
+    if (listContainers.length === 0) return;
+    try {
+        const data = await window.electronAPI.getTranslationEngines();
+        const active = data.active || 'imt';
+        const engines = [
+            { engine: 'builtin', name: '内置翻译', loaded: true },
+            ...(data.engines || []).map(e => ({ engine: e.engine, name: e.name, loaded: e.loaded }))
+        ];
+        const html = engines.map(e => {
+            const isActive = e.engine === active;
+            const status = e.loaded ? '' : ' <span class="eng-status">未装</span>';
+            const title = e.loaded ? '' : '本机 Edge/Chrome 未检测到该扩展，请先在 Edge 中安装';
+            return '<button class="translate-engine-chip' + (isActive ? ' active' : '') + '" data-engine="' + e.engine + '" title="' + title + '">' + e.name + status + '</button>';
+        }).join('');
+        listContainers.forEach(el => {
+            el.innerHTML = html;
+            el.querySelectorAll('.translate-engine-chip').forEach(chip => {
+                chip.addEventListener('click', async () => {
+                    const engineId = chip.dataset.engine;
+                    const res = await window.electronAPI.setTranslationEngine(engineId);
+                    if (res && res.success) {
+                        await renderTranslationEngines();
+                    } else {
+                        alert((res && res.error) || '切换翻译引擎失败');
+                    }
+                });
+            });
+        });
+    } catch (error) {
+        console.error('渲染翻译引擎失败:', error);
     }
 }
 
