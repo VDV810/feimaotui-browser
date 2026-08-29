@@ -3854,7 +3854,7 @@ const BUNDLED_IMT_MARKER = path.join(dataPath, 'extensions', BUNDLED_IMT_ID, '_i
 function computeBundledExtFingerprint(src) {
   try {
     const crypto = require('crypto');
-    const files = ['manifest.json', 'background.js', 'content_main.js', 'content_guard.js', 'default_config.content.json'];
+    const files = ['manifest.json', 'background.js', 'content_main.js', 'content_guard.js', 'default_config.content.json', 'options.js'];
     const hashes = files.map(f => {
       try { return crypto.createHash('md5').update(fs.readFileSync(path.join(src, f))).digest('hex').slice(0, 8); } catch (e) { return '0'; }
     });
@@ -5331,7 +5331,21 @@ function setupIPC() {
     return { success: true, active: engineId };
   });
 
-  // 文本翻译：内置引擎直连翻译；扩展引擎 → 提示用户用页面上的红色悬浮翻译按钮
+  // 打开沉浸式翻译的设置页（在标签页中打开，非独立窗口——独立窗口会空白）
+  // 用户在设置页「基本设置 → 翻译服务」里换服务（腾讯/百度/火山/有道/DeepL/Google/AI 等），
+  // 换完后粉色浮球用的就是新服务，实现同一入口的多服务轮换。
+  ipcMain.handle('open-immersive-settings', () => {
+    try {
+      createTab('chrome-extension://' + BUNDLED_IMT_ID + '/options.html', { active: true });
+      addLog('TRANSLATE', '打开沉浸式翻译设置页');
+      return { success: true };
+    } catch (e) {
+      addLog('TRANSLATE', '打开沉浸式设置失败', e.message);
+      return { success: false, error: e.message };
+    }
+  });
+
+  // 文本翻译：内置引擎直连翻译；扩展引擎 → 提示用户用页面上的粉色浮球
   ipcMain.handle('translate-text', async (event, text, targetLang) => {
     const engine = getActiveTranslationEngine();
     if (engine === 'builtin') {

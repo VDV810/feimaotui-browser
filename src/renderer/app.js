@@ -104,8 +104,6 @@ const elements = {
     translatePageBtn: document.getElementById('translatePageBtn'),
     translateTargetLang: document.getElementById('translateTargetLang'),
     pageTranslateLang: document.getElementById('pageTranslateLang'),
-    translateEngineList: document.getElementById('translateEngineList'),
-    settingsEngineList: document.getElementById('settingsEngineList'),
     refreshLogBtn: document.getElementById('refreshLogBtn'),
     copyLogBtn: document.getElementById('copyLogBtn'),
     clearLogBtn: document.getElementById('clearLogBtn'),
@@ -127,10 +125,6 @@ async function init() {
     await createInitialTab();
     await loadBookmarks();
     await loadSettings();
-    // 翻译引擎在主进程被切换时同步刷新 UI
-    if (window.electronAPI.onTranslationEngineChanged) {
-        window.electronAPI.onTranslationEngineChanged(() => renderTranslationEngines());
-    }
     console.log('[APP] 初始化完成');
 }
 
@@ -1262,7 +1256,7 @@ function togglePanel(panelName) {
             case 'history': loadHistory(); break;
             case 'log': loadLogs(); break;
             case 'settings': loadSettings(); break;
-            case 'translate': renderTranslationEngines(); break;
+            case 'translate': setupImmersiveSettingsButtons(); break;
             case 'extensions': loadExtensionsList(); break;
         }
     }
@@ -1927,46 +1921,31 @@ async function loadSettings() {
         }
         // 加载已标记广告规则
         await loadCustomAdRules();
-        // 加载翻译引擎列表
-        await renderTranslationEngines();
+        // 绑定"打开沉浸式翻译设置"按钮
+        setupImmersiveSettingsButtons();
     } catch (error) {
         console.error('加载设置失败:', error);
     }
 }
 
-// 渲染翻译引擎切换器（翻译面板 + 设置面板共用；每次只用一个引擎）
-async function renderTranslationEngines() {
-    const listContainers = [elements.translateEngineList, elements.settingsEngineList].filter(Boolean);
-    if (listContainers.length === 0) return;
-    try {
-        const data = await window.electronAPI.getTranslationEngines();
-        const active = data.active || 'imt';
-        // 不再展示"内置翻译"选项（EdgeTranslate/MyMemory 在用户机器上多数情况下要登录/受限；
-        // 真正可用的引擎是浏览器里装好的翻译扩展，由红色悬浮翻译按钮统一调度）
-        const engines = (data.engines || []).map(e => ({ engine: e.engine, name: e.name, loaded: e.loaded }));
-        const html = engines.map(e => {
-            const isActive = e.engine === active;
-            const status = e.loaded ? '' : ' <span class="eng-status">未装</span>';
-            const title = e.loaded ? '' : '本机 Edge/Chrome 未检测到该扩展，请先在 Edge 中安装';
-            return '<button class="translate-engine-chip' + (isActive ? ' active' : '') + '" data-engine="' + e.engine + '" title="' + title + '">' + e.name + status + '</button>';
-        }).join('');
-        listContainers.forEach(el => {
-            el.innerHTML = html;
-            el.querySelectorAll('.translate-engine-chip').forEach(chip => {
-                chip.addEventListener('click', async () => {
-                    const engineId = chip.dataset.engine;
-                    const res = await window.electronAPI.setTranslationEngine(engineId);
-                    if (res && res.success) {
-                        await renderTranslationEngines();
-                    } else {
-                        alert((res && res.error) || '切换翻译引擎失败');
-                    }
-                });
-            });
+// 绑定"打开沉浸式翻译设置"按钮（翻译面板 + 设置面板）
+// 翻译统一由沉浸式翻译提供（页面右侧粉色浮球）。换服务：设置页 → 基本设置 → 翻译服务。
+function setupImmersiveSettingsButtons() {
+    ['openImmersiveSettingsBtn', 'openImmersiveSettingsBtn2'].forEach(id => {
+        const btn = document.getElementById(id);
+        if (!btn || btn.dataset.bound) return;
+        btn.dataset.bound = '1';
+        btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            try {
+                await window.electronAPI.openImmersiveSettings();
+            } catch (e) {
+                console.error('打开沉浸式设置失败:', e);
+            } finally {
+                btn.disabled = false;
+            }
         });
-    } catch (error) {
-        console.error('渲染翻译引擎失败:', error);
-    }
+    });
 }
 
 // 加载已标记广告规则列表
