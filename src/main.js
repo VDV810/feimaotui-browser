@@ -311,9 +311,7 @@ const globalState = {
     privacyMode: false,
     adblockEnabled: true,
     mediaSniffingEnabled: true,
-    fontSize: 16,
-    autoTranslate: true,
-    alwaysTranslateNonCjk: true
+    fontSize: 16
   },
   mediaUrls: new Map(),
   mediaSizeCache: new Map(), // URL → file size (bytes) from response headers, used when video-element sniffing doesn't have size
@@ -2138,87 +2136,28 @@ function extractGoPhpTarget(rawUrl) {
   return null;
 }
 
-// ==================== 统一翻译按钮 + 隐藏扩展浮窗 ====================
-// 每个页面加载完毕后注入：
-//   1. CSS 隐藏所有翻译扩展的浮窗按钮（沉浸式浮球/有道/火山/字幕精灵/轻氧）
-//   2. 一个浏览器自己的红色悬浮翻译按钮（统一入口，所有引擎走这一个）
-//   3. 点击按钮 → console.log 一个特殊标记 → 主进程 console-message 监听捕获 → 触发当前引擎翻译
-function getTranslateButtonInjectionScript() {
+// ==================== 隐藏其他翻译扩展注入页面的悬浮 UI ====================
+// 用户只保留沉浸式翻译自带的粉色浮球（imt-fb-* 类）作为唯一翻译入口，
+// 其他翻译扩展注入页面的悬浮按钮一律 CSS 隐藏（选择器均经扩展源码核实，不会误伤沉浸式）：
+//   - 有道灵动翻译: .floating-ball 悬浮球 + yd-mg-* / yd-image-ocr 自定义元素
+//   - 字幕精灵: xykj-* 工具条
+//   - 轻氧翻译: #qyt-floating-ball / qyt-fb-*
+// 沉浸式浮球用的是 imt-fb-container / imt-fb-btn 等类，源码中不含 "floating-ball" 字符串，不受影响。
+function getHideExtFloatUiScript() {
   return `
 (function(){
-  // 1) 隐藏所有翻译扩展的浮窗 UI（沉浸式浮球 + 4 个新引擎的浮窗）
-  var hideStyle = document.getElementById('feimaotui-hide-ext-ui');
-  if (!hideStyle) {
-    hideStyle = document.createElement('style');
-    hideStyle.id = 'feimaotui-hide-ext-ui';
-    hideStyle.textContent = [
-      // 沉浸式翻译浮球/面板
-      '[class*="imt-float"], [id*="imt-float"], .imt-fab, #imt-fab, .imt-float-ball, #imt-float-ball, .imt-ball, #imt-ball, [class*="immersive-translate"][class*="float"]',
-      // 字幕精灵 NewTranx
-      '[class*="newtranx"], [id*="newtranx"], [class*="NewTranx"], [id*="NewTranx"]',
-      // 火山翻译
-      '[class*="volcengine-float"], [id*="volcengine-float"], [class*="huoshan-float"], [id*="huoshan-float"]',
-      // 有道翻译
-      '[class*="youdao-float"], [id*="youdao-float"]',
-      // 轻氧翻译
-      '[class*="qy-translate-float"], [id*="qy-translate-float"]'
-    ].join('{display:none !important;visibility:hidden !important;height:0 !important;overflow:hidden !important;}') + '{display:none !important;visibility:hidden !important;height:0 !important;overflow:hidden !important;}';
-    (document.head || document.documentElement).appendChild(hideStyle);
-  }
-
-  // 2) 浏览器自己的红色悬浮翻译按钮（统一入口）
-  if (document.getElementById('feimaotui-translate-btn')) return;
-  var btn = document.createElement('div');
-  btn.id = 'feimaotui-translate-btn';
-  btn.setAttribute('data-feimaotui', 'translate-btn');
-  btn.innerHTML = '<span style="font-size:16px;font-weight:bold;color:#fff;font-family:Microsoft YaHei,sans-serif;line-height:1;pointer-events:none;">译</span>';
-  btn.style.cssText = 'position:fixed !important;right:15px !important;top:50% !important;transform:translateY(-50%) !important;z-index:2147483647 !important;width:40px !important;height:40px !important;border-radius:50% !important;background:linear-gradient(135deg,#e65100,#bf360c) !important;box-shadow:0 4px 12px rgba(0,0,0,0.3) !important;cursor:pointer !important;display:flex !important;align-items:center !important;justify-content:center !important;user-select:none !important;transition:transform 0.15s,box-shadow 0.15s !important;';
-  btn.title = '点击翻译当前页面（统一翻译按钮）';
-  btn.addEventListener('mouseenter', function(){ btn.style.transform = 'translateY(-50%) scale(1.1)'; btn.style.boxShadow = '0 6px 16px rgba(0,0,0,0.4)'; });
-  btn.addEventListener('mouseleave', function(){ btn.style.transform = 'translateY(-50%) scale(1)'; btn.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)'; });
-  btn.addEventListener('click', function(e){
-    e.stopPropagation();
-    // 用 console 特殊标记通知主进程（主进程 console-message 监听捕获）
-    console.log('__FEIMAOTUI_TRANSLATE_REQUEST__');
-  });
-  (document.body || document.documentElement).appendChild(btn);
+  if (document.getElementById('feimaotui-hide-ext-ui')) return;
+  var s = document.createElement('style');
+  s.id = 'feimaotui-hide-ext-ui';
+  s.textContent = [
+    '.floating-ball',
+    'yd-mg-icon', 'yd-mg-huaci', 'yd-mg-block-icon', 'yd-image-ocr',
+    '[class*="xykj-"]',
+    '#qyt-floating-ball', '[class*="qyt-fb-"]'
+  ].join(',') + '{display:none !important;visibility:hidden !important;}';
+  (document.head || document.documentElement).appendChild(s);
 })();
   `;
-}
-
-// 在主进程监听每个 BrowserView 的 console-message，捕获翻译按钮点击
-function attachTranslateButtonListener(webContents) {
-  if (!webContents || webContents.__feimaotuiTranslateAttached) return;
-  webContents.__feimaotuiTranslateAttached = true;
-  webContents.on('console-message', (event, level, message) => {
-    // Electron 可能在某些版本把 event 合并成 (event, level, message, line, sourceId)
-    const msg = (typeof event === 'string') ? event : (message || '');
-    if (msg === '__FEIMAOTUI_TRANSLATE_REQUEST__') {
-      // 找到这个 webContents 对应的 tabId，触发翻译
-      const tab = globalState.tabs && [...globalState.tabs.values()].find(t => t.webContents === webContents);
-      if (tab) triggerFloatingTranslateButton(tab.id);
-    }
-  });
-}
-
-// 统一翻译按钮点击后的引擎分发
-async function triggerFloatingTranslateButton(tabId) {
-  const tab = globalState.tabs.get(tabId);
-  if (!tab || !tab.webContents || tab.webContents.isDestroyed()) return;
-  const engine = getActiveTranslationEngine();
-  addLog('TRANSLATE', '悬浮翻译按钮点击', `引擎=${engine}`);
-  if (engine === 'builtin') {
-    // 内置引擎：直接走页面翻译
-    await translatePageContent(tab, 'zh', { force: false }).catch(e => addLog('TRANSLATE', '悬浮按钮翻译失败', e.message));
-  } else {
-    // 扩展引擎：给页面里发个 keyboard 事件触发沉浸式翻译/有道/火山的页面翻译快捷键，
-    // 或通过 chrome.tabs.executeScript 触发——但最稳妥的是提示用户。
-    // 做法：直接给所有 tab 发一个 click 事件到浏览器自身的 chrome.commands 绑定的快捷键
-    // 简化做法：弹出 toast（通过主窗口 webContents 发送），并尝试模拟 Alt+A（沉浸式的页面翻译快捷键）
-    const item = TRANSLATION_EXTENSIONS.find(x => x.engine === engine);
-    const name = item ? item.name : engine;
-    showTranslateStatus(tab, '已切换到「' + name + '」，请使用其翻译功能').catch(() => {});
-  }
 }
 
 function createTab(url = null, options = {}) {
@@ -2239,9 +2178,6 @@ function createTab(url = null, options = {}) {
       partition: options.privacyMode ? 'persist:privacy' : 'persist:main'
     }
   });
-
-  // 监听统一翻译按钮的点击（通过 console-message 捕获）
-  attachTranslateButtonListener(view.webContents);
 
   // 伪装成 Chrome/Edge 浏览器，避免网页因检测到 Electron 而禁用功能
   // Edge 插件商店需要 UA 里带 Edg/ 令牌，否则虽然显示"兼容"但安装流程走不通
@@ -2341,12 +2277,10 @@ function createTab(url = null, options = {}) {
       }
     }
 
-    // 注入统一翻译按钮 + 隐藏所有翻译扩展的浮窗
+    // 注入 CSS：隐藏其他翻译扩展的悬浮 UI（只留沉浸式自带的粉色浮球）
     try {
-      view.webContents.executeJavaScript(getTranslateButtonInjectionScript()).catch(() => {});
+      view.webContents.executeJavaScript(getHideExtFloatUiScript()).catch(() => {});
     } catch (e) {}
-
-        if (BUILTIN_TRANSLATE_ENABLED && isBuiltinTranslateActive()) setTimeout(() => autoTranslatePageIfNeeded(tabId), 1200);
 
     // ==================== go.php / 中转页兜底 ====================
     // 若页面仍然停留在 go.php?url=base64... 之类的中转地址(标题为"温馨提示"等)，
@@ -3572,18 +3506,6 @@ function isQuotaError(error) {
   return /quota|limit|too many|429|exhaust|rate.?limit|额度|已用尽|请稍后|throttl/.test(msg);
 }
 
-// 打开指定扩展的 popup 浮窗，让用户在该扩展自己的界面里触发翻译
-// 注意：Electron 42 在独立 BrowserWindow 加载 chrome-extension://<id>/popup.html 会渲染空白，
-// 因此改为：在当前页面显示一条提示，让用户使用页面上的红色悬浮翻译按钮（已统一入口），
-// 或者直接使用扩展自带的快捷键。返回 success: true 让 IPC 走 hint 分支。
-function openExtensionPopup(extId) {
-  const item = TRANSLATION_EXTENSIONS.find(x => x.id === extId);
-  const name = item ? item.name : extId;
-  addLog('TRANSLATE', '提示用户使用统一翻译按钮', name);
-  // 不再打开空白浮窗——改为返回提示，由渲染层显示
-  return { success: true, useUnifiedButton: true, name };
-}
-
 async function translateText(text, targetLang = 'zh') {
   const sourceText = String(text || '').trim();
   if (!sourceText) return { success: true, text: '', sourceLang: 'auto', targetLang };
@@ -3673,24 +3595,6 @@ async function translateTextBatch(texts, targetLang = 'zh') {
   }
 }
 
-async function detectNonCjkPage(tab) {
-  if (!tab || !tab.webContents) return false;
-  try {
-    const sample = await tab.webContents.executeJavaScript(`(() => {
-      const title = document.title || '';
-      const meta = document.querySelector('meta[name="description"]')?.content || '';
-      const body = (document.body?.innerText || '').replace(/\\s+/g, ' ').slice(0, 2500);
-      return [title, meta, body].join(' ');
-    })()`);
-    const cjkChars = (sample.match(/[\\u3040-\\u30ff\\u3400-\\u9fff\\uf900-\\ufaff]/g) || []).length;
-    const nonCjkChars = (sample.match(/[A-Za-zÀ-ÿĀ-žА-яЁё]/g) || []).length;
-    return nonCjkChars > 80 && nonCjkChars > cjkChars * 3;
-  } catch (error) {
-    addLog('TRANSLATE', '检测非 CJK 页面失败', error.message);
-    return false;
-  }
-}
-
 const MAX_TRANSLATE_NODES = 1500;
 
 async function showTranslateStatus(tab, message) {
@@ -3773,54 +3677,6 @@ async function translatePageContent(tab, targetLang = 'zh', options = {}) {
   const replacedCount = await tab.webContents.executeJavaScript(inject);
   await showTranslateStatus(tab, `翻译完成：${replacedCount} 处`);
   return { success: true, message: '页面翻译完成', translatedCount: replacedCount };
-}
-
-function scheduleDynamicAutoTranslate(tabId) {
-  [2500, 6000, 12000].forEach(delay => {
-    setTimeout(async () => {
-      const tab = globalState.tabs.get(tabId);
-      if (!tab || !tab.webContents || tab.webContents.isDestroyed()) return;
-      try {
-        const result = await translatePageContent(tab, 'zh', { force: false });
-        addLog('TRANSLATE', '动态内容补翻译完成', `延迟 ${delay}ms，翻译 ${result.translatedCount || 0} 处`);
-      } catch (error) {
-        addLog('TRANSLATE', '动态内容补翻译失败', error.message);
-      }
-    }, delay);
-  });
-}
-
-async function autoTranslateFullPage(tabId) {
-  const tab = globalState.tabs.get(tabId);
-  if (!tab || !tab.webContents || tab.webContents.isDestroyed()) return;
-  await showTranslateStatus(tab, '检测到外文页面，正在自动翻译...');
-  const result = await translatePageContent(tab, 'zh', { force: false });
-  scheduleDynamicAutoTranslate(tabId);
-  return result;
-}
-
-async function autoTranslatePageIfNeeded(tabId) {
-  if (!BUILTIN_TRANSLATE_ENABLED || !isBuiltinTranslateActive()) return;
-  const tab = globalState.tabs.get(tabId);
-  if (!tab || !tab.webContents || globalState.settings.autoTranslate === false) return;
-  const url = tab.webContents.getURL();
-  if (!url || url.startsWith('about:') || url.startsWith('file:')) return;
-
-  try {
-    const alreadyTranslated = await tab.webContents.executeJavaScript(`document.documentElement.dataset.feimaotuiTranslated === 'zh'`);
-    if (alreadyTranslated) return;
-    const shouldTranslateNonCjk = await detectNonCjkPage(tab);
-    if (!shouldTranslateNonCjk) return;
-    if (url.includes('en.people.cn')) {
-      addLog('TRANSLATE', '检测到 en.people.cn 非 CJK 页面，开始 EdgeTranslate 自动翻译', url);
-    } else {
-      addLog('TRANSLATE', '检测到非 CJK 页面，开始 EdgeTranslate 自动翻译', url);
-    }
-    const result = await autoTranslateFullPage(tabId);
-    addLog('TRANSLATE', result.success ? '自动翻译完成' : '自动翻译失败', result.success ? `翻译 ${result.translatedCount} 处` : result.error);
-  } catch (error) {
-    addLog('TRANSLATE', '自动翻译异常', error.message);
-  }
 }
 
 // ==================== 浏览器扩展管理（把 Edge/Chrome 扩展商店的扩展安装进飞毛腿内核） ====================
@@ -5486,7 +5342,7 @@ function setupIPC() {
       return {
         success: false,
         engine,
-        hint: `当前引擎「${item.name}」，请点页面右侧红色「译」按钮触发翻译`
+        hint: `当前引擎「${item.name}」，请使用该扩展在页面上的翻译入口（当前默认显示为沉浸式粉色浮球）`
       };
     }
     return { success: false, error: '当前翻译引擎不可用' };
@@ -5507,7 +5363,7 @@ function setupIPC() {
       return {
         success: false,
         engine,
-        hint: `当前引擎「${item.name}」，请点页面右侧红色「译」按钮触发翻译`
+        hint: `当前引擎「${item.name}」，请使用该扩展在页面上的翻译入口（当前默认显示为沉浸式粉色浮球）`
       };
     }
     return { success: false, error: '当前翻译引擎不可用' };

@@ -84,8 +84,6 @@ const elements = {
     fontSizeValue: document.getElementById('fontSizeValue'),
     adblockCheckbox: document.getElementById('adblockCheckbox'),
     darkModeCheckbox: document.getElementById('darkModeCheckbox'),
-    autoTranslateCheckbox: document.getElementById('autoTranslateCheckbox'),
-    alwaysTranslateNonCjkCheckbox: document.getElementById('alwaysTranslateNonCjkCheckbox'),
     selectDownloadPathBtn: document.getElementById('selectDownloadPathBtn'),
     clearHistoryBtn: document.getElementById('clearHistoryBtn'),
     customAdRulesList: document.getElementById('customAdRulesList'),
@@ -389,12 +387,6 @@ function setupEventListeners() {
     }
     if (elements.darkModeCheckbox) {
         elements.darkModeCheckbox.addEventListener('change', updateSettings);
-    }
-    if (elements.autoTranslateCheckbox) {
-        elements.autoTranslateCheckbox.addEventListener('change', updateSettings);
-    }
-    if (elements.alwaysTranslateNonCjkCheckbox) {
-        elements.alwaysTranslateNonCjkCheckbox.addEventListener('change', updateSettings);
     }
     if (elements.fontSizeRange) {
         elements.fontSizeRange.addEventListener('input', () => {
@@ -850,9 +842,6 @@ function setupIPCEvents() {
             renderTabs();
             updateUI();
             if (data.url && tab.id === appState.activeTabId) updateBookmarkStar(data.url);
-            if (data.title && !appState.settings.autoTranslateChecked) {
-                checkAutoTranslate(data.tabId, data.url, data.title);
-            }
         }
     });
 
@@ -1043,22 +1032,6 @@ function setupIPCEvents() {
             appState.dragPayload = null;
             appState.overflowPopupOpen = false;
         });
-    }
-}
-
-// 检测英文网页自动翻译
-async function checkAutoTranslate(tabId, url, title) {
-    if (!url || url === 'about:blank') return;
-    if (appState.settings.autoTranslate === false) return;
-    const englishPattern = /^[\x00-\x7F]+$/;
-    const hasChinese = /[\u4e00-\u9fff]/.test(title);
-    if (englishPattern.test(title) && !hasChinese && title.length > 5) {
-        console.log('检测到英文页面，自动翻译:', title);
-        try {
-            await window.electronAPI.translatePage(tabId, 'zh');
-        } catch (e) {
-            console.error('自动翻译失败:', e);
-        }
     }
 }
 
@@ -1936,8 +1909,6 @@ async function loadSettings() {
         if (elements.adblockCheckbox) elements.adblockCheckbox.checked = settings.adblockEnabled !== false;
         if (elements.mediaSniffToggle) elements.mediaSniffToggle.checked = settings.mediaSniffingEnabled !== false;
         if (elements.darkModeCheckbox) elements.darkModeCheckbox.checked = settings.darkMode || false;
-        if (elements.autoTranslateCheckbox) elements.autoTranslateCheckbox.checked = settings.autoTranslate !== false;
-        if (elements.alwaysTranslateNonCjkCheckbox) elements.alwaysTranslateNonCjkCheckbox.checked = settings.alwaysTranslateNonCjk !== false;
         if (settings.darkMode) {
             document.body.classList.add('dark-mode');
         } else {
@@ -2049,8 +2020,6 @@ async function updateSettings() {
             adblockEnabled: elements.adblockCheckbox ? elements.adblockCheckbox.checked : true,
             mediaSniffingEnabled: elements.mediaSniffToggle ? elements.mediaSniffToggle.checked : true,
             darkMode: elements.darkModeCheckbox ? elements.darkModeCheckbox.checked : false,
-            autoTranslate: elements.autoTranslateCheckbox ? elements.autoTranslateCheckbox.checked : true,
-            alwaysTranslateNonCjk: elements.alwaysTranslateNonCjkCheckbox ? elements.alwaysTranslateNonCjkCheckbox.checked : true
         };
         await window.electronAPI.updateSettings(newSettings);
         Object.assign(appState.settings, newSettings);
