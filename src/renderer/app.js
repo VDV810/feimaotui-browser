@@ -1970,10 +1970,9 @@ async function renderTranslationEngines() {
     try {
         const data = await window.electronAPI.getTranslationEngines();
         const active = data.active || 'imt';
-        const engines = [
-            { engine: 'builtin', name: '内置翻译', loaded: true },
-            ...(data.engines || []).map(e => ({ engine: e.engine, name: e.name, loaded: e.loaded }))
-        ];
+        // 不再展示"内置翻译"选项（EdgeTranslate/MyMemory 在用户机器上多数情况下要登录/受限；
+        // 真正可用的引擎是浏览器里装好的翻译扩展，由红色悬浮翻译按钮统一调度）
+        const engines = (data.engines || []).map(e => ({ engine: e.engine, name: e.name, loaded: e.loaded }));
         const html = engines.map(e => {
             const isActive = e.engine === active;
             const status = e.loaded ? '' : ' <span class="eng-status">未装</span>';

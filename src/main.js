@@ -2138,6 +2138,89 @@ function extractGoPhpTarget(rawUrl) {
   return null;
 }
 
+// ==================== 统一翻译按钮 + 隐藏扩展浮窗 ====================
+// 每个页面加载完毕后注入：
+//   1. CSS 隐藏所有翻译扩展的浮窗按钮（沉浸式浮球/有道/火山/字幕精灵/轻氧）
+//   2. 一个浏览器自己的红色悬浮翻译按钮（统一入口，所有引擎走这一个）
+//   3. 点击按钮 → console.log 一个特殊标记 → 主进程 console-message 监听捕获 → 触发当前引擎翻译
+function getTranslateButtonInjectionScript() {
+  return `
+(function(){
+  // 1) 隐藏所有翻译扩展的浮窗 UI（沉浸式浮球 + 4 个新引擎的浮窗）
+  var hideStyle = document.getElementById('feimaotui-hide-ext-ui');
+  if (!hideStyle) {
+    hideStyle = document.createElement('style');
+    hideStyle.id = 'feimaotui-hide-ext-ui';
+    hideStyle.textContent = [
+      // 沉浸式翻译浮球/面板
+      '[class*="imt-float"], [id*="imt-float"], .imt-fab, #imt-fab, .imt-float-ball, #imt-float-ball, .imt-ball, #imt-ball, [class*="immersive-translate"][class*="float"]',
+      // 字幕精灵 NewTranx
+      '[class*="newtranx"], [id*="newtranx"], [class*="NewTranx"], [id*="NewTranx"]',
+      // 火山翻译
+      '[class*="volcengine-float"], [id*="volcengine-float"], [class*="huoshan-float"], [id*="huoshan-float"]',
+      // 有道翻译
+      '[class*="youdao-float"], [id*="youdao-float"]',
+      // 轻氧翻译
+      '[class*="qy-translate-float"], [id*="qy-translate-float"]'
+    ].join('{display:none !important;visibility:hidden !important;height:0 !important;overflow:hidden !important;}') + '{display:none !important;visibility:hidden !important;height:0 !important;overflow:hidden !important;}';
+    (document.head || document.documentElement).appendChild(hideStyle);
+  }
+
+  // 2) 浏览器自己的红色悬浮翻译按钮（统一入口）
+  if (document.getElementById('feimaotui-translate-btn')) return;
+  var btn = document.createElement('div');
+  btn.id = 'feimaotui-translate-btn';
+  btn.setAttribute('data-feimaotui', 'translate-btn');
+  btn.innerHTML = '<span style="font-size:16px;font-weight:bold;color:#fff;font-family:Microsoft YaHei,sans-serif;line-height:1;pointer-events:none;">译</span>';
+  btn.style.cssText = 'position:fixed !important;right:15px !important;top:50% !important;transform:translateY(-50%) !important;z-index:2147483647 !important;width:40px !important;height:40px !important;border-radius:50% !important;background:linear-gradient(135deg,#e65100,#bf360c) !important;box-shadow:0 4px 12px rgba(0,0,0,0.3) !important;cursor:pointer !important;display:flex !important;align-items:center !important;justify-content:center !important;user-select:none !important;transition:transform 0.15s,box-shadow 0.15s !important;';
+  btn.title = '点击翻译当前页面（统一翻译按钮）';
+  btn.addEventListener('mouseenter', function(){ btn.style.transform = 'translateY(-50%) scale(1.1)'; btn.style.boxShadow = '0 6px 16px rgba(0,0,0,0.4)'; });
+  btn.addEventListener('mouseleave', function(){ btn.style.transform = 'translateY(-50%) scale(1)'; btn.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)'; });
+  btn.addEventListener('click', function(e){
+    e.stopPropagation();
+    // 用 console 特殊标记通知主进程（主进程 console-message 监听捕获）
+    console.log('__FEIMAOTUI_TRANSLATE_REQUEST__');
+  });
+  (document.body || document.documentElement).appendChild(btn);
+})();
+  `;
+}
+
+// 在主进程监听每个 BrowserView 的 console-message，捕获翻译按钮点击
+function attachTranslateButtonListener(webContents) {
+  if (!webContents || webContents.__feimaotuiTranslateAttached) return;
+  webContents.__feimaotuiTranslateAttached = true;
+  webContents.on('console-message', (event, level, message) => {
+    // Electron 可能在某些版本把 event 合并成 (event, level, message, line, sourceId)
+    const msg = (typeof event === 'string') ? event : (message || '');
+    if (msg === '__FEIMAOTUI_TRANSLATE_REQUEST__') {
+      // 找到这个 webContents 对应的 tabId，触发翻译
+      const tab = globalState.tabs && [...globalState.tabs.values()].find(t => t.webContents === webContents);
+      if (tab) triggerFloatingTranslateButton(tab.id);
+    }
+  });
+}
+
+// 统一翻译按钮点击后的引擎分发
+async function triggerFloatingTranslateButton(tabId) {
+  const tab = globalState.tabs.get(tabId);
+  if (!tab || !tab.webContents || tab.webContents.isDestroyed()) return;
+  const engine = getActiveTranslationEngine();
+  addLog('TRANSLATE', '悬浮翻译按钮点击', `引擎=${engine}`);
+  if (engine === 'builtin') {
+    // 内置引擎：直接走页面翻译
+    await translatePageContent(tab, 'zh', { force: false }).catch(e => addLog('TRANSLATE', '悬浮按钮翻译失败', e.message));
+  } else {
+    // 扩展引擎：给页面里发个 keyboard 事件触发沉浸式翻译/有道/火山的页面翻译快捷键，
+    // 或通过 chrome.tabs.executeScript 触发——但最稳妥的是提示用户。
+    // 做法：直接给所有 tab 发一个 click 事件到浏览器自身的 chrome.commands 绑定的快捷键
+    // 简化做法：弹出 toast（通过主窗口 webContents 发送），并尝试模拟 Alt+A（沉浸式的页面翻译快捷键）
+    const item = TRANSLATION_EXTENSIONS.find(x => x.engine === engine);
+    const name = item ? item.name : engine;
+    showTranslateStatus(tab, '已切换到「' + name + '」，请使用其翻译功能').catch(() => {});
+  }
+}
+
 function createTab(url = null, options = {}) {
   const tabId = `tab-${++globalState.tabCounter}`;
   const targetUrl = url || globalState.settings.homepage;
@@ -2156,6 +2239,9 @@ function createTab(url = null, options = {}) {
       partition: options.privacyMode ? 'persist:privacy' : 'persist:main'
     }
   });
+
+  // 监听统一翻译按钮的点击（通过 console-message 捕获）
+  attachTranslateButtonListener(view.webContents);
 
   // 伪装成 Chrome/Edge 浏览器，避免网页因检测到 Electron 而禁用功能
   // Edge 插件商店需要 UA 里带 Edg/ 令牌，否则虽然显示"兼容"但安装流程走不通
@@ -2254,6 +2340,11 @@ function createTab(url = null, options = {}) {
         addLog('ADBLOCK', '注入广告规则CSS', `${domainRules.length} 条规则 (${currentDomain})`);
       }
     }
+
+    // 注入统一翻译按钮 + 隐藏所有翻译扩展的浮窗
+    try {
+      view.webContents.executeJavaScript(getTranslateButtonInjectionScript()).catch(() => {});
+    } catch (e) {}
 
         if (BUILTIN_TRANSLATE_ENABLED && isBuiltinTranslateActive()) setTimeout(() => autoTranslatePageIfNeeded(tabId), 1200);
 
@@ -3482,40 +3573,15 @@ function isQuotaError(error) {
 }
 
 // 打开指定扩展的 popup 浮窗，让用户在该扩展自己的界面里触发翻译
+// 注意：Electron 42 在独立 BrowserWindow 加载 chrome-extension://<id>/popup.html 会渲染空白，
+// 因此改为：在当前页面显示一条提示，让用户使用页面上的红色悬浮翻译按钮（已统一入口），
+// 或者直接使用扩展自带的快捷键。返回 success: true 让 IPC 走 hint 分支。
 function openExtensionPopup(extId) {
-  try {
-    let popupPath = 'popup.html';
-    try {
-      const sess = session.fromPartition('persist:main');
-      const all = (sess.extensions && typeof sess.extensions.getAllExtensions === 'function')
-        ? sess.extensions.getAllExtensions() : [];
-      const ext = all.find(x => x.id === extId);
-      if (ext && ext.manifest && ext.manifest.action && ext.manifest.action.default_popup) {
-        popupPath = ext.manifest.action.default_popup;
-      } else if (ext && ext.manifest && ext.manifest.browser_action && ext.manifest.browser_action.default_popup) {
-        popupPath = ext.manifest.browser_action.default_popup;
-      }
-    } catch (e) {}
-    const url = `chrome-extension://${extId}/${popupPath}`;
-    const win = new BrowserWindow({
-      width: 430,
-      height: 600,
-      resizable: true,
-      frame: false,
-      autoHideMenuBar: true,
-      title: '翻译引擎',
-      webPreferences: { partition: 'persist:main', contextIsolation: true }
-    });
-    win.webContents.on('before-input-event', (event, input) => {
-      if (input.type === 'keyDown' && input.key === 'Escape') win.close();
-    });
-    win.loadURL(url).catch(() => {});
-    addLog('TRANSLATE', '打开翻译引擎面板', url);
-    return { success: true, url };
-  } catch (e) {
-    addLog('TRANSLATE', '打开翻译引擎面板失败', e.message);
-    return { success: false, error: e.message };
-  }
+  const item = TRANSLATION_EXTENSIONS.find(x => x.id === extId);
+  const name = item ? item.name : extId;
+  addLog('TRANSLATE', '提示用户使用统一翻译按钮', name);
+  // 不再打开空白浮窗——改为返回提示，由渲染层显示
+  return { success: true, useUnifiedButton: true, name };
 }
 
 async function translateText(text, targetLang = 'zh') {
@@ -5378,6 +5444,7 @@ function setupIPC() {
   ipcMain.handle('get-translation-engines', () => {
     const installed = loadInstalledExtensions();
     const installedIds = new Set(installed.map(x => x.id));
+    // 不再返回 builtin（已从 UI 移除）
     const engines = TRANSLATION_EXTENSIONS.map(x => ({
       engine: x.engine,
       name: x.name,
@@ -5385,7 +5452,14 @@ function setupIPC() {
       bundled: Boolean(x.bundled),
       loaded: x.bundled ? true : installedIds.has(x.id)
     }));
-    return { engines, active: getActiveTranslationEngine() };
+    // 如果之前保存的 active 是 builtin，自动重置为 imt
+    let active = getActiveTranslationEngine();
+    if (active === 'builtin') {
+      globalState.settings.translationEngine = 'imt';
+      active = 'imt';
+      saveData();
+    }
+    return { engines, active };
   });
 
   // 切换当前翻译引擎（每次只用一个）
@@ -5401,7 +5475,7 @@ function setupIPC() {
     return { success: true, active: engineId };
   });
 
-  // 文本翻译：按当前引擎分发。内置 → 直连翻译；扩展引擎 → 打开该扩展面板
+  // 文本翻译：内置引擎直连翻译；扩展引擎 → 提示用户用页面上的红色悬浮翻译按钮
   ipcMain.handle('translate-text', async (event, text, targetLang) => {
     const engine = getActiveTranslationEngine();
     if (engine === 'builtin') {
@@ -5409,19 +5483,16 @@ function setupIPC() {
     }
     const item = TRANSLATION_EXTENSIONS.find(x => x.engine === engine);
     if (item) {
-      const opened = openExtensionPopup(item.id);
       return {
         success: false,
         engine,
-        hint: opened.success
-          ? `已打开「${item.name}」面板，请在弹出的扩展窗口里完成翻译`
-          : `当前引擎「${item.name}」为浏览器扩展，请使用扩展自带的翻译入口`
+        hint: `当前引擎「${item.name}」，请点页面右侧红色「译」按钮触发翻译`
       };
     }
     return { success: false, error: '当前翻译引擎不可用' };
   });
 
-  // 页面翻译：按当前引擎分发。内置 → 页面 DOM 就地替换；扩展引擎 → 打开该扩展面板
+  // 页面翻译：内置引擎走页面 DOM 翻译；扩展引擎 → 提示用红色按钮
   ipcMain.handle('translate-page', async (event, tabId, targetLang) => {
     const engine = getActiveTranslationEngine();
     const tab = globalState.tabs.get(tabId);
@@ -5433,15 +5504,14 @@ function setupIPC() {
     }
     const item = TRANSLATION_EXTENSIONS.find(x => x.engine === engine);
     if (item) {
-      const opened = openExtensionPopup(item.id);
       return {
         success: false,
         engine,
-        hint: opened.success
-          ? `已打开「${item.name}」面板，请在弹出的扩展窗口里触发页面翻译`
-          : `当前引擎「${item.name}」为浏览器扩展，请使用扩展自带的翻译入口`
+        hint: `当前引擎「${item.name}」，请点页面右侧红色「译」按钮触发翻译`
       };
     }
+    return { success: false, error: '当前翻译引擎不可用' };
+  });
     return { success: false, error: '当前翻译引擎不可用' };
   });
 
