@@ -1,3 +1,5 @@
+/* FEIMAOTUI-PATCH: Electron 的 chrome.tabs 无 create，SW 环境置为 no-op 防崩 */
+(function(){try{if(typeof chrome!=='undefined'&&chrome&&chrome.tabs){if(typeof chrome.tabs.create!=='function'){chrome.tabs.create=function(){return Promise.resolve({id:-1});};}}}catch(e){}})();
 // 沉浸式翻译默认配置 V5：回退到"点一下才翻"+"中英对照"，并强制用免费翻译服务
 // V3(散 key 失败) → V4(写对 fullLocalUserConfig,单语自动翻译) → V5(回退:双语手动,强制Bing防登录墙)
 // 用户反馈:Bing 接口曾 2 个月后失效;为免沉浸式翻译弹"登录后继续"强制锁定 translationService=bing

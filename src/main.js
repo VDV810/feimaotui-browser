@@ -5358,6 +5358,20 @@ function setupIPC() {
     }
   });
 
+  // 地址栏原生粘贴兜底（Chromium 禁止渲染层 execCommand('paste')，Ctrl+V 同源的原生实现）
+  ipcMain.handle('native-address-paste', () => {
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.focus();
+        mainWindow.webContents.paste();
+        return { success: true };
+      }
+      return { success: false };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  });
+
   // 文本翻译：内置引擎直连翻译；扩展引擎 → 提示用户用页面上的粉色浮球
   ipcMain.handle('translate-text', async (event, text, targetLang) => {
     const engine = getActiveTranslationEngine();

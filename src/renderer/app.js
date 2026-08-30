@@ -972,13 +972,36 @@ function setupIPCEvents() {
 
     // 地址栏右键菜单动作回调（来自主进程原生 Menu）
     if (window.electronAPI.onAddressBarAction) {
+// 地址栏粘贴：execCommand('paste') 被 Chromium 禁止（静默无效），改用 Clipboard API；
+// 失败时回退到主进程原生粘贴（等同 Ctrl+V）
+async function pasteIntoAddressBar() {
+    const input = elements.addressInput;
+    if (!input) return;
+    let text = '';
+    try {
+        text = await navigator.clipboard.readText();
+    } catch (e) {
+        console.error('读取剪贴板失败，尝试原生粘贴:', e);
+        try { input.focus(); await window.electronAPI.nativeAddressPaste(); } catch (e2) {}
+        return;
+    }
+    if (!text) return;
+    input.focus();
+    const start = input.selectionStart === null ? input.value.length : input.selectionStart;
+    const end = input.selectionEnd === null ? input.value.length : input.selectionEnd;
+    input.value = input.value.slice(0, start) + text + input.value.slice(end);
+    const pos = start + text.length;
+    try { input.setSelectionRange(pos, pos); } catch (e) {}
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
         window.electronAPI.onAddressBarAction((data) => {
             if (!data || !data.action) return;
             const { action } = data;
             if (action === 'copy') {
                 document.execCommand('copy');
             } else if (action === 'paste') {
-                document.execCommand('paste');
+                pasteIntoAddressBar();
             } else if (action === 'cut') {
                 document.execCommand('cut');
             } else if (action === 'select-all') {
@@ -2218,7 +2241,7 @@ function showAddressBarContextMenu(x, y) {
             if (action === 'copy') {
                 document.execCommand('copy');
             } else if (action === 'paste') {
-                document.execCommand('paste');
+                pasteIntoAddressBar();
             } else if (action === 'cut') {
                 document.execCommand('cut');
             } else if (action === 'select-all') {

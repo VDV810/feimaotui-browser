@@ -666,6 +666,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setTranslationEngine: (engineId) => ipcRenderer.invoke('set-translation-engine', engineId),
   openImmersiveSettings: () => ipcRenderer.invoke('open-immersive-settings'),
   openImmersiveLogin: () => ipcRenderer.invoke('open-immersive-login'),
+  nativeAddressPaste: () => ipcRenderer.invoke('native-address-paste'),
   onTranslationEngineChanged: (callback) => {
     const listener = (_event, engineId) => callback(engineId);
     ipcRenderer.on('translation-engine-changed', listener);
