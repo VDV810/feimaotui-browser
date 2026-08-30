@@ -1946,6 +1946,20 @@ function setupImmersiveSettingsButtons() {
             }
         });
     });
+    const loginBtn = document.getElementById('openImmersiveLoginBtn');
+    if (loginBtn && !loginBtn.dataset.bound) {
+        loginBtn.dataset.bound = '1';
+        loginBtn.addEventListener('click', async () => {
+            loginBtn.disabled = true;
+            try {
+                await window.electronAPI.openImmersiveLogin();
+            } catch (e) {
+                console.error('打开沉浸式登录页失败:', e);
+            } finally {
+                loginBtn.disabled = false;
+            }
+        });
+    }
 }
 
 // 加载已标记广告规则列表

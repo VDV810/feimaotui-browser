@@ -5345,6 +5345,19 @@ function setupIPC() {
     }
   });
 
+  // 打开沉浸式翻译的登录页（在标签页中打开）。
+  // 扩展面板里的「未登录」依赖后台 service worker 的 tabs API（Electron 下不稳定），
+  // 这里从浏览器侧直接打开官网登录页；登录成功后扩展会通过自身官网上的内容脚本同步登录态。
+  ipcMain.handle('open-immersive-login', () => {
+    try {
+      createTab('https://immersivetranslate.com/accounts/login?from=plugin', { active: true });
+      addLog('TRANSLATE', '打开沉浸式翻译登录页');
+      return { success: true };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  });
+
   // 文本翻译：内置引擎直连翻译；扩展引擎 → 提示用户用页面上的粉色浮球
   ipcMain.handle('translate-text', async (event, text, targetLang) => {
     const engine = getActiveTranslationEngine();
