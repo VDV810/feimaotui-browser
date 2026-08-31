@@ -6000,9 +6000,69 @@ function setupWxProxy() {
   });
 }
 
+// ==================== 会话Cookie持久化：解决微信小店/腾讯广告每次打开都要扫码 ====================
+// 根因：微信小店(store.weixin.qq.com)等登录 Cookie 是"会话Cookie"（无过期时间）。
+// Chrome/Edge 开启"继续上次会话"后重启会恢复它们，Electron 默认重启即丢弃 → 每次都要重新扫码。
+// 方案：定期+退出时把 persist:main 的会话Cookie备份到 JSON；启动时回填并赋予400天有效期。
+const SESSION_COOKIE_FILE = path.join(dataPath, 'session-cookies.json');
+const SESSION_COOKIE_TTL = 400 * 24 * 3600; // 秒
+
+async function backupSessionCookies() {
+  try {
+    const ses = session.fromPartition('persist:main');
+    const all = ses.cookies.get({});
+    // 仅备份会话Cookie（无过期时间的）；持久Cookie Chromium 自己落盘
+    const sessionOnes = all.filter(c => !c.expirationDate);
+    if (!sessionOnes.length) return;
+    const payload = sessionOnes.map(c => ({
+      name: c.name, value: c.value, domain: c.domain, path: c.path,
+      secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite, hostOnly: c.hostOnly
+    }));
+    fs.writeFileSync(SESSION_COOKIE_FILE, JSON.stringify(payload));
+    addLog('COOKIE', '备份会话Cookie', `${payload.length} 条`);
+  } catch (e) {
+    addLog('COOKIE', '备份会话Cookie失败', e.message);
+  }
+}
+
+async function restoreSessionCookies() {
+  try {
+    if (!fs.existsSync(SESSION_COOKIE_FILE)) return;
+    const arr = JSON.parse(fs.readFileSync(SESSION_COOKIE_FILE, 'utf8'));
+    if (!Array.isArray(arr) || !arr.length) return;
+    const ses = session.fromPartition('persist:main');
+    let ok = 0, skip = 0;
+    for (const c of arr) {
+      try {
+        const domain = c.domain || '';
+        const host = domain.startsWith('.') ? domain.slice(1) : domain;
+        const secure = !!c.secure;
+        const details = {
+          url: (secure ? 'https://' : 'http://') + host + (c.path || '/'),
+          name: c.name, value: c.value, path: c.path || '/',
+          secure, httpOnly: !!c.httpOnly,
+          sameSite: c.sameSite || 'unspecified',
+          expirationDate: Math.floor(Date.now() / 1000) + SESSION_COOKIE_TTL
+        };
+        if (!c.hostOnly && domain) details.domain = domain;
+        // Chromium 已恢复/用户新登录的同名 Cookie 不覆盖（新的优先）
+        const existing = ses.cookies.get({ name: c.name, domain: domain, path: c.path || '/' });
+        if (existing.length) { skip++; continue; }
+        await ses.cookies.set(details);
+        ok++;
+      } catch (e) { skip++; }
+    }
+    addLog('COOKIE', '启动恢复会话Cookie', `恢复${ok}条/跳过${skip}条`);
+  } catch (e) {
+    addLog('COOKIE', '恢复会话Cookie失败', e.message);
+  }
+}
+
 app.whenReady().then(async () => {
   setupWxProxy();
   loadData();
+  // 会话Cookie回填：必须在建窗口前完成（限时3秒防挂起阻塞启动）
+  await Promise.race([restoreSessionCookies(), new Promise(r => setTimeout(r, 3000))]);
   applyProxyToSessions().catch(e => addLog('PROXY', '启动应用代理异常', e.message));
   createMainWindow();
   setupIPC();
@@ -6016,11 +6076,12 @@ app.whenReady().then(async () => {
   await seedAndLoadTranslationExtensions();
   loadPersistedExtensionsOnStartup().catch(e => addLog('EXT', '启动加载扩展异常', e.message));
 
-  // 每30秒自动保存会话（防止直接关机/断电丢失）
+  // 每30秒自动保存会话（防止直接关机/断电丢失）+ 会话Cookie备份
   setInterval(() => {
     if (globalState.tabs.size > 0) {
       saveTabsSession();
     }
+    backupSessionCookies();
   }, 30000);
 
   app.on('activate', () => {
@@ -6060,6 +6121,8 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   globalState.isQuitting = true;
+  // 退出前备份会话Cookie（微信小店等扫码登录的会话Cookie，下次启动回填免扫码）
+  try { backupSessionCookies(); } catch (e) {}
   // 关闭微信 Edge 代理进程
   try { wxEdgeProxy.stop(); } catch (e) {}
   // 正常退出时清空会话，下次不自动恢复
