@@ -3848,7 +3848,9 @@ async function loadPersistedExtensionsOnStartup() {
 // 清 SW 缓存很关键：manifest 带 key 导致扩展 ID 固定，Electron 会按 ID 缓存 service worker，
 // 若之前加载过未打补丁的版本，后台脚本缓存会导致补丁不生效（表现为扩展始终初始化失败）。
 const BUNDLED_IMT_ID = 'amkbmndfnliijdhojkpoglbnaaahippg';
-const BUNDLED_IMT_MARKER = path.join(dataPath, 'extensions', BUNDLED_IMT_ID, '_imt_patch_v1');
+// Electron 44+ 保留 `_` 开头的文件名（加载扩展时警告/可能拒绝），marker 改为不带下划线前缀
+const BUNDLED_IMT_MARKER = path.join(dataPath, 'extensions', BUNDLED_IMT_ID, 'imt-patch-marker.txt');
+const BUNDLED_IMT_MARKER_LEGACY = path.join(dataPath, 'extensions', BUNDLED_IMT_ID, '_imt_patch_v1');
 
 // 计算 bundled 扩展源的关键文件指纹：manifest.json 指纹 + 三个被打补丁的脚本第一行同步修复特征。
 // 仓库里这三个文件被修改时指纹会变，下一次启动自动重新部署到 userData，旧 marker 失效。
@@ -3994,7 +3996,16 @@ async function seedAndLoadBundledImmersiveTranslate() {
     const tgt = path.join(dataPath, 'extensions', BUNDLED_IMT_ID);
     // 用 bundled 源 manifest.json 的指纹作为部署版本：仓库扩展源码变化时指纹变化，旧部署自动刷新
     const srcFingerprint = computeBundledExtFingerprint(src);
-    const existingFingerprint = (() => { try { return fs.readFileSync(BUNDLED_IMT_MARKER, 'utf8'); } catch (e) { return ''; } })();
+    const existingFingerprint = (() => {
+      try { return fs.readFileSync(BUNDLED_IMT_MARKER, 'utf8'); } catch (e) {
+        try { return fs.readFileSync(BUNDLED_IMT_MARKER_LEGACY, 'utf8'); } catch (e2) { return ''; }
+      }
+    })();
+    // 清理旧版下划线 marker（Electron 44+ 禁止 `_` 前缀文件名），并把指纹落到新 marker
+    try { fs.rmSync(BUNDLED_IMT_MARKER_LEGACY, { force: true }); } catch (e) {}
+    if (existingFingerprint && !fs.existsSync(BUNDLED_IMT_MARKER)) {
+      try { fs.writeFileSync(BUNDLED_IMT_MARKER, existingFingerprint); } catch (e) {}
+    }
     if (srcFingerprint !== existingFingerprint) {
       try { fs.rmSync(tgt, { recursive: true, force: true }); } catch (e) {}
       fs.mkdirSync(tgt, { recursive: true });
