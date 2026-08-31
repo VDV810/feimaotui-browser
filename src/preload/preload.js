@@ -647,6 +647,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   removeExtension: (extId) => ipcRenderer.invoke('extension-remove', extId),
   reloadExtension: (extId) => ipcRenderer.invoke('extension-reload', extId),
   installLocalExtension: () => ipcRenderer.invoke('extension-install-local'),
+
+  // 网络代理
+  setProxy: (proxyServer) => ipcRenderer.invoke('set-proxy', proxyServer),
+  getProxy: () => ipcRenderer.invoke('get-proxy'),
   downloadMedia: (url, fileName, options) => ipcRenderer.invoke('download-media', url, fileName, options),
   downloadMediaList: (mediaList, options) => ipcRenderer.invoke('download-media-list', mediaList, options),
   startAutoSniffScroll: (webContentsId, options) => ipcRenderer.invoke('start-auto-sniff-scroll', webContentsId, options),

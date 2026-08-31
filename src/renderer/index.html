@@ -310,6 +310,11 @@
                     <div class="setting-item"><label>翻译服务（沉浸式翻译，粉色浮球为入口）</label><button id="openImmersiveSettingsBtn2" class="io-btn" style="width:100%;">打开沉浸式翻译设置</button><div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">额度用完：设置页 → 基本设置 → 翻译服务，换一个即可</div></div>
                 </div>
                 <div class="settings-section">
+                    <h4>网络代理</h4>
+                    <div class="setting-item"><label>代理服务器</label><input type="text" id="proxyServerInput" placeholder="如 127.0.0.1:7890（留空=跟随系统）"></div>
+                    <div class="setting-item"><button id="saveProxyBtn" class="io-btn" style="width:100%;">保存代理设置（立即生效）</button><div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">GitHub 等被墙站点需配合代理工具（Clash/v2rayN 等）使用。填代理工具的本地端口即可。</div></div>
+                </div>
+                <div class="settings-section">
                     <h4>数据管理</h4>
                     <div class="setting-item"><button id="clearHistoryBtn" class="danger-btn">清除历史记录</button></div>
                     <div class="setting-item bookmark-io-section">

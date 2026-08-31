@@ -82,6 +82,8 @@ const elements = {
     downloadPathInput: document.getElementById('downloadPathInput'),
     fontSizeRange: document.getElementById('fontSizeRange'),
     fontSizeValue: document.getElementById('fontSizeValue'),
+    proxyServerInput: document.getElementById('proxyServerInput'),
+    saveProxyBtn: document.getElementById('saveProxyBtn'),
     adblockCheckbox: document.getElementById('adblockCheckbox'),
     darkModeCheckbox: document.getElementById('darkModeCheckbox'),
     selectDownloadPathBtn: document.getElementById('selectDownloadPathBtn'),
@@ -266,6 +268,21 @@ function setupEventListeners() {
             e.stopPropagation();
             console.log('[APP] 点击扩展按钮');
             togglePanel('extensions');
+        });
+    }
+    if (elements.saveProxyBtn) {
+        elements.saveProxyBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const server = (elements.proxyServerInput && elements.proxyServerInput.value || '').trim();
+            if (!window.electronAPI || !window.electronAPI.setProxy) { alert('electronAPI 不可用'); return; }
+            try {
+                const r = await window.electronAPI.setProxy(server);
+                if (r && r.success) {
+                    alert(server ? `代理已生效: ${server}\n刷新页面后访问被墙站点试试。` : '已切换为跟随系统代理。');
+                } else {
+                    alert('保存失败');
+                }
+            } catch (err) { alert('设置代理异常: ' + err.message); }
         });
     }
     if (elements.closeExtensionsPanel) {
@@ -1946,6 +1963,13 @@ async function loadSettings() {
         await loadCustomAdRules();
         // 绑定"打开沉浸式翻译设置"按钮
         setupImmersiveSettingsButtons();
+        // 加载网络代理设置
+        if (window.electronAPI.getProxy && elements.proxyServerInput) {
+            try {
+                const proxyInfo = await window.electronAPI.getProxy();
+                elements.proxyServerInput.value = (proxyInfo && proxyInfo.proxyServer) || '';
+            } catch (e) { console.error('加载代理设置失败:', e); }
+        }
     } catch (error) {
         console.error('加载设置失败:', error);
     }

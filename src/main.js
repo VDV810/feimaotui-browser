@@ -311,7 +311,8 @@ const globalState = {
     privacyMode: false,
     adblockEnabled: true,
     mediaSniffingEnabled: true,
-    fontSize: 16
+    fontSize: 16,
+    proxyServer: ''
   },
   mediaUrls: new Map(),
   mediaSizeCache: new Map(), // URL → file size (bytes) from response headers, used when video-element sniffing doesn't have size
@@ -5903,6 +5904,45 @@ function createTray() {
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.feimaotui.browser');
 }
+// ==================== 网络代理 ====================
+// 背景：GitHub 等被墙站点直连会 ERR_CONNECTION_RESET，Edge 能上是因为用户代理只在 Edge 内生效。
+// 飞毛腿显式设置代理：填了 proxyServer 用自定义代理规则，否则跟随系统代理（mode:'system'）。
+// 注意：不设置时 Electron 虽然默认跟随系统代理，但某些代理工具（插件级/PAC 差异）会导致不一致，
+// 显式声明 mode:'system' 保证与 Edge 行为一致。
+function buildProxyConfig(server) {
+  const s = String(server || '').trim();
+  if (!s) return { mode: 'system' };
+  // 支持 "127.0.0.1:7890" / "http=127.0.0.1:7890;https=127.0.0.1:7890" / "socks5://127.0.0.1:7890"
+  return { proxyRules: s };
+}
+
+async function applyProxyToSessions() {
+  const cfg = buildProxyConfig(globalState.settings.proxyServer);
+  const parts = ['persist:main', 'persist:privacy', 'default'];
+  for (const part of parts) {
+    try {
+      const ses = session.fromPartition(part) || session.defaultSession;
+      await ses.setProxy(cfg);
+    } catch (e) {
+      addLog('PROXY', '设置代理失败', `${part}: ${e.message}`);
+    }
+  }
+  addLog('PROXY', '代理已应用', cfg.proxyRules ? cfg.proxyRules : '跟随系统');
+}
+
+ipcMain.handle('set-proxy', async (event, proxyServer) => {
+  globalState.settings.proxyServer = String(proxyServer || '').trim();
+  try {
+    fs.writeFileSync(path.join(dataPath, 'settings.json'), JSON.stringify(globalState.settings));
+  } catch (e) { addLog('PROXY', '保存代理设置失败', e.message); }
+  await applyProxyToSessions();
+  return { success: true, proxyServer: globalState.settings.proxyServer };
+});
+
+ipcMain.handle('get-proxy', async () => {
+  return { proxyServer: globalState.settings.proxyServer || '' };
+});
+
 // ==================== 微信快捷登录：IPC 代理 localhost.weixin.qq.com 请求 ====================
 // Chromium 148 的 Private Network Access 在渲染层阻止公网→本地请求
 // 通过 IPC 代理：页面 JS -> preload -> IPC -> 主进程 net.fetch -> 微信本地服务器
@@ -5963,6 +6003,7 @@ function setupWxProxy() {
 app.whenReady().then(async () => {
   setupWxProxy();
   loadData();
+  applyProxyToSessions().catch(e => addLog('PROXY', '启动应用代理异常', e.message));
   createMainWindow();
   setupIPC();
   createTray();
