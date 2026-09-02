@@ -54,11 +54,13 @@ app.commandLine.appendSwitch('ignore-certificate-errors');
 const MAX_LOG_LINES = 5000;
 let runtimeLogs = [];
 let logAutoClear = false;
+let logSeq = 0; // 日志单调递增序号（运行时快照变更检测用）
 
 function addLog(level, message, details = '') {
   const timestamp = new Date().toLocaleString('zh-CN');
   const logEntry = `[${timestamp}] [${level}] ${message} ${details}`;
   runtimeLogs.push(logEntry);
+  logSeq++;
   if (runtimeLogs.length > MAX_LOG_LINES) {
     runtimeLogs = runtimeLogs.slice(-MAX_LOG_LINES);
   }
@@ -322,6 +324,118 @@ const globalState = {
 
 const dataPath = path.join(app.getPath('userData'), 'browser-data');
 if (!fs.existsSync(dataPath)) fs.mkdirSync(dataPath, { recursive: true });
+
+// ==================== 退出日志系统（v1.3.81） ====================
+// 目标：任何退出都要留下可查的详细日志。
+// 1) 正常退出：before-quit 时写详细退出报告（exit-latest.log + 时间戳归档），并打 clean-exit 标记；
+// 2) 异常退出（崩溃/断电/强杀）：没有 clean-exit 标记，下次启动报警提示；
+//    每 30 秒的运行时快照（runtime-latest.log）保留崩溃前的最后日志；
+// 3) 退出前延迟 3 秒（EXIT_DELAY_MS）再真正退出进程，确保日志完整落盘。
+//    同步写几 MB 日志实测仅需几十毫秒，3 秒足够宽裕；
+// 4) 退出不再清除日志，仅用户在日志面板手动清除。
+const logsDir = path.join(dataPath, 'logs');
+if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+const CLEAN_EXIT_MARKER = path.join(logsDir, 'clean-exit.txt');
+const EXIT_LOG_LATEST = path.join(logsDir, 'exit-latest.log');
+const RUNTIME_SNAPSHOT = path.join(logsDir, 'runtime-latest.log');
+const EXIT_DELAY_MS = 3000;
+const appStartTime = Date.now();
+let exitPrepared = false;
+let lastSnapshotSeq = -1;
+
+// 启动即检查上次退出是否干净（读完即删标记，本次若崩溃下次能检出）
+try {
+  if (fs.existsSync(CLEAN_EXIT_MARKER)) {
+    const lastExitInfo = (fs.readFileSync(CLEAN_EXIT_MARKER, 'utf8').split('\n')[0] || '').trim();
+    addLog('EXIT', '上次为正常退出', lastExitInfo);
+    fs.unlinkSync(CLEAN_EXIT_MARKER);
+  } else {
+    addLog('WARN', '上次未正常退出（疑似崩溃/断电/强杀）', `崩溃前日志见 ${RUNTIME_SNAPSHOT}`);
+  }
+} catch (e) {}
+
+function getUptimeStr() {
+  const sec = Math.floor((Date.now() - appStartTime) / 1000);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return `${h}时${m}分${s}秒（共${sec}秒）`;
+}
+
+function buildExitReport(reason) {
+  const now = new Date();
+  const mem = process.memoryUsage();
+  const mb = (n) => (n / 1024 / 1024).toFixed(1) + 'MB';
+  const lines = [];
+  lines.push('================ 飞毛腿浏览器 退出详细日志 ================');
+  lines.push(`退出时间: ${now.toLocaleString('zh-CN')}`);
+  lines.push(`退出触发点: ${reason}`);
+  lines.push(`是否用户主动退出(isQuitting): ${globalState.isQuitting}`);
+  lines.push(`运行时长: ${getUptimeStr()}`);
+  lines.push(`版本: v${app.getVersion()} | Electron ${process.versions.electron} | Chromium ${process.versions.chrome} | Node ${process.versions.node}`);
+  lines.push(`平台: ${process.platform} ${process.arch} | PID: ${process.pid}`);
+  lines.push('');
+  lines.push('-------- 窗口状态 --------');
+  try {
+    const wins = BrowserWindow.getAllWindows();
+    lines.push(`窗口总数: ${wins.length} | mainWindow存在: ${!!mainWindow} | mainWindow已销毁: ${mainWindow ? mainWindow.isDestroyed() : 'N/A'}`);
+    wins.forEach(w => {
+      let t = '';
+      try { t = w.getTitle(); } catch (e) {}
+      lines.push(`  窗口#${w.id} title="${t}" destroyed=${w.isDestroyed()} visible=${w.isVisible()}`);
+    });
+  } catch (e) { lines.push(`  窗口状态采集失败: ${e.message}`); }
+  lines.push('');
+  lines.push('-------- 标签页状态 --------');
+  try {
+    lines.push(`标签数: ${globalState.tabs.size} | 活动标签: ${globalState.activeTabId}`);
+    for (const [id, tab] of globalState.tabs) {
+      lines.push(`  ${id} | loading=${tab.loading} | title="${tab.title}" | url=${tab.url}`);
+    }
+  } catch (e) { lines.push(`  标签状态采集失败: ${e.message}`); }
+  lines.push('');
+  lines.push('-------- 内存状态 --------');
+  lines.push(`进程内存: rss=${mb(mem.rss)} heapUsed=${mb(mem.heapUsed)} heapTotal=${mb(mem.heapTotal)} external=${mb(mem.external || 0)}`);
+  lines.push(`系统内存: 可用=${mb(os.freemem())} / 总计=${mb(os.totalmem())}`);
+  lines.push('');
+  lines.push('-------- 关键事件摘录（QUIT-DIAG / CLOSE-FIX / BLOCK / ERROR / WARN，最近200条）--------');
+  const keyLines = runtimeLogs.filter(l => /QUIT-DIAG|CLOSE-FIX|BLOCK|\[ERROR\]|\[WARN\]/.test(l)).slice(-200);
+  if (keyLines.length === 0) lines.push('  （无）');
+  else keyLines.forEach(l => lines.push('  ' + l));
+  lines.push('');
+  lines.push(`-------- 完整运行日志（共 ${runtimeLogs.length} 条）--------`);
+  lines.push(getLogs());
+  lines.push('================ 退出日志结束 ================');
+  return lines.join('\n');
+}
+
+function writeExitLog(reason) {
+  try {
+    const report = buildExitReport(reason);
+    // 固定文件名：下次启动/排查时直接看这个
+    fs.writeFileSync(EXIT_LOG_LATEST, report, 'utf8');
+    // 时间戳归档，最多保留 10 份
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    fs.writeFileSync(path.join(logsDir, `exit-${ts}.log`), report, 'utf8');
+    const archives = fs.readdirSync(logsDir).filter(f => /^exit-\d{8}-\d{6}\.log$/.test(f)).sort();
+    while (archives.length > 10) {
+      try { fs.unlinkSync(path.join(logsDir, archives.shift())); } catch (e) {}
+    }
+    // 干净退出标记（内容含摘要，供下次启动读取）
+    fs.writeFileSync(CLEAN_EXIT_MARKER, `${now.toLocaleString('zh-CN')} 正常退出（${reason}），详细日志: ${EXIT_LOG_LATEST}\n`, 'utf8');
+    addLog('EXIT', '退出日志已写盘', `${EXIT_LOG_LATEST}（${report.length} 字节），${EXIT_DELAY_MS / 1000} 秒后正式退出`);
+  } catch (e) {
+    try { console.log('写退出日志失败: ' + (e && e.message)); } catch (e2) {}
+  }
+}
+
+function writeRuntimeSnapshot() {
+  try {
+    if (logSeq === lastSnapshotSeq) return;
+    lastSnapshotSeq = logSeq;
+    fs.writeFileSync(RUNTIME_SNAPSHOT, getLogs(), 'utf8');
+  } catch (e) {}
+}
 
 function loadData() {
   try {
@@ -688,8 +802,16 @@ function createMainWindow() {
   });
 
   mainWindow.on('close', (event) => {
-    addLog('QUIT-DIAG', 'mainWindow close 事件', `isQuitting=${globalState.isQuitting}`);
-    globalState.isQuitting = true;
+    // v1.3.81 恢复 v1.3.48 守卫（曾在 v1.3.64 仓库重导入时丢失，腾讯充值成功页「返回」偶尔全退的头号嫌疑）：
+    // 非主动退出（isQuitting=false）一律拦截。页面 window.close() 冒泡触发主窗口 close 时，
+    // 若无此守卫，下面会无条件 app.quit() 导致整个浏览器退出，window-all-closed 兜底形同虚设。
+    // 用户正常退出请走托盘「退出」（会先置 isQuitting=true 再 app.quit）。
+    if (!globalState.isQuitting) {
+      event.preventDefault();
+      addLog('QUIT-DIAG', 'mainWindow close 被拦截（非主动退出）', '已 preventDefault，浏览器保持运行；正常退出请使用托盘「退出」');
+      return;
+    }
+    addLog('QUIT-DIAG', 'mainWindow close 事件（主动退出，放行）', `isQuitting=${globalState.isQuitting}`);
     saveData();
     // 正常关闭时清除会话文件，下次启动不恢复标签页
     // 只有断电/强制关机时 tabs-session.json 才会保留
@@ -702,9 +824,7 @@ function createMainWindow() {
     } catch (e) {
       addLog('ERROR', '清除会话文件失败', e.message);
     }
-    if (logAutoClear) {
-      runtimeLogs = [];
-    }
+    // v1.3.81 起退出不再清除日志（仅用户在日志面板手动清除），退出日志由 before-quit 统一写盘
     if (tray) {
       tray.destroy();
       tray = null;
@@ -6172,6 +6292,7 @@ app.whenReady().then(async () => {
       saveTabsSession();
     }
     backupSessionCookies();
+    writeRuntimeSnapshot(); // 每30秒快照运行日志，崩溃/断电退出也能拿到崩溃前日志
   }, 30000);
 
   app.on('activate', () => {
@@ -6209,8 +6330,15 @@ app.on('window-all-closed', () => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
   globalState.isQuitting = true;
+  // 第二实例（单实例锁未拿到）直接退出：不写退出日志、不延迟
+  if (globalState.skipExitLog) return;
+  if (exitPrepared) return; // 重复触发（如延迟期间再次退出）直接放行，日志已写
+  // 拦截本次退出：先完成清理 + 写详细退出日志，3 秒后再真正退出进程
+  event.preventDefault();
+  exitPrepared = true;
+  addLog('EXIT', '开始退出流程', '清理数据并写退出日志...');
   // 退出前备份会话Cookie（微信小店等扫码登录的会话Cookie，下次启动回填免扫码）
   try { backupSessionCookies(); } catch (e) {}
   // 关闭微信 Edge 代理进程
@@ -6221,11 +6349,24 @@ app.on('before-quit', () => {
     addLog('SESSION', '正常退出，清空会话');
   } catch (e) {}
   saveData();
-  if (logAutoClear) runtimeLogs = [];
+  // 销毁托盘，避免 3 秒延迟期间用户重复点击
+  if (tray) {
+    try { tray.destroy(); } catch (e) {}
+    tray = null;
+  }
+  // 写详细退出日志（v1.3.81 起退出不再清除日志，仅用户手动清除）
+  writeRuntimeSnapshot();
+  writeExitLog('before-quit');
+  // 延迟 3 秒正式退出：确保退出日志完整落盘
+  // （同步写盘实际只需几十毫秒，3 秒足够宽裕；用 app.exit 避免再次进入 before-quit）
+  setTimeout(() => {
+    try { app.exit(0); } catch (e) { process.exit(0); }
+  }, EXIT_DELAY_MS);
 });
 
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
+  globalState.skipExitLog = true; // 第二实例：直接退出，不写退出日志、不延迟
   app.quit();
 } else {
   app.on('second-instance', (event, commandLine, workingDirectory) => {
