@@ -1,6 +1,0 @@
-v1.3.83: 页面window.close改为关闭对应标签页(Chrome语义,可见反馈) - 浏览器/主窗口仍不退出
-
-- page-close-attempt IPC: 按event.sender定位发起调用的标签页并closeTab(标签页消失=用户可见异常反馈)
-- webContents被页面绕过桩自行销毁时: destroyed监听同步finalizeTabRemove清理簿记
-- closeTab拆出finalizeTabRemove公共簿记(删tabs/切活动标签/通知渲染层/存会话), 两条关闭路径复用
-- 主窗口3秒页面关闭信号守卫不变: 冒泡关主窗口仍被拦截, 点X正常退出
