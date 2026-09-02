@@ -319,6 +319,7 @@ const globalState = {
   mediaUrls: new Map(),
   mediaSizeCache: new Map(), // URL → file size (bytes) from response headers, used when video-element sniffing doesn't have size
   isQuitting: false,
+  lastPageCloseSignal: 0, // 最近一次页面脚本触发关闭的时间戳（区分用户点X与页面冒泡关闭）
   savedTabs: null
 };
 
@@ -665,6 +666,12 @@ function createMainWindow() {
   // 使用 webContents 的 file-drop-for-security 来处理拖入的书签文件
   mainWindow.on('will-prevent-unload', (event) => {});
   // 监听 preload 发来的关闭按钮诊断信息
+  // v1.3.82：页面主世界 window.close 桩被调用时，经 preload(DOM事件跨世界) 转发到此，
+  // 记录页面关闭信号（点X判定依据之一）
+  ipcMain.on('page-close-attempt', () => {
+    globalState.lastPageCloseSignal = Date.now();
+    addLog('CLOSE-FIX', '页面调用 window.close(已屏蔽)', '记录页面关闭信号，用于区分用户点X与页面冒泡关闭');
+  });
   ipcMain.on('close-btn-diag', (event, url, data) => {
     try {
       const items = JSON.parse(data);
@@ -802,16 +809,24 @@ function createMainWindow() {
   });
 
   mainWindow.on('close', (event) => {
-    // v1.3.81 恢复 v1.3.48 守卫（曾在 v1.3.64 仓库重导入时丢失，腾讯充值成功页「返回」偶尔全退的头号嫌疑）：
-    // 非主动退出（isQuitting=false）一律拦截。页面 window.close() 冒泡触发主窗口 close 时，
-    // 若无此守卫，下面会无条件 app.quit() 导致整个浏览器退出，window-all-closed 兜底形同虚设。
-    // 用户正常退出请走托盘「退出」（会先置 isQuitting=true 再 app.quit）。
+    // v1.3.82 恢复并增强 v1.3.48 守卫（曾在 v1.3.64 重导入时丢失，充值成功页「返回」偶尔全退的根因）：
+    // - 页面脚本触发的关闭（3 秒内有页面关闭信号：window.close 桩上报 / webContents 异常销毁）
+    //   → 非正常关闭，preventDefault 拦截，浏览器保持运行，仅记日志；
+    // - 用户点 X（无页面关闭信号）→ 正常退出；
+    // - 托盘「退出」/ 程序主动退出（isQuitting=true）→ 正常退出。
     if (!globalState.isQuitting) {
-      event.preventDefault();
-      addLog('QUIT-DIAG', 'mainWindow close 被拦截（非主动退出）', '已 preventDefault，浏览器保持运行；正常退出请使用托盘「退出」');
-      return;
+      const sinceSignal = Date.now() - (globalState.lastPageCloseSignal || 0);
+      if (sinceSignal < 3000) {
+        event.preventDefault();
+        globalState.lastPageCloseSignal = 0;
+        addLog('CLOSE-FIX', '非正常关闭被拦截(浏览器保持运行)', `页面关闭信号于 ${Math.round(sinceSignal)}ms 前触发；确需退出请用托盘「退出」`);
+        return;
+      }
+      addLog('QUIT-DIAG', 'mainWindow close(无页面关闭信号,视为用户点X,正常退出)', '');
+      globalState.isQuitting = true;
+    } else {
+      addLog('QUIT-DIAG', 'mainWindow close(主动退出,放行)', 'isQuitting=true');
     }
-    addLog('QUIT-DIAG', 'mainWindow close 事件（主动退出，放行）', `isQuitting=${globalState.isQuitting}`);
     saveData();
     // 正常关闭时清除会话文件，下次启动不恢复标签页
     // 只有断电/强制关机时 tabs-session.json 才会保留
@@ -2829,9 +2844,18 @@ function createTab(url = null, options = {}) {
   // 兜底：拦截页面 window.close 触发的 webContents 关闭，防止误关掉当前标签页
   // （腾讯广告充值成功页的"返回"按钮会调 window.close，误关标签页/主窗口）
   // 注意：Electron 的 webContents 'close' 事件 event 只有 preventDefault，没有 stopPropagation
+  // 注意：Electron 42+ 文档已不含 webContents 'close' 事件，此监听可能不再触发（保留兼容旧版）
   view.webContents.on('close', (event) => {
     event.preventDefault();
     addLog('CLOSE-FIX', '拦截 webContents close', `阻止页面 window.close 关闭标签页 (${tabId})`);
+  });
+
+  // v1.3.82：若页面 window.close 绕过注入桩（注入竞态）成功销毁了 webContents，
+  // 记录"页面关闭信号"，供主窗口 close 区分用户点X与页面冒泡关闭（closeTab 正常关闭不算）
+  view.webContents.on('destroyed', () => {
+    if (globalState._closingTabId === tabId) return;
+    globalState.lastPageCloseSignal = Date.now();
+    addLog('CLOSE-FIX', 'webContents 被页面异常销毁(关闭信号)', tabId);
   });
 
   // 监听证书错误（微信客户端检测需要 localhost.weixin.qq.com 自签名证书）
@@ -2951,8 +2975,15 @@ function createTab(url = null, options = {}) {
             };
           }
           // 屏蔽 window.close：防止页面（如腾讯广告的"返回"按钮）调用后关闭 webview/app
-          // 必须在主世界执行，preload 隔离世界覆盖无效
-          try { window.close = function() {}; } catch(e) {}
+          // 必须在主世界执行，preload 隔离世界覆盖无效。
+          // v1.3.82：桩被调用时经 DOM 自定义事件通知 preload（跨世界唯一通道）转发主进程，
+          // 记录"页面关闭信号"，供主窗口 close 区分用户点X与页面冒泡关闭。
+          try {
+            window.close = function() {
+              try { console.log('[CLOSE-STUB] page called window.close (blocked)'); } catch (e2) {}
+              try { document.dispatchEvent(new CustomEvent('fmt-page-close-attempt')); } catch (e2) {}
+            };
+          } catch (e) {}
         })();
       `, true).catch(() => {});
     }
@@ -3098,7 +3129,10 @@ function closeTab(tabId) {
     if (mainWindow && !mainWindow.isDestroyed() && mainWindow.getBrowserView() === tab.view) {
       mainWindow.setBrowserView(null);
     }
+    // v1.3.82：标记这是用户/程序正常关闭，destroyed 监听不当作页面异常销毁
+    globalState._closingTabId = tabId;
     tab.view.webContents.destroy();
+    setTimeout(() => { if (globalState._closingTabId === tabId) globalState._closingTabId = null; }, 0);
   }
   globalState.tabs.delete(tabId);
 

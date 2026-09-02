@@ -1,5 +1,13 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+// v1.3.82: 页面主世界的 window.close 桩（main.js did-start-navigation 注入）被调用时，
+// 通过 DOM 自定义事件跨世界通知 preload，再转发主进程记录"页面关闭信号"，
+// 用于主窗口 close 时区分「用户点X正常退出」与「页面冒泡关闭(拦截)」。
+// preload 在页面任何脚本前执行，监听器注册最早，不会漏掉页面初始化期间的调用。
+document.addEventListener('fmt-page-close-attempt', () => {
+  try { ipcRenderer.send('page-close-attempt'); } catch (e) {}
+});
+
 // 清除 Electron 痕迹，避免网页通过 JS 检测浏览器类型后禁用功能
 // 必须在页面任何脚本运行前执行
 const _realUA = navigator.userAgent;
