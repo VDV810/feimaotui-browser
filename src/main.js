@@ -434,16 +434,41 @@ function createMainWindow() {
   addLog('INFO', '开始创建主窗口');
 
   // 恢复上次会话的标签页（在窗口创建前执行，确保渲染进程启动时标签已存在）
+  // 记录恢复的标签页ID：窗口显示后自动重载一次（关机重启后恢复的页面经常白屏，需手动刷新才出来）
+  const restoredTabIds = [];
   if (globalState.savedTabs && globalState.savedTabs.length > 0 && globalState.tabs.size === 0) {
     addLog('SESSION', '开始恢复会话', `${globalState.savedTabs.length} 个标签页`);
     globalState.savedTabs.forEach((savedTab, index) => {
-      createTab(savedTab.url, {
+      const restoredId = createTab(savedTab.url, {
         active: index === globalState.savedTabs.length - 1,
         title: savedTab.title
       });
+      if (restoredId) restoredTabIds.push(restoredId);
     });
     globalState.savedTabs = null;
     addLog('SESSION', '会话恢复完成');
+  }
+
+  // 主窗口显示后，错开自动刷新恢复的标签页（等效用户手动逐个点刷新）
+  let restoredTabsReloaded = false;
+  function scheduleRestoredTabsReload() {
+    if (restoredTabsReloaded || restoredTabIds.length === 0) return;
+    restoredTabsReloaded = true;
+    const ids = restoredTabIds.splice(0);
+    addLog('SESSION', '自动刷新恢复的标签页', `${ids.length} 个`);
+    ids.forEach((id, i) => {
+      setTimeout(() => {
+        try {
+          const t = globalState.tabs.get(id);
+          if (t && t.webContents && !t.webContents.isDestroyed()) {
+            t.webContents.reload();
+            addLog('SESSION', '自动刷新', t.url || id);
+          }
+        } catch (e) {
+          addLog('ERROR', '自动刷新恢复标签页失败', e.message);
+        }
+      }, 1500 + i * 800); // 窗口显示1.5秒后开始，每800ms一个，避免瞬间并发挤爆网络
+    });
   }
 
   // 隐藏默认菜单栏，F12 快捷键独立注册
@@ -546,6 +571,7 @@ function createMainWindow() {
     addLog('WARN', '页面加载超时，强制显示窗口');
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.show();
+      scheduleRestoredTabsReload();
       setTimeout(() => {
         if (globalState.tabs.size === 0) {
           createTab();
@@ -558,6 +584,7 @@ function createMainWindow() {
     clearTimeout(loadTimeout);
     addLog('INFO', '渲染页面加载完成');
     mainWindow.show();
+    scheduleRestoredTabsReload();
     addLog('INFO', '主窗口已显示');
     if (process.env.NODE_ENV === 'development') {
       mainWindow.webContents.openDevTools();
