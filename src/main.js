@@ -363,15 +363,34 @@ function saveTabsSession() {
   try {
     const tabs = [];
     globalState.tabs.forEach((tab) => {
+      // 关键：优先从 webContents 取实时 URL/title（覆盖 SPA 页内跳转 replaceState/pushState，
+      // 例如千川改日期筛选后 URL 变化但不触发整页加载），tab.url 字段可能停留在旧值
+      let url = tab.url, title = tab.title;
+      try {
+        if (tab.webContents && !tab.webContents.isDestroyed()) {
+          url = tab.webContents.getURL() || url;
+          title = tab.webContents.getTitle() || title;
+        }
+      } catch (e) { /* webContents 已销毁，用字段值兜底 */ }
       tabs.push({
-        url: tab.url,
-        title: tab.title,
+        url: url,
+        title: title,
         favicon: tab.favicon,
         zoomLevel: tab.zoomLevel || 0
       });
     });
     fs.writeFileSync(path.join(dataPath, 'tabs-session.json'), JSON.stringify(tabs));
   } catch (e) { addLog('ERROR', '保存会话失败', e.message); }
+}
+
+// 页内导航（SPA replaceState/pushState）后的防抖保存，避免高频写盘
+let saveTabsTimer = null;
+function scheduleSaveTabsSession() {
+  if (saveTabsTimer) return;
+  saveTabsTimer = setTimeout(() => {
+    saveTabsTimer = null;
+    saveTabsSession();
+  }, 2000);
 }
 
 // 深色模式CSS和函数（全局，确保createTab中did-finish-load可以调用）
@@ -2261,6 +2280,20 @@ function createTab(url = null, options = {}) {
     tab.canGoBack = view.webContents.canGoBack();
     tab.canGoForward = view.webContents.canGoForward();
     notifyTabUpdate(tabId, { loading: false, canGoBack: tab.canGoBack, canGoForward: tab.canGoForward });
+  });
+
+  // SPA 页内跳转（replaceState/pushState，如千川改筛选日期）：不触发整页加载，
+  // 必须在这里同步 tab.url 并防抖保存，否则直接关机后会话恢复的是旧 URL
+  view.webContents.on('did-navigate-in-page', (event, url, isMainFrame) => {
+    if (!isMainFrame || !url || url === 'about:blank') return;
+    if (tab.url !== url) {
+      tab.url = url;
+      tab.canGoBack = view.webContents.canGoBack();
+      tab.canGoForward = view.webContents.canGoForward();
+      notifyTabUpdate(tabId, { url: tab.url, canGoBack: tab.canGoBack, canGoForward: tab.canGoForward });
+      addLog('NAV', '页内跳转更新会话', url);
+      scheduleSaveTabsSession();
+    }
   });
 
   view.webContents.on('did-finish-load', () => {
