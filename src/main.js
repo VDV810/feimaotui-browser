@@ -434,6 +434,24 @@ function saveData() {
   } catch (e) { addLog('ERROR', '保存数据失败', e.message); }
 }
 
+// 千川全域投放页的日期筛选（dr=YYYY-MM-DD,YYYY-MM-DD）存在 URL 但用户改页面筛选时不更新 URL，
+// 隔天恢复会话拿到的是旧日期。恢复时自动把 dr 替换为当天，开机直接看当天数据
+function refreshQianchuanDateParam(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname !== 'qianchuan.jinritemai.com') return url;
+    const dr = u.searchParams.get('dr');
+    if (!dr || !/^\d{4}-\d{2}-\d{2},\d{4}-\d{2}-\d{2}$/.test(dr)) return url;
+    const now = new Date();
+    const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const today = fmt(now);
+    if (dr === `${today},${today}`) return url;
+    u.searchParams.set('dr', `${today},${today}`);
+    addLog('SESSION', '千川日期跟进今天', `${dr} -> ${today},${today}`);
+    return u.toString();
+  } catch (e) { return url; }
+}
+
 let mainWindow = null;
 let tray = null;
 const TOP_OFFSET = 112;
@@ -458,7 +476,8 @@ function createMainWindow() {
   if (globalState.savedTabs && globalState.savedTabs.length > 0 && globalState.tabs.size === 0) {
     addLog('SESSION', '开始恢复会话', `${globalState.savedTabs.length} 个标签页`);
     globalState.savedTabs.forEach((savedTab, index) => {
-      const restoredId = createTab(savedTab.url, {
+      const restoredUrl = refreshQianchuanDateParam(savedTab.url);
+      const restoredId = createTab(restoredUrl, {
         active: index === globalState.savedTabs.length - 1,
         title: savedTab.title
       });
