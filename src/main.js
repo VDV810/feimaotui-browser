@@ -666,11 +666,21 @@ function createMainWindow() {
   // 使用 webContents 的 file-drop-for-security 来处理拖入的书签文件
   mainWindow.on('will-prevent-unload', (event) => {});
   // 监听 preload 发来的关闭按钮诊断信息
-  // v1.3.82：页面主世界 window.close 桩被调用时，经 preload(DOM事件跨世界) 转发到此，
-  // 记录页面关闭信号（点X判定依据之一）
-  ipcMain.on('page-close-attempt', () => {
+  // v1.3.83：页面主世界 window.close 桩被调用时，经 preload(DOM事件跨世界) 转发到此。
+  // 行为对齐 Chrome：只关闭发起调用的标签页（可见反馈），主窗口/浏览器不退出；
+  // 同时记录页面关闭信号，若后续主窗口仍被冒泡关闭（历史bug链路），3秒守卫会拦截。
+  ipcMain.on('page-close-attempt', (event) => {
     globalState.lastPageCloseSignal = Date.now();
-    addLog('CLOSE-FIX', '页面调用 window.close(已屏蔽)', '记录页面关闭信号，用于区分用户点X与页面冒泡关闭');
+    let targetId = null;
+    for (const [id, t] of globalState.tabs) {
+      if (t.webContents === event.sender) { targetId = id; break; }
+    }
+    if (targetId) {
+      addLog('CLOSE-FIX', '页面调用 window.close(关闭对应标签页)', `${targetId}，浏览器保持运行`);
+      closeTab(targetId);
+    } else {
+      addLog('CLOSE-FIX', '页面调用 window.close(未找到对应标签页)', `senderId=${event.sender.id}`);
+    }
   });
   ipcMain.on('close-btn-diag', (event, url, data) => {
     try {
@@ -2850,12 +2860,14 @@ function createTab(url = null, options = {}) {
     addLog('CLOSE-FIX', '拦截 webContents close', `阻止页面 window.close 关闭标签页 (${tabId})`);
   });
 
-  // v1.3.82：若页面 window.close 绕过注入桩（注入竞态）成功销毁了 webContents，
-  // 记录"页面关闭信号"，供主窗口 close 区分用户点X与页面冒泡关闭（closeTab 正常关闭不算）
+  // v1.3.83：若页面 window.close 绕过注入桩（注入竞态）成功销毁了 webContents，
+  // 记录"页面关闭信号"并同步清理标签页簿记（对齐 Chrome：标签页消失可见，浏览器不退）
+  // （closeTab 正常关闭由 _closingTabId 标记，不进此分支）
   view.webContents.on('destroyed', () => {
     if (globalState._closingTabId === tabId) return;
     globalState.lastPageCloseSignal = Date.now();
-    addLog('CLOSE-FIX', 'webContents 被页面异常销毁(关闭信号)', tabId);
+    addLog('CLOSE-FIX', 'webContents 被页面关闭，同步移除标签页', tabId);
+    try { finalizeTabRemove(tabId); } catch (e) {}
   });
 
   // 监听证书错误（微信客户端检测需要 localhost.weixin.qq.com 自签名证书）
@@ -3131,9 +3143,16 @@ function closeTab(tabId) {
     }
     // v1.3.82：标记这是用户/程序正常关闭，destroyed 监听不当作页面异常销毁
     globalState._closingTabId = tabId;
-    tab.view.webContents.destroy();
+    try { tab.view.webContents.destroy(); } catch (e) {}
     setTimeout(() => { if (globalState._closingTabId === tabId) globalState._closingTabId = null; }, 0);
   }
+  finalizeTabRemove(tabId);
+}
+
+// v1.3.83：标签页移除的公共簿记（从 tabs 删除、切换活动标签、通知渲染层、保存会话）。
+// closeTab 和「页面绕过桩自行销毁 webContents」两条路径都走这里，保证状态一致。
+function finalizeTabRemove(tabId) {
+  if (!globalState.tabs.has(tabId)) return;
   globalState.tabs.delete(tabId);
 
   if (globalState.activeTabId === tabId) {
