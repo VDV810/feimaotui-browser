@@ -1,4 +1,4 @@
-const { app, BrowserWindow, BrowserView, ipcMain, dialog, session, shell, Menu, Tray, clipboard, desktopCapturer, globalShortcut, net, protocol } = require('electron');
+const { app, BrowserWindow, BrowserView, ipcMain, dialog, session, shell, Menu, Tray, clipboard, desktopCapturer, globalShortcut, net, protocol, screen } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
@@ -832,7 +832,23 @@ function createMainWindow() {
         addLog('CLOSE-FIX', '非正常关闭被拦截(浏览器保持运行)', `页面关闭信号于 ${Math.round(sinceSignal)}ms 前触发；确需退出请用托盘「退出」`);
         return;
       }
-      addLog('QUIT-DIAG', 'mainWindow close(无页面关闭信号,视为用户点X,正常退出)', '');
+      // v1.3.84：光标归因兜底 —— 页面 window.close 可能绕过注入桩（注入竞态/子frame调用）
+      // 直达主窗口（实测：腾讯广告充值回调页 midasCallback.html 返回时全退）。
+      // 此时无页面关闭信号，但并非用户点X。原生标题栏的X按钮固定在窗口右上角：
+      // 光标不在右上角(约100x80区域) → 判定为页面冒泡关闭，拦截；
+      // 光标在右上角 → 判定为用户点X，正常退出。
+      let cursorAtX = false;
+      try {
+        const cp = screen.getCursorScreenPoint();
+        const wb = mainWindow.getBounds();
+        cursorAtX = (cp.x >= wb.x + wb.width - 100) && (cp.y <= wb.y + 80);
+      } catch (e) { cursorAtX = false; }
+      if (!cursorAtX) {
+        event.preventDefault();
+        addLog('CLOSE-FIX', '页面关闭请求绕过桩被拦截(光标不在X按钮区域,浏览器保持运行)', '页面 window.close 竞态绕过；确需退出请点X或用托盘「退出」');
+        return;
+      }
+      addLog('QUIT-DIAG', 'mainWindow close(光标在X区域,视为用户点X,正常退出)', '');
       globalState.isQuitting = true;
     } else {
       addLog('QUIT-DIAG', 'mainWindow close(主动退出,放行)', 'isQuitting=true');
@@ -6273,7 +6289,12 @@ const SESSION_COOKIE_TTL = 400 * 24 * 3600; // 秒
 async function backupSessionCookies() {
   try {
     const ses = session.fromPartition('persist:main');
-    const all = ses.cookies.get({});
+    let all = ses.cookies.get({});
+    // Electron 44 下 get({}) 可能返回非数组（如 Promise），做兼容归一，避免 all.filter is not a function
+    if (!Array.isArray(all) && all && typeof all.then === 'function') {
+      try { all = await all; } catch (e) { all = []; }
+    }
+    if (!Array.isArray(all)) all = [];
     // 仅备份会话Cookie（无过期时间的）；持久Cookie Chromium 自己落盘
     const sessionOnes = all.filter(c => !c.expirationDate);
     if (!sessionOnes.length) return;
