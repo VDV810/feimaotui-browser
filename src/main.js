@@ -5,6 +5,37 @@ const axios = require('axios');
 const { execFile, spawn } = require('child_process');
 const os = require('os');
 
+// ==================== EPIPE / 未捕获异常防护（v1.3.85） ====================
+// 从终端/后台脚本启动时，若 stdout 管道断开（终端被关、重定向进程退出），
+// addLog 里的 console.log 会抛 EPIPE → uncaughtException → Electron 弹
+// 「A JavaScript error occurred in the main process」错误框，且每条新日志再弹一次，
+// 表现为"关也关不掉"。这里三层防护：
+// 1) stdout/stderr 挂 error 监听，EPIPE 不再升级为未捕获异常；
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream && typeof stream.on === 'function') {
+    stream.on('error', (err) => {
+      if (err && (err.code === 'EPIPE' || err.code === 'ERR_STREAM_DESTROYED' || err.code === 'ERR_STREAM_WRITE_AFTER_END')) return;
+      throw err;
+    });
+  }
+}
+// 2) 全局 uncaughtException 兜底：记录到内存日志（不写控制台，避免再次触发 EPIPE），
+//    弹窗不再出现；非 EPIPE 的严重异常仍记入日志供排查。
+process.on('uncaughtException', (err) => {
+  try {
+    const msg = (err && (err.stack || err.message)) || String(err);
+    runtimeLogs.push(`[${new Date().toLocaleString('zh-CN')}] [CRASH-GUARD] ${msg}`);
+    if (runtimeLogs.length > MAX_LOG_LINES) runtimeLogs = runtimeLogs.slice(-MAX_LOG_LINES);
+  } catch (e) {}
+});
+process.on('unhandledRejection', (err) => {
+  try {
+    const msg = (err && (err.stack || err.message)) || String(err);
+    runtimeLogs.push(`[${new Date().toLocaleString('zh-CN')}] [CRASH-GUARD] unhandledRejection: ${msg}`);
+    if (runtimeLogs.length > MAX_LOG_LINES) runtimeLogs = runtimeLogs.slice(-MAX_LOG_LINES);
+  } catch (e) {}
+});
+
 // 内置翻译总开关：内置翻译（EdgeTranslate/MyMemory 直连）成为"翻译引擎"之一。
 // 仅当用户选择的翻译引擎为"内置"（settings.translationEngine === 'builtin'）时才会实际触发，
 // 避免与"沉浸式翻译"等扩展引擎同时生效（每次只用一个引擎）。
@@ -64,7 +95,7 @@ function addLog(level, message, details = '') {
   if (runtimeLogs.length > MAX_LOG_LINES) {
     runtimeLogs = runtimeLogs.slice(-MAX_LOG_LINES);
   }
-  console.log(logEntry);
+  try { console.log(logEntry); } catch (e) {}
 }
 
 function getLogs() {
@@ -129,10 +160,7 @@ const wxEdgeProxy = {
   async _start() {
     const exe = this.findEdgeExe();
     if (!exe) { addLog('WX-EDGE', '未找到Edge安装', 'Edge通道不可用'); return false; }
-    // 提前告知渲染端：即将调用系统 Edge 完成微信登录，避免安全软件误报时用户不明所以
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('wx-edge-starting', { msg: '正在调用系统 Edge 浏览器完成微信关联登录，如安全软件提示请点「允许」' });
-    }
+    // v1.3.85：去掉"正在调用系统 Edge"的 toast 提示（用户反馈不需要）
     const { spawn } = require('child_process');
     const profileDir = path.join(app.getPath('userData'), 'edge-wx-proxy');
     // 每次启动重建干净 profile（历史版本可能写入过 BLOCK 权限，必须清掉）
@@ -935,19 +963,21 @@ function normalizeFontSize(value) {
 
 function applyFontSizeToTab(tab) {
   if (!tab || !tab.webContents || tab.webContents.isDestroyed()) return;
+  // v1.3.85: 改用 Chromium 文本缩放（webFrame.setTextZoomFactor，在 preload 中执行）。
+  // 旧方案注入 html { font-size: Npx !important } 会破坏微云等 rem 布局站点
+  // （默认 html font-size:100px 被改成 16px 后整页塌缩成横条、登录框跑到顶部）。
   const fontSize = normalizeFontSize(globalState.settings.fontSize);
-  const script = `(() => {
-    const styleId = 'feimaotui-font-size-style';
-    let style = document.getElementById(styleId);
-    if (!style) {
-      style = document.createElement('style');
-      style.id = styleId;
-      document.documentElement.appendChild(style);
-    }
-    style.textContent = 'html { font-size: ${fontSize}px !important; }';
-  })()`;
-  tab.webContents.executeJavaScript(script).catch(error => addLog('SETTINGS', '应用字体大小失败', error.message));
+  const factor = fontSize / 16;
+  try {
+    tab.webContents.send('feimaotui-font-zoom-changed', factor);
+  } catch (e) {}
 }
+
+// preload 在每个页面（含子框架）加载时通过 sendSync 获取当前字号倍率，
+// 保证页面首帧渲染前文本缩放已生效（等效 Chrome「字体大小」设置的行为）。
+ipcMain.on('feimaotui-get-font-zoom', (event) => {
+  event.returnValue = normalizeFontSize(globalState.settings.fontSize) / 16;
+});
 
 function applyFontSizeToAllTabs() {
   for (const tab of globalState.tabs.values()) applyFontSizeToTab(tab);
@@ -2574,273 +2604,9 @@ function createTab(url = null, options = {}) {
     }
   });
 
-  // ========== 腾讯广告面板X按钮检测（主进程驱动，可扫描iframe） ==========
-  var _panelScanTimer = null;
-  var _lastPanelSig = '';
-
-  function scanForPanel() {
-    // 已禁用：改用 preload.js 的 MutationObserver 监听 splitview 面板
-    // 之前的扫描会误检测到 spaui-alert-close 等元素
-    return;
-    if (!view || !view.webContents || view.webContents.isDestroyed()) return;
-    var url = view.webContents.getURL();
-    if (!url || url.indexOf('ad.qq.com') === -1) return;
-
-    view.webContents.executeJavaScript(`
-      (function() {
-        var vw = window.innerWidth || 1920;
-        var vh = window.innerHeight || 1080;
-        var results = [];
-
-        function buildSelector(el, doc) {
-          try {
-            var parts = [];
-            var node = el;
-            for (var d = 0; d < 12 && node && node.nodeType === 1; d++) {
-              var part = node.tagName.toLowerCase();
-              if (node.id) {
-                part += '#' + node.id.replace(/"/g, '\\\\"');
-                parts.unshift(part);
-                break;
-              }
-              var parent = node.parentNode;
-              if (parent && parent.children) {
-                var sibs = parent.children;
-                var nth = 1;
-                for (var si = 0; si < sibs.length; si++) {
-                  if (sibs[si] === node) { nth = si + 1; break; }
-                }
-                part += ':nth-child(' + nth + ')';
-              }
-              parts.unshift(part);
-              node = node.parentElement;
-            }
-            return parts.join(' > ');
-          } catch(e) { return ''; }
-        }
-
-        function isVisible(el, dw) {
-          if (!el) return false;
-          var style;
-          try { style = dw.getComputedStyle(el); } catch(e) { return false; }
-          if (!style) return false;
-          if (style.display === 'none' || style.visibility === 'hidden') return false;
-          if (parseFloat(style.opacity) < 0.1) return false;
-          var rect;
-          try { rect = el.getBoundingClientRect(); } catch(e) { return false; }
-          if (!rect || rect.width < 4 || rect.height < 4) return false;
-          return rect;
-        }
-
-        function searchInDoc(doc, baseX, baseY, iframeIdx) {
-          var docResults = [];
-          if (!doc) return docResults;
-          var dw = doc.defaultView || window;
-
-          // 策略1：直接查找 id="icon-close"（腾讯广告专用）
-          var iconClose = doc.getElementById('icon-close');
-          if (iconClose) {
-            var rect = isVisible(iconClose, dw);
-            if (rect) {
-              docResults.push({
-                tag: iconClose.tagName,
-                cls: ((iconClose.className || '').toString()).substring(0, 100),
-                text: ((iconClose.textContent || '').trim()).substring(0, 20),
-                left: Math.round(baseX + rect.left),
-                top: Math.round(baseY + rect.top),
-                width: Math.round(rect.width),
-                height: Math.round(rect.height),
-                score: 999,
-                selector: '#' + iconClose.id,
-                inIframe: iframeIdx !== undefined,
-                iframeIdx: iframeIdx || 0
-              });
-            }
-          }
-
-          // 策略2：查找其他 id 包含 close 的元素
-          if (docResults.length === 0) {
-            var allWithId = doc.querySelectorAll('[id]');
-            for (var ii = 0; ii < allWithId.length; ii++) {
-              var el = allWithId[ii];
-              var eid = (el.id || '').toLowerCase();
-              if (eid.indexOf('close') === -1 && eid.indexOf('shut') === -1 && eid.indexOf('cancel') === -1) continue;
-              if (eid === 'icon-close') continue; // 已在策略1处理
-              var rect = isVisible(el, dw);
-              if (!rect) continue;
-              if (rect.width > 80 || rect.height > 80) continue;
-              if (rect.top > vh * 0.5) continue;
-              docResults.push({
-                tag: el.tagName,
-                cls: ((el.className || '').toString()).substring(0, 100),
-                text: ((el.textContent || '').trim()).substring(0, 20),
-                left: Math.round(baseX + rect.left),
-                top: Math.round(baseY + rect.top),
-                width: Math.round(rect.width),
-                height: Math.round(rect.height),
-                score: 500,
-                selector: buildSelector(el, doc),
-                inIframe: iframeIdx !== undefined,
-                iframeIdx: iframeIdx || 0
-              });
-              break; // 只取第一个
-            }
-          }
-
-          // 策略3：查找 class 包含 close 的小元素（<i>、<button>、<span>、<a>）
-          if (docResults.length === 0) {
-            var candidates = doc.querySelectorAll('i[class*="close"], button[class*="close"], span[class*="close"], a[class*="close"], div[class*="close"]');
-            for (var ci = 0; ci < candidates.length; ci++) {
-              var el = candidates[ci];
-              var rect = isVisible(el, dw);
-              if (!rect) continue;
-              if (rect.width > 60 || rect.height > 60) continue;
-              if (rect.top > vh * 0.5) continue;
-              var cls = ((el.className || '').toString()).toLowerCase();
-              // 排除 remove 类
-              if (cls.indexOf('remove') !== -1 && cls.indexOf('close') === -1) continue;
-              docResults.push({
-                tag: el.tagName,
-                cls: cls.substring(0, 100),
-                text: ((el.textContent || '').trim()).substring(0, 20),
-                left: Math.round(baseX + rect.left),
-                top: Math.round(baseY + rect.top),
-                width: Math.round(rect.width),
-                height: Math.round(rect.height),
-                score: 300,
-                selector: buildSelector(el, doc),
-                inIframe: iframeIdx !== undefined,
-                iframeIdx: iframeIdx || 0
-              });
-              break;
-            }
-          }
-
-          // 策略4：查找 splitview 面板内的关闭按钮
-          if (docResults.length === 0) {
-            var splitview = doc.getElementById('splitview');
-            if (splitview) {
-              var scls = ((splitview.className || '').toString()).toLowerCase();
-              if (scls.indexOf('show') !== -1) {
-                var svChildren = splitview.querySelectorAll('*');
-                for (var si = 0; si < svChildren.length; si++) {
-                  var el = svChildren[si];
-                  var tag = el.tagName;
-                  if (tag !== 'I' && tag !== 'BUTTON' && tag !== 'SPAN' && tag !== 'A' && tag !== 'DIV') continue;
-                  var ecl = ((el.className || '').toString()).toLowerCase();
-                  if (ecl.indexOf('close') === -1 && ecl.indexOf('cancel') === -1 && ecl.indexOf('fold') === -1) continue;
-                  var rect = isVisible(el, dw);
-                  if (!rect) continue;
-                  if (rect.width > 60 || rect.height > 60) continue;
-                  docResults.push({
-                    tag: el.tagName,
-                    cls: ecl.substring(0, 100),
-                    text: ((el.textContent || '').trim()).substring(0, 20),
-                    left: Math.round(baseX + rect.left),
-                    top: Math.round(baseY + rect.top),
-                    width: Math.round(rect.width),
-                    height: Math.round(rect.height),
-                    score: 400,
-                    selector: buildSelector(el, doc),
-                    inIframe: iframeIdx !== undefined,
-                    iframeIdx: iframeIdx || 0
-                  });
-                  break;
-                }
-              }
-            }
-          }
-
-          return docResults;
-        }
-
-        // 搜索主文档
-        var allResults = searchInDoc(document, 0, 0);
-
-        // 搜索同源iframe
-        var iframes = document.querySelectorAll('iframe');
-        for (var fi = 0; fi < iframes.length; fi++) {
-          try {
-            var iframe = iframes[fi];
-            var iRect = iframe.getBoundingClientRect();
-            if (iRect.width < 100 || iRect.height < 100) continue;
-            if (iRect.top > vh + 100 || iRect.bottom < -100) continue;
-            var idoc = null;
-            try { idoc = iframe.contentDocument; } catch(e) {}
-            if (!idoc) continue;
-            var iframeResults = searchInDoc(idoc, iRect.left, iRect.top, fi);
-            allResults = allResults.concat(iframeResults);
-          } catch(e) {}
-        }
-
-        if (allResults.length > 0) {
-          allResults.sort(function(a, b) { return b.score - a.score; });
-          var best = allResults[0];
-          window.__feimaotuiCloseTarget = best;
-          return JSON.stringify({
-            found: true,
-            closeBtn: best,
-            total: allResults.length,
-            top3: allResults.slice(0, 3).map(function(b) {
-              return { score: b.score, tag: b.tag, text: b.text, cls: (b.cls||'').substring(0,60), left: b.left, top: b.top, iframe: b.inIframe, selector: (b.selector||'').substring(0,80) };
-            })
-          });
-        }
-        window.__feimaotuiCloseTarget = null;
-        return JSON.stringify({ found: false, total: 0 });
-      })();
-    `).then(function(result) {
-      try {
-        var data = JSON.parse(result);
-        if (data.found && data.closeBtn) {
-          var btn = data.closeBtn;
-          var sig = btn.selector || (btn.left + ',' + btn.top + ',' + btn.score);
-          if (sig !== _lastPanelSig) {
-            _lastPanelSig = sig;
-            addLog('CLOSE-FIX', '检测到关闭按钮', 'score=' + btn.score + ' left=' + btn.left + ' top=' + btn.top +
-              ' tag=' + btn.tag + ' cls=' + (btn.cls || '').substring(0, 50) + ' text="' + btn.text + '"' +
-              ' selector=' + (btn.selector || '').substring(0, 80) +
-              (btn.inIframe ? ' [iframe#' + btn.iframeIdx + ']' : '') +
-              ' candidates=' + data.total);
-            if (data.top3) {
-              for (var ti = 0; ti < data.top3.length; ti++) {
-                addLog('CLOSE-FIX', '候选[' + ti + ']', 'score=' + data.top3[ti].score + ' tag=' + data.top3[ti].tag + ' cls=' + data.top3[ti].cls + ' selector=' + data.top3[ti].selector);
-              }
-            }
-          }
-          // 直接修复原始关闭按钮的图标显示（不创建覆盖框）
-          view.webContents.send('feimaotui-fix-close-btn', {
-            selector: btn.selector || '',
-            inIframe: btn.inIframe || false,
-            iframeIdx: btn.iframeIdx || 0
-          });
-        } else {
-          _lastPanelSig = '';
-        }
-      } catch(e) {
-        addLog('CLOSE-FIX', '解析检测结果异常', e.message || 'unknown');
-      }
-    }).catch(function(e) {});
-  }
-
-  // 页面加载完成后开始扫描
-  view.webContents.on('did-finish-load', () => {
-    addLog('CLOSE-FIX', 'did-finish-load', '开始扫描面板');
-    _lastPanelSig = '';
-    setTimeout(scanForPanel, 2000);
-    if (_panelScanTimer) clearInterval(_panelScanTimer);
-    _panelScanTimer = setInterval(scanForPanel, 1500);
-    setTimeout(function() { if (_panelScanTimer) { clearInterval(_panelScanTimer); _panelScanTimer = null; } }, 300000);
-  });
-
-  // 页面导航开始时清除状态
-  view.webContents.on('did-start-navigation', (event, url, isInPlace, isMainFrame) => {
-    if (isMainFrame) {
-      addLog('CLOSE-FIX', 'did-start-navigation', '延迟扫描');
-      _lastPanelSig = '';
-      setTimeout(scanForPanel, 3000);
-    }
-  });
+  // ========== 腾讯广告面板X按钮检测（已移除，v1.3.85 清理屎山） ==========
+  // 旧方案：主进程每1.5s轮询 executeJavaScript 扫描关闭按钮，已废弃且死代码250+行。
+  // 现行方案：preload.js 的 MutationObserver 监听 splitview 面板（保留不变）。
 
   // 监听渲染进程崩溃
   view.webContents.on('render-process-gone', (event, details) => {

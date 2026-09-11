@@ -1,4 +1,20 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webFrame } = require('electron');
+
+// v1.3.85: 字体大小设置改用 Chromium 文本缩放（webFrame.setTextZoomFactor）实现。
+// 旧方案在页面注入 html { font-size: 16px !important } 会破坏微云等 rem 布局站点
+// （它们默认 html font-size:100px，被强制改小后整页高度塌缩、登录框错位）。
+// 文本缩放与 Chrome「字体大小」设置同机制：等比缩放文字，不改动站点自身布局。
+try {
+  const fontZoomFactor = ipcRenderer.sendSync('feimaotui-get-font-zoom');
+  if (typeof fontZoomFactor === 'number' && fontZoomFactor > 0 && fontZoomFactor !== 1) {
+    webFrame.setTextZoomFactor(fontZoomFactor);
+  }
+} catch (e) {}
+ipcRenderer.on('feimaotui-font-zoom-changed', (event, factor) => {
+  try {
+    if (typeof factor === 'number' && factor > 0) webFrame.setTextZoomFactor(factor);
+  } catch (e) {}
+});
 
 // v1.3.82: 页面主世界的 window.close 桩（main.js did-start-navigation 注入）被调用时，
 // 通过 DOM 自定义事件跨世界通知 preload，再转发主进程记录"页面关闭信号"，
