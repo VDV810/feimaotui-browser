@@ -4643,6 +4643,47 @@ function notifySniffCountUpdate(count) {
 }
 
 // ==================== IPC 处理 ====================
+// ==================== 截图像素合成（v1.3.87） ====================
+// 旧方案：隐藏 offscreen 窗口 + canvas drawImage + 巨型 data URL，
+// 在 Electron 44 中 Promise 永不 resolve（运行日志只到"需要合成"，
+// 永远到不了"已复制到剪贴板"），导致截图后剪贴板无图、粘贴不出来。
+// 新方案：nativeImage 裸像素 Buffer 直接叠加，同步执行、毫秒级完成。
+function compositeNativeImages(base, overlay, dx, dy) {
+  const { nativeImage } = require('electron');
+  const baseSize = base.getSize();
+  const overSize = overlay.getSize();
+  const baseBuf = base.toBitmap();   // BGRA
+  const overBuf = overlay.toBitmap(); // BGRA
+  const out = Buffer.from(baseBuf);
+  const bw = baseSize.width, bh = baseSize.height;
+  const ow = overSize.width, oh = overSize.height;
+  const x0 = Math.max(0, dx), y0 = Math.max(0, dy);
+  const x1 = Math.min(bw, dx + ow), y1 = Math.min(bh, dy + oh);
+  for (let y = y0; y < y1; y++) {
+    const sRow = (y - dy) * ow;
+    const dRow = y * bw;
+    for (let x = x0; x < x1; x++) {
+      const si = (sRow + (x - dx)) * 4;
+      const a = overBuf[si + 3];
+      if (a === 0) continue; // 透明，保留底层
+      const di = (dRow + x) * 4;
+      if (a === 255) {
+        out[di] = overBuf[si];
+        out[di + 1] = overBuf[si + 1];
+        out[di + 2] = overBuf[si + 2];
+        out[di + 3] = 255;
+      } else {
+        const al = a / 255, ia = 1 - al;
+        out[di] = Math.round(out[di] * ia + overBuf[si] * al);
+        out[di + 1] = Math.round(out[di + 1] * ia + overBuf[si + 1] * al);
+        out[di + 2] = Math.round(out[di + 2] * ia + overBuf[si + 2] * al);
+        out[di + 3] = 255;
+      }
+    }
+  }
+  return nativeImage.createFromBitmap(out, { width: bw, height: bh });
+}
+
 function setupIPC() {
   // 截图区域选择完成（crop 是屏幕坐标 {x, y, w, h}）
   ipcMain.on('screenshot-region', async (event, crop) => {
@@ -4751,49 +4792,13 @@ function setupIPC() {
               height: bvCropH
             });
 
-            // 将 BrowserView 内容粘贴到主窗口截图的正确位置
-            // 使用 nativeImage 无法直接合成，需要用 data URL + canvas
-            const tempWin = new BrowserWindow({
-              width: imgW,
-              height: imgH,
-              show: false,
-              webPreferences: {
-                nodeIntegration: true,
-                contextIsolation: false,
-                offscreen: true
-              }
-            });
-
-            const composited = await new Promise((resolve, reject) => {
-              tempWin.webContents.once('did-finish-load', async () => {
-                try {
-                  const result = await tempWin.webContents.executeJavaScript(`
-                    new Promise((res) => {
-                      const c = document.createElement('canvas');
-                      c.width = ${imgW};
-                      c.height = ${imgH};
-                      const ctx = c.getContext('2d');
-                      const base = new Image();
-                      base.onload = () => {
-                        ctx.drawImage(base, 0, 0);
-                        const overlay = new Image();
-                        overlay.onload = () => {
-                          ctx.drawImage(overlay, ${Math.max(0, viewRelX)}, ${Math.max(0, viewRelY)}, ${bvCropW}, ${bvCropH});
-                          res(c.toDataURL('image/png'));
-                        };
-                        overlay.src = '${bvCrop.toDataURL()}';
-                      };
-                      base.src = '${winCrop.toDataURL()}';
-                    })
-                  `);
-                  resolve(nativeImage.createFromDataURL(result));
-                } catch (e) { reject(e); }
-                tempWin.close();
-              });
-              tempWin.loadURL('about:blank');
-            });
-
-            finalImage = composited;
+            // v1.3.87: 像素级直接合成，替代挂死的 offscreen canvas 方案
+            finalImage = compositeNativeImages(
+              winCrop,
+              bvCrop,
+              Math.max(0, viewRelX),
+              Math.max(0, viewRelY)
+            );
           }
         }
       }
