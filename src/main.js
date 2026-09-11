@@ -4684,6 +4684,31 @@ function compositeNativeImages(base, overlay, dx, dy) {
   return nativeImage.createFromBitmap(out, { width: bw, height: bh });
 }
 
+// 把位图写入系统剪贴板（v1.3.89）
+// Electron 44 中 clipboard.writeImage 已移除，clipboard.write({image}) 也会异步拒绝
+// （"expects an array of ClipboardItem"，而主进程没有 ClipboardItem 构造器）。
+// 采用与 copyFileForChat 相同的 PowerShell -STA 方案写位图，端到端测试通过。
+function writeImageToClipboard(image) {
+  return new Promise((resolve, reject) => {
+    try {
+      const tmpPng = path.join(os.tmpdir(), `feimaotui-clip-${Date.now()}-${Math.floor(Math.random() * 10000)}.png`);
+      fs.writeFileSync(tmpPng, image.toPNG());
+      const escaped = tmpPng.replace(/'/g, "''");
+      const script = [
+        'Add-Type -AssemblyName System.Windows.Forms',
+        'Add-Type -AssemblyName System.Drawing',
+        `$img = [System.Drawing.Image]::FromFile('${escaped}')`,
+        '[System.Windows.Forms.Clipboard]::SetImage($img)',
+        '$img.Dispose()',
+        `Remove-Item '${escaped}' -Force -ErrorAction SilentlyContinue`
+      ].join('; ');
+      execFile('powershell.exe', ['-NoProfile', '-STA', '-Command', script], { windowsHide: true, timeout: 8000 }, (error) => {
+        if (error) reject(error); else resolve();
+      });
+    } catch (e) { reject(e); }
+  });
+}
+
 function setupIPC() {
   // 截图区域选择完成（crop 是屏幕坐标 {x, y, w, h}）
   ipcMain.on('screenshot-region', async (event, crop) => {
@@ -4812,8 +4837,8 @@ function setupIPC() {
         height: Math.min(imgH, finalSize.height)
       });
 
-      // v1.3.88: Electron 44 移除了 clipboard.writeImage，改用 clipboard.write({image})
-      clipboard.write({ image: cropped });
+      // v1.3.89: clipboard.write({image}) 在 Electron 44 也会异步拒绝，改用 PowerShell STA 写位图
+      await writeImageToClipboard(cropped);
       addLog('SCREENSHOT', '截图已复制到剪贴板');
     } catch (error) {
       addLog('ERROR', '截图失败', error.message);
