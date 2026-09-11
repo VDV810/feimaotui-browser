@@ -1,8 +1,0 @@
-v1.3.86: 微云rem布局修复+EPIPE弹窗防护+界面清理+屎山清理
-
-- 字体大小设置改用 Chromium 文本缩放(webFrame.setTextZoomFactor): 旧方案注入 html{font-size:16px !important} 破坏微云等rem布局站点(整页塌缩成横条/登录框跑到顶部), 已用最小Electron复现验证
-- 主进程EPIPE/未捕获异常三层防护: stdout管道断开时console.log抛EPIPE导致错误弹窗循环, 现吞掉EPIPE+全局uncaughtException/unhandledRejection兜底
-- 移除微信关联登录"正在调用系统Edge"toast提示(用户反馈)
-- 移除工具栏扩展(拼图)按钮, 扩展仍自动加载
-- 删除scanForPanel死代码267行(废弃的腾讯广告面板X轮询, 含每页3个空转定时器)
-- 删除src/*.bak备份及根目录过期main.js/preload.js副本(不再打进app.asar)
