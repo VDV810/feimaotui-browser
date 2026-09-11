@@ -4812,7 +4812,8 @@ function setupIPC() {
         height: Math.min(imgH, finalSize.height)
       });
 
-      clipboard.writeImage(cropped);
+      // v1.3.88: Electron 44 移除了 clipboard.writeImage，改用 clipboard.write({image})
+      clipboard.write({ image: cropped });
       addLog('SCREENSHOT', '截图已复制到剪贴板');
     } catch (error) {
       addLog('ERROR', '截图失败', error.message);
