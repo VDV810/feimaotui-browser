@@ -1387,7 +1387,47 @@ function showPageContextMenu(tabId, params) {
       addLog('ADBLOCK', '开始标记广告', `坐标: x=${params.x}, y=${params.y}`);
       tab.webContents.executeJavaScript(`
         (function() {
-          // 生成CSS选择器
+          // v1.3.91：可移植选择器——用"类名链"定位同一元素，跨账户/跨页面DOM结构差异也能命中。
+          // 旧方案按 nth-of-type 绝对路径定位，换个账户顶部元素数量一变就失配（千川双账户实测踩坑）。
+          function classSelector(el) {
+            var cls = (typeof el.className === 'string' ? el.className : '').trim().split(/\\s+/).filter(function(c) { return c; });
+            if (!cls.length) return '';
+            return el.tagName.toLowerCase() + '.' + cls.map(function(c) { return CSS.escape(c); }).join('.');
+          }
+          function countMatches(sel) {
+            try { return document.querySelectorAll(sel).length; } catch (e) { return -1; }
+          }
+          function getRobustSelector(element) {
+            if (element.id) return '#' + CSS.escape(element.id);
+            var chain = [];        // 含类名的链（可移植）
+            var fallbackPath = []; // 旧式绝对路径（兜底）
+            var current = element;
+            var depth = 0;
+            while (current && current !== document.body && depth < 8) {
+              var cs = classSelector(current);
+              if (cs) {
+                chain.unshift(cs);
+                var candidate = chain.join(' > ');
+                if (countMatches(candidate) === 1) return candidate; // 在当前页唯一 => 稳定且可移植
+              }
+              // 同时维护旧式绝对路径做兜底
+              var pSel = current.tagName.toLowerCase();
+              var parent = current.parentElement;
+              if (parent) {
+                var siblings = Array.from(parent.children).filter(function(c) { return c.tagName === current.tagName; });
+                if (siblings.length > 1) pSel += ':nth-of-type(' + (siblings.indexOf(current) + 1) + ')';
+              }
+              fallbackPath.unshift(pSel);
+              current = parent;
+              depth++;
+            }
+            // 没有唯一类链：用最短的类名链（可能同页多个同类元素一起隐藏——对广告横幅通常正是想要的效果）
+            var classChain = chain.filter(function(s) { return s.indexOf('.') !== -1; });
+            if (classChain.length) return classChain.slice(0, 3).join(' > ');
+            // 最后兜底：旧式绝对路径
+            return fallbackPath.join(' > ');
+          }
+          // 生成CSS选择器（旧式绝对路径，仅作兜底）
           function getSelector(element) {
             if (element.id) return '#' + CSS.escape(element.id);
             var path = [];
@@ -1488,7 +1528,7 @@ function showPageContextMenu(tabId, params) {
             if (seenElements.has(el)) return;
             seenElements.add(el);
             elementsToMark.push({
-              selector: getSelector(el),
+              selector: getRobustSelector(el),
               tagName: el.tagName,
               text: (el.textContent || '').substring(0, 50).trim(),
               className: el.className || ''
@@ -1536,7 +1576,7 @@ function showPageContextMenu(tabId, params) {
               mode: 'single',
               count: 1,
               elements: [{
-                selector: getSelector(el),
+                selector: getRobustSelector(el),
                 tagName: el.tagName,
                 text: (el.textContent || '').substring(0, 50).trim(),
                 className: el.className || ''
