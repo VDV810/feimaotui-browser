@@ -1,6 +1,0 @@
-v1.3.90: 广告标记规则可分享(复制/剪贴板导入,自动去重立即生效) + 修右键标记闪烁/误标整页
-
-- 闪烁根因: 标记后用内联style隐藏,React SPA重渲染恢复style导致元素反复闪现;改为持久样式表注入(applyCustomAdRulesToTab带key管理,防did-finish-load重复叠加)
-- 误标根因: 单个标记用elementFromPoint会命中巨型容器(如整个app-content);改用elementsFromPoint过滤近乎全屏容器
-- 删除/清空规则不再整页reload,直接重写各标签页样式表(无感更新)
-- 分享: 每条规则「复制」/「复制全部标记」生成JSON -> 微信发给同事 -> 对方「从剪贴板导入标记」自动去重立即生效;也支持纯选择器文本一行一条(domain=*)
