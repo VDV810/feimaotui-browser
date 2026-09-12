@@ -714,6 +714,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   copyAdRule: (index) => ipcRenderer.invoke('copy-ad-rule', index),
   copyAllAdRules: () => ipcRenderer.invoke('copy-all-ad-rules'),
   importAdRulesFromClipboard: () => ipcRenderer.invoke('import-ad-rules-from-clipboard'),
+  // 切换单条规则作用域（仅本站 <-> 全站生效）（v1.3.92）
+  toggleAdRuleScope: (index) => ipcRenderer.invoke('toggle-ad-rule-scope', index),
 
   // 日志功能
   getLogs: () => ipcRenderer.invoke('get-logs'),

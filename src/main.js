@@ -1421,10 +1421,8 @@ function showPageContextMenu(tabId, params) {
               current = parent;
               depth++;
             }
-            // 没有唯一类链：用最短的类名链（可能同页多个同类元素一起隐藏——对广告横幅通常正是想要的效果）
-            var classChain = chain.filter(function(s) { return s.indexOf('.') !== -1; });
-            if (classChain.length) return classChain.slice(0, 3).join(' > ');
-            // 最后兜底：旧式绝对路径
+            // 没有唯一类链：不再用短类名链兜底（v1.3.91 实测会命中整站同类元素，误伤），
+            // 回退旧式绝对路径——只精确命中当前页面的这个位置
             return fallbackPath.join(' > ');
           }
           // 生成CSS选择器（旧式绝对路径，仅作兜底）
@@ -5646,6 +5644,25 @@ function setupIPC() {
     }
     addLog('ADBLOCK', '导入广告规则', `新增 ${added} 条, 已存在跳过 ${skipped} 条`);
     return { success: true, added, skipped, total: imported.length };
+  });
+
+  // v1.3.92：切换单条规则作用域（仅本站 <-> 全站生效）
+  // 同一个广告元素（如千川乘方横幅）会出现在多个站点，标记后一键切全站即可通吃
+  ipcMain.handle('toggle-ad-rule-scope', (event, index) => {
+    const rules = globalState.customAdRules || [];
+    if (index < 0 || index >= rules.length) return { success: false, error: '索引无效' };
+    const r = rules[index];
+    if (r.domain === '*') {
+      // 全站 -> 切回原站点（切到全站时会把原域名记在 originDomain）
+      r.domain = (r.originDomain && r.originDomain !== '*') ? r.originDomain : '*';
+    } else {
+      r.originDomain = r.domain;
+      r.domain = '*';
+    }
+    saveData();
+    globalState.tabs.forEach((tab) => applyCustomAdRulesToTab(tab));
+    addLog('ADBLOCK', '切换规则作用域', `现为: ${r.domain === '*' ? '全站生效' : r.domain} | ${r.selector}`);
+    return { success: true, domain: r.domain };
   });
 
   ipcMain.handle('select-download-path', async () => {

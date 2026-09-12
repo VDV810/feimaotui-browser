@@ -2060,7 +2060,12 @@ async function loadCustomAdRules() {
             html += '<div style="font-weight: 600; color: #333;">' + domain + ' <span style="color: #bbb; font-weight: normal; font-size: 11px;">' + timeStr + '</span></div>';
             html += '<div style="color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="' + selector.replace(/"/g, '&quot;') + '">' + shortSelector + '</div>';
             html += '</div>';
-            html += '<button data-rule-index="' + originalIndex + '" class="copy-rule-btn" style="background: #1890ff; color: white; border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 11px; margin-left: 8px; flex-shrink: 0;">复制</button>';
+            // 作用域按钮（v1.3.92）：仅本站 <-> 全站生效，一键切换
+            const isGlobal = domain === '*';
+            const scopeLabel = isGlobal ? '全站生效' : ('仅' + (domain.split('.')[0] || domain));
+            const scopeBg = isGlobal ? '#52c41a' : '#8c8c8c';
+            html += '<button data-rule-index="' + originalIndex + '" class="scope-rule-btn" title="点击切换：仅本站生效 / 所有网站生效" style="background: ' + scopeBg + '; color: white; border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 11px; margin-left: 8px; flex-shrink: 0;">' + scopeLabel + '</button>';
+            html += '<button data-rule-index="' + originalIndex + '" class="copy-rule-btn" style="background: #1890ff; color: white; border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 11px; margin-left: 4px; flex-shrink: 0;">复制</button>';
             html += '<button data-rule-index="' + originalIndex + '" class="delete-rule-btn" style="background: #ff4d4f; color: white; border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 11px; margin-left: 4px; flex-shrink: 0;">删除</button>';
             html += '</div>';
         });
