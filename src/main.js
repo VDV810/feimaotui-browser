@@ -909,6 +909,34 @@ function createMainWindow() {
   return mainWindow;
 }
 
+// ==================== 自定义广告规则 CSS 统一注入（v1.3.90） ====================
+// 用持久样式表而非内联样式：React SPA（千川/腾讯广告）重渲染或重建节点后，
+// 样式表规则仍会命中选择器继续隐藏；旧方案的内联 style 会被 React 的 style diff
+// 恢复，导致已隐藏元素反复闪现（页面一闪一闪的根因）。
+// 同时用 tab.__adRuleCssKey 记录已注入样式表，注入前先移除，避免每次 did-finish-load 叠加。
+function applyCustomAdRulesToTab(tab) {
+  try {
+    const wc = tab && tab.view && tab.view.webContents;
+    if (!wc || wc.isDestroyed()) return;
+    let currentDomain = '';
+    try { currentDomain = new URL(wc.getURL() || tab.url || '').hostname; } catch (e) {}
+    if (!currentDomain) return;
+    const domainRules = (globalState.customAdRules || []).filter(r => r.domain === currentDomain || r.domain === '*');
+    // 先移除上次注入的样式表（导航后旧 key 已失效，失败静默忽略）
+    if (tab.__adRuleCssKey) {
+      try { wc.removeInsertedCSS(tab.__adRuleCssKey).catch(() => {}); } catch (e) {}
+      tab.__adRuleCssKey = null;
+    }
+    if (domainRules.length > 0) {
+      const adCss = domainRules.map(r => `${r.selector} { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; }`).join('\n');
+      wc.insertCSS(adCss, { cssOrigin: 'user' }).then(key => { tab.__adRuleCssKey = key; }).catch(() => {});
+      addLog('ADBLOCK', '注入广告规则CSS', `${domainRules.length} 条规则 (${currentDomain})`);
+    }
+  } catch (e) {
+    addLog('ERROR', '注入广告规则CSS失败', e.message);
+  }
+}
+
 // ==================== 关键修复：三栏布局后的BrowserView尺寸计算 ====================
 function resizeActiveTab() {
   updateBrowserViewLayout();
@@ -1488,7 +1516,21 @@ function showPageContextMenu(tabId, params) {
             });
           } else {
             // 单个标记模式：右键点击的元素
-            var el = document.elementFromPoint(${params.x}, ${params.y});
+            // v1.3.90：用 elementsFromPoint 从上往下选第一个"合理"元素——
+            // 跳过 body/html 和几乎全屏的巨型容器（如整个 app-content），
+            // 避免一标记就把整页内容隐藏掉（千川页面实测踩坑）
+            var stack = document.elementsFromPoint(${params.x}, ${params.y});
+            var el = null;
+            for (var i = 0; i < stack.length; i++) {
+              var e = stack[i];
+              if (e === document.body || e === document.documentElement) continue;
+              var r = e.getBoundingClientRect();
+              var vw = window.innerWidth || document.documentElement.clientWidth;
+              var vh = window.innerHeight || document.documentElement.clientHeight;
+              if (r.width > vw * 0.9 && r.height > vh * 0.9) continue; // 近乎全屏的容器跳过
+              el = e; break;
+            }
+            if (!el && stack.length > 0) el = stack[0];
             if (!el) return null;
             return JSON.stringify({
               mode: 'single',
@@ -1535,27 +1577,10 @@ function showPageContextMenu(tabId, params) {
             saveData();
             addLog('ADBLOCK', '批量保存完成', '新增: ' + addedCount + ' 条, 已存在: ' + existCount + ' 条');
             
-            // 立即隐藏当前页面的所有匹配元素
-            tab.webContents.executeJavaScript(`
-              (function() {
-                var rules = ${JSON.stringify(data.elements.map(e => e.selector))};
-                var totalCount = 0;
-                rules.forEach(function(selector) {
-                  try {
-                    var els = document.querySelectorAll(selector);
-                    els.forEach(function(el) {
-                      el.setAttribute('style', 'display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important;');
-                      totalCount++;
-                    });
-                  } catch(e) {}
-                });
-                return totalCount;
-              })();
-            `).then(count => {
-              addLog('ADBLOCK', '已隐藏元素', '成功隐藏 ' + count + ' 个元素');
-            }).catch(err => {
-              addLog('ADBLOCK', '隐藏元素失败', err.message);
-            });
+            // 立即生效：把新规则作为持久样式表注入（v1.3.90）。
+            // 不再用内联 style hack——React SPA 重渲染会恢复 style 属性导致元素闪现；
+            // 样式表规则在节点被 React 重建后依然命中选择器，隐藏稳定不闪。
+            applyCustomAdRulesToTab(tab);
           } catch(e) {
             addLog('ADBLOCK', '解析失败', e.message);
           }
@@ -2537,16 +2562,8 @@ function createTab(url = null, options = {}) {
       }
     `).catch(() => {});
 
-    // 注入自定义广告规则CSS：隐藏用户标记的广告元素
-    if (globalState.customAdRules && globalState.customAdRules.length > 0) {
-      const currentDomain = new URL(tab.url).hostname;
-      const domainRules = globalState.customAdRules.filter(r => r.domain === currentDomain || r.domain === '*');
-      if (domainRules.length > 0) {
-        const adCss = domainRules.map(r => `${r.selector} { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; }`).join('\n');
-        view.webContents.insertCSS(adCss).catch(() => {});
-        addLog('ADBLOCK', '注入广告规则CSS', `${domainRules.length} 条规则 (${currentDomain})`);
-      }
-    }
+    // 注入自定义广告规则CSS：隐藏用户标记的广告元素（v1.3.90 统一走带 key 管理的注入）
+    applyCustomAdRulesToTab(tab);
 
     // 注入 CSS：隐藏其他翻译扩展的悬浮 UI（只留沉浸式自带的粉色浮球）
     try {
@@ -5513,12 +5530,8 @@ function setupIPC() {
       const removed = globalState.customAdRules.splice(index, 1);
       saveData();
       addLog('ADBLOCK', '删除广告规则', removed[0].selector);
-      // 通知所有标签页重新加载以移除CSS
-      globalState.tabs.forEach((tab) => {
-        if (tab.view && tab.view.webContents && !tab.view.webContents.isDestroyed()) {
-          tab.view.webContents.reload();
-        }
-      });
+      // v1.3.90：不再整页 reload，直接重写各标签页的广告规则样式表（无感更新）
+      globalState.tabs.forEach((tab) => applyCustomAdRulesToTab(tab));
       return { success: true };
     }
     return { success: false, error: '索引无效' };
@@ -5529,12 +5542,70 @@ function setupIPC() {
     globalState.customAdRules = [];
     saveData();
     addLog('ADBLOCK', '清空所有广告规则', `${count} 条`);
-    globalState.tabs.forEach((tab) => {
-      if (tab.view && tab.view.webContents && !tab.view.webContents.isDestroyed()) {
-        tab.view.webContents.reload();
+    globalState.tabs.forEach((tab) => applyCustomAdRulesToTab(tab));
+    return { success: true, count };
+  });
+
+  // ==================== 广告规则分享：复制/导入（v1.3.90） ====================
+  // 分享格式：{"type":"feimaotui-ad-rules","version":1,"rules":[{domain,selector,createdAt}]}
+  function formatAdRulesPayload(rules) {
+    return JSON.stringify({ type: 'feimaotui-ad-rules', version: 1, rules: rules.map(r => ({ domain: r.domain || '*', selector: r.selector, createdAt: r.createdAt || Date.now() })) }, null, 2);
+  }
+
+  // 从文本解析规则：支持分享格式 / 裸数组 / 单条对象 / 纯选择器文本（一行一条，域名为 *）
+  function parseAdRulesPayload(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return [];
+    try {
+      const obj = JSON.parse(raw);
+      let list = [];
+      if (obj && obj.type === 'feimaotui-ad-rules' && Array.isArray(obj.rules)) list = obj.rules;
+      else if (Array.isArray(obj)) list = obj;
+      else if (obj && obj.selector) list = [obj];
+      return list.filter(r => r && r.selector).map(r => ({ domain: r.domain || '*', selector: String(r.selector), createdAt: r.createdAt || Date.now() }));
+    } catch (e) {
+      // 非JSON：按纯选择器解析（一行一条，忽略空行和注释）
+      return raw.split('\n').map(s => s.trim()).filter(s => s && !s.startsWith('#')).map(s => ({ domain: '*', selector: s, createdAt: Date.now() }));
+    }
+  }
+
+  ipcMain.handle('copy-ad-rule', (event, index) => {
+    const rules = globalState.customAdRules || [];
+    if (index < 0 || index >= rules.length) return { success: false, error: '索引无效' };
+    clipboard.writeText(formatAdRulesPayload([rules[index]]));
+    addLog('ADBLOCK', '复制广告规则', rules[index].selector);
+    return { success: true };
+  });
+
+  ipcMain.handle('copy-all-ad-rules', () => {
+    const rules = globalState.customAdRules || [];
+    if (rules.length === 0) return { success: false, error: '暂无规则可复制' };
+    clipboard.writeText(formatAdRulesPayload(rules));
+    addLog('ADBLOCK', '复制全部广告规则', `${rules.length} 条`);
+    return { success: true, count: rules.length };
+  });
+
+  ipcMain.handle('import-ad-rules-from-clipboard', () => {
+    const text = clipboard.readText();
+    const imported = parseAdRulesPayload(text);
+    if (imported.length === 0) return { success: false, error: '剪贴板里没有可识别的标记规则（需先在对方电脑上点「复制」）' };
+    let added = 0, skipped = 0;
+    imported.forEach(rule => {
+      const exists = (globalState.customAdRules || []).some(r => r.selector === rule.selector && r.domain === rule.domain);
+      if (!exists) {
+        globalState.customAdRules.push(rule);
+        added++;
+      } else {
+        skipped++;
       }
     });
-    return { success: true, count };
+    if (added > 0) {
+      saveData();
+      // 立即对所有标签页生效（无需刷新页面）
+      globalState.tabs.forEach((tab) => applyCustomAdRulesToTab(tab));
+    }
+    addLog('ADBLOCK', '导入广告规则', `新增 ${added} 条, 已存在跳过 ${skipped} 条`);
+    return { success: true, added, skipped, total: imported.length };
   });
 
   ipcMain.handle('select-download-path', async () => {

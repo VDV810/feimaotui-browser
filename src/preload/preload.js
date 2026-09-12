@@ -710,6 +710,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getCustomAdRules: () => ipcRenderer.invoke('get-custom-ad-rules'),
   deleteCustomAdRule: (index) => ipcRenderer.invoke('delete-custom-ad-rule', index),
   clearCustomAdRules: () => ipcRenderer.invoke('clear-custom-ad-rules'),
+  // 广告规则分享（v1.3.90）：复制单条/全部到剪贴板，从剪贴板导入
+  copyAdRule: (index) => ipcRenderer.invoke('copy-ad-rule', index),
+  copyAllAdRules: () => ipcRenderer.invoke('copy-all-ad-rules'),
+  importAdRulesFromClipboard: () => ipcRenderer.invoke('import-ad-rules-from-clipboard'),
 
   // 日志功能
   getLogs: () => ipcRenderer.invoke('get-logs'),

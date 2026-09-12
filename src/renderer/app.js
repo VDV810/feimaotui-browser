@@ -432,6 +432,33 @@ function setupEventListeners() {
         });
     }
 
+    // 广告规则分享（v1.3.90）：从剪贴板导入 / 复制全部
+    const importAdRulesBtn = document.getElementById('importAdRulesBtn');
+    if (importAdRulesBtn) {
+        importAdRulesBtn.addEventListener('click', async () => {
+            const result = await window.electronAPI.importAdRulesFromClipboard();
+            if (result.success) {
+                await loadCustomAdRules();
+                importAdRulesBtn.textContent = `已导入 ${result.added} 条`;
+                setTimeout(() => { importAdRulesBtn.textContent = '从剪贴板导入标记'; }, 2000);
+            } else {
+                alert(`导入失败：${result.error || '未知错误'}`);
+            }
+        });
+    }
+    const copyAllAdRulesBtn = document.getElementById('copyAllAdRulesBtn');
+    if (copyAllAdRulesBtn) {
+        copyAllAdRulesBtn.addEventListener('click', async () => {
+            const result = await window.electronAPI.copyAllAdRules();
+            if (result.success) {
+                copyAllAdRulesBtn.textContent = `已复制 ${result.count} 条`;
+                setTimeout(() => { copyAllAdRulesBtn.textContent = '复制全部标记'; }, 2000);
+            } else {
+                alert(result.error || '复制失败');
+            }
+        });
+    }
+
     // 导出书签
     if (elements.exportBookmarksBtn) {
         elements.exportBookmarksBtn.addEventListener('click', async () => {
@@ -2033,7 +2060,8 @@ async function loadCustomAdRules() {
             html += '<div style="font-weight: 600; color: #333;">' + domain + ' <span style="color: #bbb; font-weight: normal; font-size: 11px;">' + timeStr + '</span></div>';
             html += '<div style="color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="' + selector.replace(/"/g, '&quot;') + '">' + shortSelector + '</div>';
             html += '</div>';
-            html += '<button data-rule-index="' + originalIndex + '" class="delete-rule-btn" style="background: #ff4d4f; color: white; border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 11px; margin-left: 8px; flex-shrink: 0;">删除</button>';
+            html += '<button data-rule-index="' + originalIndex + '" class="copy-rule-btn" style="background: #1890ff; color: white; border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 11px; margin-left: 8px; flex-shrink: 0;">复制</button>';
+            html += '<button data-rule-index="' + originalIndex + '" class="delete-rule-btn" style="background: #ff4d4f; color: white; border: none; border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 11px; margin-left: 4px; flex-shrink: 0;">删除</button>';
             html += '</div>';
         });
         elements.customAdRulesList.innerHTML = html;
@@ -2043,6 +2071,19 @@ async function loadCustomAdRules() {
                 const idx = parseInt(btn.dataset.ruleIndex);
                 await window.electronAPI.deleteCustomAdRule(idx);
                 await loadCustomAdRules();
+            });
+        });
+        // 绑定复制按钮事件（v1.3.90：单条规则分享）
+        elements.customAdRulesList.querySelectorAll('.copy-rule-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const idx = parseInt(btn.dataset.ruleIndex);
+                const result = await window.electronAPI.copyAdRule(idx);
+                if (result && result.success) {
+                    btn.textContent = '已复制';
+                    setTimeout(() => { btn.textContent = '复制'; }, 1500);
+                } else {
+                    alert((result && result.error) || '复制失败');
+                }
             });
         });
     } catch (error) {
