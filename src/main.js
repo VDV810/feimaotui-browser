@@ -979,6 +979,24 @@ ipcMain.on('feimaotui-get-font-zoom', (event) => {
   event.returnValue = normalizeFontSize(globalState.settings.fontSize) / 16;
 });
 
+// v1.3.94: 标记广告规则 CSS 首帧注入（参考手机版 v2.5.2 方案）
+// preload 在 document_start 通过 sendSync 拉取全量规则，广告元素从第一帧起就是 display:none，
+// 彻底消除"页面先渲染广告、did-finish-load 才隐藏"的闪现。
+// 全量注入不分域名：选择器是用户标记时的精确结构特征，跨站碰撞概率极低（手机版实测结论）。
+ipcMain.on('feimaotui-get-adblock-css', (event) => {
+  try {
+    if (!globalState.settings.adblockEnabled) { event.returnValue = ''; return; }
+    const rules = globalState.customAdRules || [];
+    if (rules.length === 0) { event.returnValue = ''; return; }
+    event.returnValue = rules
+      .filter(r => r.selector)
+      .map(r => `${r.selector} { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; }`)
+      .join('\n');
+  } catch (e) {
+    event.returnValue = '';
+  }
+});
+
 function applyFontSizeToAllTabs() {
   for (const tab of globalState.tabs.values()) applyFontSizeToTab(tab);
 }
@@ -2537,8 +2555,10 @@ function createTab(url = null, options = {}) {
       }
     `).catch(() => {});
 
-    // 注入自定义广告规则CSS：隐藏用户标记的广告元素
-    if (globalState.customAdRules && globalState.customAdRules.length > 0) {
+    // 注入自定义广告规则CSS：did-finish-load 兜底（v1.3.94）
+    // 首帧注入在 preload（参考手机版 v2.5.2），此处仅作双保险——防 preload 注入的 style 被站点清理，
+    // 并覆盖 preload 注入之后才新增的标记。开关关闭时不注入（与首帧注入一致）。
+    if (globalState.settings.adblockEnabled && globalState.customAdRules && globalState.customAdRules.length > 0) {
       const currentDomain = new URL(tab.url).hostname;
       const domainRules = globalState.customAdRules.filter(r => r.domain === currentDomain || r.domain === '*');
       if (domainRules.length > 0) {

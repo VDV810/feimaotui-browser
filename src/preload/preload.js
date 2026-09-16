@@ -16,6 +16,39 @@ ipcRenderer.on('feimaotui-font-zoom-changed', (event, factor) => {
   } catch (e) {}
 });
 
+// v1.3.94: 标记广告规则 CSS 首帧注入（参考手机版 v2.5.2 方案，消除广告闪现）
+// preload 运行于 document_start，此处注入的 CSS 在浏览器解析页面之前就位——
+// 广告元素从第一帧起就是 display:none，压根没渲染过，而不是渲染后再隐藏。
+// 兜底链：本首帧注入 → did-finish-load 的 insertCSS 兜底 → 右键标记立即隐藏。
+(function injectAdRulesEarly() {
+  try {
+    const adCss = ipcRenderer.sendSync('feimaotui-get-adblock-css');
+    if (!adCss) return;
+    const inject = () => {
+      try {
+        if (document.getElementById('feimaotui-ad-rules')) return;
+        const s = document.createElement('style');
+        s.id = 'feimaotui-ad-rules';
+        s.textContent = adCss;
+        // document_start 时 html 元素已创建但 head/body 可能还没解析，挂到 html 上即可生效
+        (document.head || document.documentElement).appendChild(s);
+      } catch (e) {}
+    };
+    if (document.documentElement) {
+      inject();
+    } else {
+      // DOM 未挂载（v2.5.1 教训）：MutationObserver 等 DOM 一出现立刻挂载，任何元素出现之前
+      const mo = new MutationObserver(() => {
+        if (document.documentElement) {
+          mo.disconnect();
+          inject();
+        }
+      });
+      mo.observe(document, { childList: true });
+    }
+  } catch (e) {}
+})();
+
 // v1.3.82: 页面主世界的 window.close 桩（main.js did-start-navigation 注入）被调用时，
 // 通过 DOM 自定义事件跨世界通知 preload，再转发主进程记录"页面关闭信号"，
 // 用于主窗口 close 时区分「用户点X正常退出」与「页面冒泡关闭(拦截)」。
