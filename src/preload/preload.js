@@ -80,23 +80,32 @@ ipcRenderer.on('feimaotui-font-zoom-changed', (event, factor) => {
   } catch (e) {}
 })();
 
-// v2.1.0: 标记过的弹窗自动关闭（点站点自带 X）
-// 弹窗类规则(选择器含 modal/dialog/popup/drawer/mask/overlay/layer)匹配的元素出现时，
-// 点击其内部关闭按钮 —— 站点自己的关闭逻辑会把遮罩/portal/弹窗状态整套正确清理，
-// 页面立即恢复，不留灰色蒙层。CSS 隐藏仅作关闭失败时的兜底。
+// v2.2.0: 标记过的弹窗自动关闭（宽松选择器匹配卡片 → 向上定位弹窗根 → 点站点X / 无X则内联藏根）
+// 精确选择器在 SPA 刷新后失配(8.txt 实锤轮询零命中)，宽松版(class链)稳定命中；
+// 点X让站点正确清理遮罩/portal/状态；无X的弹窗内联隐藏弹窗根（遮罩在根上一并消失）。
 (function autoCloseMarkedModals() {
   try {
     const modalSelectors = ipcRenderer.sendSync('feimaotui-get-modal-selectors');
     if (!modalSelectors || modalSelectors.length === 0) return;
+    const MODAL_RE = /(modal|dialog|popup|drawer|mask|overlay|layer)/i;
     setInterval(function() {
       try {
         modalSelectors.forEach(function(sel) {
-          document.querySelectorAll(sel).forEach(function(el) {
-            if (el.__fmtCloseTried) return;
-            el.__fmtCloseTried = true;
-            var btn = el.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
+          document.querySelectorAll(sel).forEach(function(card) {
+            var root = card, up = 0, best = null;
+            while (root && root.nodeType === 1 && root !== document.body && up < 6) {
+              var cls = (root.className && typeof root.className === 'string') ? root.className : '';
+              if (MODAL_RE.test(cls)) best = root;
+              root = root.parentElement; up++;
+            }
+            var target = best || card;
+            if (target.__fmtCloseTried) return;
+            target.__fmtCloseTried = true;
+            var btn = target.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
             if (btn) {
               try { btn.click(); console.warn('[AD-PRELOAD] 已自动点击弹窗关闭按钮'); } catch (e) {}
+            } else {
+              try { target.style.setProperty('display', 'none', 'important'); console.warn('[AD-PRELOAD] 弹窗无关闭按钮, 已内联隐藏弹窗根'); } catch (e) {}
             }
           });
         });

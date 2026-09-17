@@ -1018,35 +1018,52 @@ ipcMain.on('feimaotui-get-adblock-css', (event) => {
 // 只做 CSS 隐藏时，卡片藏了遮罩还盖着（千川新人弹窗实测整页灰蒙蒙）；
 // 站点的 X 关闭逻辑会把整套组件正确卸载，页面立即恢复。
 // className 含 modal/dialog/popup/drawer/mask/overlay/layer 的规则视为弹窗类。
-function buildModalCloseClickJS(rules) {
-  const modalRules = (rules || []).filter(r =>
-    /modal|dialog|popup|drawer|mask|overlay|layer/i.test(r.className || r.selector || ''));
-  if (modalRules.length === 0) return '';
+// v2.2.0: 弹窗自动关闭 JS（宽松选择器匹配卡片 → 向上定位弹窗根 → 点X / 找不到X则内联藏根）
+// 精确选择器在 SPA 刷新后失配（8.txt 实锤），宽松版(class链)稳定命中；
+// 点X让站点正确清理遮罩/portal/状态；无X的弹窗内联隐藏弹窗根（遮罩在根上一并消失）。
+function buildModalCloseClickJS(selectors) {
+  const sels = (selectors || []).filter(Boolean);
+  if (sels.length === 0) return '';
   return `
 (function() {
-  var sels = ${JSON.stringify(modalRules.map(r => r.selector))};
-  var clicked = 0;
+  var sels = ${JSON.stringify(sels)};
+  var MODAL_RE = /(modal|dialog|popup|drawer|mask|overlay|layer)/i;
+  var clicked = 0, forceHidden = 0;
   sels.forEach(function(sel) {
     try {
-      document.querySelectorAll(sel).forEach(function(el) {
-        if (el.__fmtCloseTried) return;
-        el.__fmtCloseTried = true;
-        var btn = el.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
+      document.querySelectorAll(sel).forEach(function(card) {
+        var root = card, up = 0, best = null;
+        while (root && root.nodeType === 1 && root !== document.body && up < 6) {
+          var cls = (root.className && typeof root.className === 'string') ? root.className : '';
+          if (MODAL_RE.test(cls)) best = root;
+          root = root.parentElement; up++;
+        }
+        var target = best || card;
+        if (target.__fmtCloseTried) return;
+        target.__fmtCloseTried = true;
+        var btn = target.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
         if (btn) { try { btn.click(); clicked++; } catch (e) {} }
+        else { try { target.style.setProperty('display', 'none', 'important'); forceHidden++; } catch (e) {} }
       });
     } catch (e) {}
   });
-  return clicked;
+  return JSON.stringify({ clicked: clicked, forceHidden: forceHidden });
 })();`;
 }
 
-// v2.1.0: 弹窗类标记规则选择器列表（preload 轮询自动关闭用）
+// v2.2.0: 弹窗类标记规则选择器列表（preload 轮询自动关闭用）
+// 返回宽松版（去 nth）—— 精确版在 SPA 刷新后结构漂移即失配（8.txt 实锤：轮询一次都没命中），
+// 宽松版仅依赖 class 链，刷新后仍能找到弹窗卡片，再向上定位弹窗根点 X
 ipcMain.on('feimaotui-get-modal-selectors', (event) => {
   try {
     if (!globalState.settings.adblockEnabled) { event.returnValue = []; return; }
-    event.returnValue = (globalState.customAdRules || [])
-      .filter(r => r.selector && /modal|dialog|popup|drawer|mask|overlay|layer/i.test(r.selector))
-      .map(r => r.selector);
+    const sels = new Set();
+    for (const r of (globalState.customAdRules || [])) {
+      if (!r.selector || !/modal|dialog|popup|drawer|mask|overlay|layer/i.test(r.selector)) continue;
+      const loose = looseSelectorOf(r.selector);
+      if (loose) sels.add(loose);
+    }
+    event.returnValue = [...sels];
   } catch (e) {
     event.returnValue = [];
   }
@@ -1704,10 +1721,12 @@ function showPageContextMenu(tabId, params) {
             }).catch(err => {
               addLog('ADBLOCK', '隐藏元素失败', err.message);
             });
-            const closeClickJS = buildModalCloseClickJS(markRules);
+            const closeClickJS = buildModalCloseClickJS(markRules.map(r => r.selector));
             if (closeClickJS) {
-              tab.webContents.executeJavaScript(closeClickJS).then(n => {
-                if (n > 0) addLog('ADBLOCK', '已点击弹窗关闭按钮', n + ' 个（站点自行清理遮罩/弹窗状态）');
+              tab.webContents.executeJavaScript(closeClickJS).then(resStr => {
+                const res = JSON.parse(resStr);
+                if (res.clicked > 0) addLog('ADBLOCK', '已点击弹窗关闭按钮', res.clicked + ' 个（站点自行清理遮罩/弹窗状态）');
+                if (res.forceHidden > 0) addLog('ADBLOCK', '弹窗无关闭按钮', '已内联隐藏弹窗根 ' + res.forceHidden + ' 个');
               }).catch(() => {});
             }
           } catch(e) {

@@ -117,26 +117,48 @@ app.whenReady().then(async () => {
   console.log('[升级后]', d.afterCls, '| 选择器:', d.sel);
   console.log('[结果] 卡片已不渲染(零尺寸):', d.cardGone, '| 遮罩根隐藏:', d.maskRootHidden, '| 普通页面不受影响:', d.plainOk);
 
-  // ── 测试2: v2.1.0 自动关闭 —— 模拟 preload 轮询点击站点 X → 整个弹窗(含遮罩)被站点移除 ──
+  // ── 测试2: v2.2.0 自动关闭 —— 模拟"刷新后结构漂移": 精确选择器失效, 宽松选择器命中卡片
+  //    → 向上定位弹窗根 → 点站点X → 整个弹窗(含遮罩)被站点移除 ──
   await new Promise(rr => setTimeout(rr, 300));
   const r2 = await win.webContents.executeJavaScript(`
     (function(){
-      // 复刻 preload autoCloseMarkedModals 轮询核心
-      var sel = ${JSON.stringify(d.sel)};
+      // 在弹窗前插一个新兄弟, 模拟刷新后 nth 漂移 → 精确选择器(:nth-child(2))失效
+      var ph = document.createElement('div');
+      ph.className = 'new-sibling-after-refresh';
+      document.body.insertBefore(ph, document.querySelector('.ocean-vmok-plugin-oc-modal'));
+      var preciseSel = ${JSON.stringify(d.sel)};
+      var looseSel = 'div.new-comer-report-custom-body'; // 宽松版(主进程 looseSelectorOf 生成)
+      var preciseHits = document.querySelectorAll(preciseSel).length;
+      var looseHits = document.querySelectorAll(looseSel).length;
+      // 复刻 preload autoCloseMarkedModals v2.2.0 轮询核心
+      var MODAL_RE = /(modal|dialog|popup|drawer|mask|overlay|layer)/i;
       var clicked = 0;
-      document.querySelectorAll(sel).forEach(function(el) {
-        if (el.__fmtCloseTried) return;
-        el.__fmtCloseTried = true;
-        var btn = el.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
+      document.querySelectorAll(looseSel).forEach(function(card) {
+        var root = card, up = 0, best = null;
+        while (root && root.nodeType === 1 && root !== document.body && up < 6) {
+          var cls = (root.className && typeof root.className === 'string') ? root.className : '';
+          if (MODAL_RE.test(cls)) best = root;
+          root = root.parentElement; up++;
+        }
+        var target = best || card;
+        if (target.__fmtCloseTried) return;
+        target.__fmtCloseTried = true;
+        var btn = target.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
         if (btn) { try { btn.click(); clicked++; } catch (e) {} }
+        else { try { target.style.setProperty('display', 'none', 'important'); } catch (e) {} }
       });
-      return JSON.stringify({ clicked: clicked, modalInDom: !!document.querySelector('.ocean-vmok-plugin-oc-modal') });
+      return JSON.stringify({
+        preciseHits: preciseHits, looseHits: looseHits, clicked: clicked,
+        modalInDom: !!document.querySelector('.ocean-vmok-plugin-oc-modal')
+      });
     })()
   `);
   const d2 = JSON.parse(r2);
+  console.log('[测试2] 精确选择器命中(漂移后):', d2.preciseHits, '| 宽松选择器命中:', d2.looseHits);
   console.log('[测试2] 自动点击X:', d2.clicked, '| 站点已移除整个弹窗(含遮罩):', !d2.modalInDom);
   fs.unlinkSync(tmp);
-  const pass = d.cardGone && d.maskRootHidden && d.plainOk && /modal/i.test(d.afterCls) && d2.clicked === 1 && !d2.modalInDom;
+  const pass = d.cardGone && d.maskRootHidden && d.plainOk && /modal/i.test(d.afterCls)
+    && d2.preciseHits === 0 && d2.looseHits === 1 && d2.clicked === 1 && !d2.modalInDom;
   console.log(pass ? 'MODAL ROOT + AUTO CLOSE TESTS PASS (标卡片=弹窗连遮罩消失, 且自动点X由站点清理)' : 'TEST FAIL');
   app.exit(pass ? 0 : 1);
 });
