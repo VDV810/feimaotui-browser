@@ -1517,11 +1517,31 @@ function showPageContextMenu(tabId, params) {
           // 收集所有要标记的元素（去重）
           var elementsToMark = [];
           var seenElements = new Set();
-          
+
+          // v1.9.0: 弹窗组件根升级（公共函数，单点/批量共用）
+          // 目标(或其祖先)的 class 含 modal/dialog/popup/mask/overlay/drawer/layer 时，
+          // 升级到最外层这类祖先 —— 弹窗的灰色遮罩通常是组件根的背景或兄弟 mask 节点，
+          // 只藏卡片会让遮罩残留、整页灰蒙蒙；藏组件根则遮罩+卡片一起消失。
+          function upgradeToModalRoot(el) {
+            try {
+              var cur = el, best = null, up = 0;
+              while (cur && cur.nodeType === 1 && cur !== document.body && cur !== document.documentElement && up < 6) {
+                var cls = (cur.className && typeof cur.className === 'string') ? cur.className : '';
+                if (/(modal|dialog|popup|drawer|mask|overlay|layer)/i.test(cls)) best = cur;
+                cur = cur.parentElement;
+                up++;
+              }
+              if (best) return best;
+            } catch (e) {}
+            return el;
+          }
+
           function addElement(el) {
             if (!el || el === document.body || el === document.documentElement) return;
             if (seenElements.has(el)) return;
             seenElements.add(el);
+            el = upgradeToModalRoot(el);
+            if (seenElements.has(el)) return;
             elementsToMark.push({
               selector: getSelector(el),
               tagName: el.tagName,
@@ -1577,6 +1597,8 @@ function showPageContextMenu(tabId, params) {
               try { el = nearestVisible(document.elementFromPoint(${params.x}, ${params.y})); } catch (e) {}
             }
             if (!el) return null;
+            // v1.9.0: 升级到弹窗组件根（遮罩+卡片一起消失），详见公共函数注释
+            el = upgradeToModalRoot(el);
             return JSON.stringify({
               mode: 'single',
               count: 1,
