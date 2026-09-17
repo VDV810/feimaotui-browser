@@ -80,37 +80,70 @@ ipcRenderer.on('feimaotui-font-zoom-changed', (event, factor) => {
   } catch (e) {}
 })();
 
-// v2.2.0: 标记过的弹窗自动关闭（宽松选择器匹配卡片 → 向上定位弹窗根 → 点站点X / 无X则内联藏根）
-// 精确选择器在 SPA 刷新后失配(8.txt 实锤轮询零命中)，宽松版(class链)稳定命中；
-// 点X让站点正确清理遮罩/portal/状态；无X的弹窗内联隐藏弹窗根（遮罩在根上一并消失）。
+// v2.3.0: 标记过的弹窗自动关闭 —— 事件驱动(响应≤1帧, 告别1秒轮询的"卡/慢")
+// MutationObserver 只收集新增节点(O(1)入队), rAF 每帧批量检查一次;
+// 快速预筛用 className 字符串 includes(纳秒级), 命中才做 querySelectorAll(合并选择器单次查询);
+// 2s 低频轮询仅作兜底。点X让站点正确清理遮罩/portal/状态, 无X则内联隐藏弹窗根。
 (function autoCloseMarkedModals() {
   try {
     const modalSelectors = ipcRenderer.sendSync('feimaotui-get-modal-selectors');
     if (!modalSelectors || modalSelectors.length === 0) return;
+    const COMBINED_SEL = modalSelectors.join(',');
     const MODAL_RE = /(modal|dialog|popup|drawer|mask|overlay|layer)/i;
-    setInterval(function() {
+
+    function closeIn(rootEl) {
+      let clicked = 0;
+      document.querySelectorAll(COMBINED_SEL).forEach(function(card) {
+        var root = card, up = 0, best = null;
+        while (root && root.nodeType === 1 && root !== document.body && up < 6) {
+          var cls = (root.className && typeof root.className === 'string') ? root.className : '';
+          if (MODAL_RE.test(cls)) best = root;
+          root = root.parentElement; up++;
+        }
+        var target = best || card;
+        if (target.__fmtCloseTried) return;
+        target.__fmtCloseTried = true;
+        var btn = target.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
+        if (btn) {
+          try { btn.click(); clicked++; console.warn('[AD-PRELOAD] 已自动点击弹窗关闭按钮'); } catch (e) {}
+        } else {
+          try { target.style.setProperty('display', 'none', 'important'); console.warn('[AD-PRELOAD] 弹窗无关闭按钮, 已内联隐藏弹窗根'); } catch (e) {}
+        }
+      });
+      return clicked;
+    }
+
+    // 事件驱动: 收集新增节点(入队O(1)), rAF 每帧批量预筛+命中才查 DOM
+    const pending = new Set();
+    const mo = new MutationObserver(function(muts) {
+      for (const m of muts) {
+        for (const n of m.addedNodes) {
+          if (n.nodeType === 1) pending.add(n);
+        }
+      }
+    });
+    mo.observe(document.documentElement || document, { childList: true, subtree: true });
+    (function drain() {
       try {
-        modalSelectors.forEach(function(sel) {
-          document.querySelectorAll(sel).forEach(function(card) {
-            var root = card, up = 0, best = null;
-            while (root && root.nodeType === 1 && root !== document.body && up < 6) {
-              var cls = (root.className && typeof root.className === 'string') ? root.className : '';
-              if (MODAL_RE.test(cls)) best = root;
-              root = root.parentElement; up++;
-            }
-            var target = best || card;
-            if (target.__fmtCloseTried) return;
-            target.__fmtCloseTried = true;
-            var btn = target.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
-            if (btn) {
-              try { btn.click(); console.warn('[AD-PRELOAD] 已自动点击弹窗关闭按钮'); } catch (e) {}
-            } else {
-              try { target.style.setProperty('display', 'none', 'important'); console.warn('[AD-PRELOAD] 弹窗无关闭按钮, 已内联隐藏弹窗根'); } catch (e) {}
-            }
+        if (pending.size > 0) {
+          let hit = false;
+          pending.forEach(function(n) {
+            try {
+              var cls = (n.className && typeof n.className === 'string') ? n.className : '';
+              // 纳秒级预筛: 节点自身/子树都不含弹窗类关键字则跳过
+              if (MODAL_RE.test(cls) || (n.querySelector && n.querySelector('[class*="modal" i],[class*="dialog" i],[class*="popup" i],[class*="mask" i],[class*="overlay" i],[class*="drawer" i],[class*="layer" i]'))) hit = true;
+            } catch (e) {}
           });
-        });
+          pending.clear();
+          if (hit) closeIn(document);
+        }
       } catch (e) {}
-    }, 1000);
+      requestAnimationFrame(drain);
+    })();
+
+    // 兜底轮询(合并选择器单次查询, 2s 低频)
+    setInterval(function() { try { closeIn(document); } catch (e) {} }, 2000);
+    try { closeIn(document); } catch (e) {}
   } catch (e) {}
 })();
 
