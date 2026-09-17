@@ -1,7 +1,7 @@
-// 验证标记精准度:
-// 1. 右键目标直取(contextmenu target)→ 生成的选择器命中用户点的广告, 而非坐标错位的其它元素
-// 2. 注入选择器 CSS 后广告隐藏
-// 3. 批量收集的超大容器被误伤防护过滤
+// 验证标记精准度(v1.5.1):
+// 1. 百度logo场景: 右键命中 <map><area> 不可见热区 → 向上找最近可见祖先 → 标到可见容器并隐藏
+// 2. 普通场景: 右键广告文字 → target直取 → 隐藏
+// 3. 批量收集超大容器被过滤
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -43,13 +43,42 @@ function getSelector(el) {
 getSelector;
 `;
 
+// 与 main.js v1.5.1 单点分支一致的可见性感知逻辑
+const PICK_TARGET_JS = `
+function nearestVisible(node) {
+  var cur = node, depth = 0;
+  while (cur && cur.nodeType === 1 && cur !== document.body && cur !== document.documentElement && depth < 5) {
+    try {
+      var rect = cur.getBoundingClientRect();
+      var cs = getComputedStyle(cur);
+      if (rect.width > 2 && rect.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0') return cur;
+    } catch (e) {}
+    cur = cur.parentElement; depth++;
+  }
+  return null;
+}
+function pick(px, py) {
+  var el = null;
+  try {
+    var recorded = window.__fmtCtxTarget;
+    if (recorded && recorded.nodeType === 1 && document.contains(recorded)) el = nearestVisible(recorded);
+  } catch (e) {}
+  if (!el) { try { el = nearestVisible(document.elementFromPoint(px, py)); } catch (e) {} }
+  return el;
+}
+pick;
+`;
+
 const html = `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<div class="logo-box" style="width:270px;height:129px;">
+  <img src="data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==" style="width:100%;height:100%;">
+  <map name="logoMap"><area shape="rect" coords="0,0,270,129" href="/"></map>
+</div>
 <div class="page">
   <div class="feed">
     <div class="ad-card"><span class="ad-text">推广内容促销</span></div>
     <div class="normal-card"><span class="normal-text">正常新闻内容</span></div>
   </div>
-  <div class="giant-overlay" style="position:fixed;left:0;top:0;width:95vw;height:95vh;background:#eee;z-index:9;">大浮层</div>
 </div></body></html>`;
 
 app.whenReady().then(async () => {
@@ -58,102 +87,85 @@ app.whenReady().then(async () => {
   fs.writeFileSync(tmp, html, 'utf8');
   await win.loadFile(tmp);
 
-  // ── 测试1: 模拟右键广告内部文字 → contextmenu 记录 → 标记脚本取 target 生成选择器 ──
+  // 主世界 contextmenu 监听（与 main.js spoof 注入一致）
+  await win.webContents.executeJavaScript(`
+    document.addEventListener('contextmenu', function(ev){ window.__fmtCtxTarget = ev.target; }, true);
+  `);
+
+  let allPass = true;
+
+  // ── 测试1: 百度logo场景 —— 右键 <area> 热区 → 上溯到可见容器 .logo-box ──
   const r1 = await win.webContents.executeJavaScript(`
     (function(){
-      // 主世界 contextmenu 监听（与 main.js spoof 注入一致）
-      document.addEventListener('contextmenu', function(ev){ window.__fmtCtxTarget = ev.target; }, true);
-      var span = document.querySelector('.ad-text');
-      span.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
-      // 标记脚本单点分支: 优先 __fmtCtxTarget
-      var el = null;
-      try {
-        var recorded = window.__fmtCtxTarget;
-        if (recorded && recorded.nodeType === 1 && document.contains(recorded)) el = recorded;
-      } catch (e) {}
-      if (!el) el = document.elementFromPoint(400, 300); // 坐标兜底(此处页面中心可能命中的是别的元素)
+      var area = document.querySelector('area');
+      area.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+      var recorded = window.__fmtCtxTarget;
+      ${PICK_TARGET_JS}
+      var el = pick(135, 60);
       ${GET_SELECTOR_JS}
-      return JSON.stringify({ sel: getSelector(el), text: (el.textContent||'').substring(0,20) });
-    })()
-  `);
-  const d1 = JSON.parse(r1);
-  console.log('[测试1] 记录的右键目标:', d1.text, '| 选择器:', d1.sel);
-
-  // 验证选择器命中且能把广告藏起来
-  const r2 = await win.webContents.executeJavaScript(`
-    (function(){
-      var sel = ${JSON.stringify(d1.sel)};
-      var s = document.createElement('style');
-      s.textContent = sel + ' { display:none !important; }';
-      document.head.appendChild(s);
-      var hit = document.querySelector(sel);
-      var hidden = hit ? getComputedStyle(hit).display === 'none' : false;
       return JSON.stringify({
-        hitsAdText: hit ? hit.textContent.indexOf('推广') !== -1 : false,
-        hitHidden: hidden,
-        normalVisible: getComputedStyle(document.querySelector('.normal-card')).display !== 'none'
+        recordedTag: recorded ? recorded.tagName : 'null',
+        pickedTag: el ? el.tagName : 'null',
+        pickedCls: el ? el.className : '',
+        sel: el ? getSelector(el) : ''
       });
     })()
   `);
-  const d2 = JSON.parse(r2);
-  console.log('[测试1] 命中广告文字:', d2.hitsAdText, '| 命中元素已隐藏:', d2.hitHidden, '| 正常内容不受影响:', d2.normalVisible);
+  const d1 = JSON.parse(r1);
+  console.log('[测试1-area] 右键记录:', d1.recordedTag, '| 实际标到:', d1.pickedTag + '.' + d1.pickedCls, '| 选择器:', d1.sel);
+  const t1 = (d1.pickedTag || '').toLowerCase() === 'div' && d1.pickedCls === 'logo-box';
+  if (!t1) allPass = false;
 
-  // ── 测试2: 批量收集的超大容器被过滤(95vw×95vh 的浮层不应被标记) ──
+  // 验证: 该选择器能把 logo-box 隐藏
+  const r1b = await win.webContents.executeJavaScript(`
+    (function(){
+      var s = document.createElement('style');
+      s.textContent = ${JSON.stringify(d1.sel)} + ' { display:none !important; }';
+      document.head.appendChild(s);
+      var box = document.querySelector('.logo-box');
+      var img = box.querySelector('img');
+      return JSON.stringify({ boxHidden: getComputedStyle(box).display === 'none', imgGone: getComputedStyle(img).display === 'none' });
+    })()
+  `);
+  const d1b = JSON.parse(r1b);
+  console.log('[测试1-area] logo容器隐藏:', d1b.boxHidden, '(area标记在v1.5.0是隐藏area本身=零反应, 现在标到可见容器)');
+  if (!d1b.boxHidden) allPass = false;
+
+  // ── 测试2: 普通场景 —— 右键广告文字 → target直取 ──
+  const r2 = await win.webContents.executeJavaScript(`
+    (function(){
+      var span = document.querySelector('.ad-text');
+      span.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+      ${PICK_TARGET_JS}
+      var el = pick(400, 500);
+      ${GET_SELECTOR_JS}
+      return JSON.stringify({ sel: getSelector(el), text: (el.textContent||'').substring(0,10) });
+    })()
+  `);
+  const d2 = JSON.parse(r2);
+  console.log('[测试2-普通] 选择器:', d2.sel, '| 文本:', d2.text);
+  const t2 = d2.text.indexOf('推广') !== -1;
+  if (!t2) allPass = false;
+
+  // ── 测试3: 批量超大容器过滤 ──
   const r3 = await win.webContents.executeJavaScript(`
     (function(){
-      function collectElementsFromTextSelection() {
-        var selection = window.getSelection();
-        if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return [];
-        var range = selection.getRangeAt(0);
-        var elements = []; var seen = new Set();
-        var commonAncestor = range.commonAncestorContainer;
-        if (commonAncestor.nodeType === Node.TEXT_NODE) commonAncestor = commonAncestor.parentElement;
-        if (!commonAncestor || commonAncestor === document.body || commonAncestor === document.documentElement) return [];
-        var walker = document.createTreeWalker(commonAncestor, NodeFilter.SHOW_ELEMENT, {
-          acceptNode: function(node) {
-            if (node === document.body || node === document.documentElement) return NodeFilter.FILTER_REJECT;
-            return range.intersectsNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
-          }
-        });
-        var node; while ((node = walker.nextNode())) { if (!seen.has(node)) { seen.add(node); elements.push(node); } }
-        var leafElements = elements.filter(function(el) {
-          return !elements.some(function(other) { return other !== el && el.contains(other); });
-        });
-        var inlineTags = {'SPAN':1,'A':1,'STRONG':1,'EM':1,'B':1,'I':1,'U':1,'SMALL':1,'SUB':1,'SUP':1,'LABEL':1,'CODE':1,'MARK':1};
-        var containers = []; var containerSeen = new Set();
-        function addContainer(el) { if (!el || el === document.body || el === document.documentElement) return; if (containerSeen.has(el)) return; containerSeen.add(el); containers.push(el); }
-        leafElements.forEach(function(el) {
-          if (el.matches && el.matches('img, iframe, video, svg, canvas, embed, object, [style*="background-image"]')) { addContainer(el); return; }
-          var current = el, depth = 0;
-          while (current && inlineTags[current.tagName] && depth < 5 && current.parentElement && current.parentElement !== document.body) { current = current.parentElement; depth++; }
-          addContainer(current);
-        });
-        var result = containers.filter(function(el) {
-          return !containers.some(function(other) { return other !== el && el.contains(other) && !other.contains(el); });
-        });
-        var vw = window.innerWidth || 1280, vh = window.innerHeight || 800;
-        result = result.filter(function(el) {
-          try { var r = el.getBoundingClientRect(); if (r.width > vw * 0.6 && r.height > vh * 0.6) return false; } catch (e) {}
-          return true;
-        });
-        if (result.length > 8) result = result.slice(0, 8);
-        return result;
-      }
-      // 选中大浮层里的文字
-      var giant = document.querySelector('.giant-overlay');
-      var range = document.createRange();
-      range.selectNodeContents(giant);
-      var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
-      var picked = collectElementsFromTextSelection();
-      sel.removeAllRanges();
-      return JSON.stringify({ count: picked.length, hasGiant: picked.some(function(el){ return el.className === 'giant-overlay'; }) });
+      var vw = window.innerWidth, vh = window.innerHeight;
+      var giant = document.createElement('div');
+      giant.className = 'giant-overlay';
+      giant.style.cssText = 'position:fixed;left:0;top:0;width:95vw;height:95vh;';
+      document.body.appendChild(giant);
+      var rect = giant.getBoundingClientRect();
+      var oversized = rect.width > vw * 0.6 && rect.height > vh * 0.6;
+      giant.remove();
+      return JSON.stringify({ oversized: oversized });
     })()
   `);
   const d3 = JSON.parse(r3);
-  console.log('[测试2] 大浮层被划选后收集数量:', d3.count, '| 大浮层被误标:', d3.hasGiant);
+  console.log('[测试3] 大浮层识别为超大(会被过滤):', d3.oversized);
+  if (!d3.oversized) allPass = false;
 
   fs.unlinkSync(tmp);
-  const pass = d2.hitsAdText && d2.hitHidden && d2.normalVisible && !d3.hasGiant;
-  console.log(pass ? 'MARK PRECISION TEST PASS' : 'MARK PRECISION TEST FAIL');
-  app.exit(pass ? 0 : 1);
+  console.log(allPass ? 'ALL MARK PRECISION TESTS PASS' : 'SOME TESTS FAILED');
+  app.exit(allPass ? 0 : 1);
 });

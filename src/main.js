@@ -1533,14 +1533,32 @@ function showPageContextMenu(tabId, params) {
               elements: elementsToMark
             });
           } else {
-            // 单个标记模式（v1.4.1）：优先用主世界记录的右键目标（event.target 直取，缩放/DPI 无关），
-            // 目标已从 DOM 移除（SPA 重渲染）才退回 elementFromPoint 坐标兜底
+            // 单个标记模式（v1.5.1: 可见性感知候选链）
+            // 候选: ① 主世界记录的右键 target（缩放/DPI 无关）② elementFromPoint 坐标命中
+            // 每个候选向上找"最近可见祖先"——跳过 <area>/<map>/零尺寸/不可见元素
+            // （v1.5.0 实锤：百度 logo 是 <map><area> 图像热区，target 直取标到不可见的 area，
+            //   隐藏它视觉上零反应；手机版用 elementFromPoint 只命中可见元素所以从未有此问题）
+            function nearestVisible(node) {
+              var cur = node, depth = 0;
+              while (cur && cur.nodeType === 1 && cur !== document.body && cur !== document.documentElement && depth < 5) {
+                try {
+                  var rect = cur.getBoundingClientRect();
+                  var cs = getComputedStyle(cur);
+                  if (rect.width > 2 && rect.height > 2 && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0') return cur;
+                } catch (e) {}
+                cur = cur.parentElement;
+                depth++;
+              }
+              return null;
+            }
             var el = null;
             try {
               var recorded = window.__fmtCtxTarget;
-              if (recorded && recorded.nodeType === 1 && document.contains(recorded)) el = recorded;
+              if (recorded && recorded.nodeType === 1 && document.contains(recorded)) el = nearestVisible(recorded);
             } catch (e) {}
-            if (!el) el = document.elementFromPoint(${params.x}, ${params.y});
+            if (!el) {
+              try { el = nearestVisible(document.elementFromPoint(${params.x}, ${params.y})); } catch (e) {}
+            }
             if (!el) return null;
             return JSON.stringify({
               mode: 'single',
@@ -1612,7 +1630,7 @@ function showPageContextMenu(tabId, params) {
             addLog('ADBLOCK', '解析失败', e.message);
           }
         } else {
-          addLog('ADBLOCK', '未获取到元素', 'elementFromPoint返回null');
+          addLog('ADBLOCK', '未获取到元素', `坐标(${params.x},${params.y})无可标记的可见元素 | ${tab.url}`);
         }
       }).catch(err => {
         addLog('ADBLOCK', '执行JS失败', err.message);
@@ -5074,7 +5092,9 @@ function setupIPC() {
         ]
       });
       if (result.canceled || !result.filePath) return { success: false, canceled: true };
-      fs.writeFileSync(result.filePath, logText, 'utf8');
+      // v1.5.1: 日志文件头带版本号（用户要求：免得每次排查都怀疑版本不一致）
+      const header = `===== 飞毛腿浏览器 v${app.getVersion()} | Electron ${process.versions.electron} | Chromium ${process.versions.chrome} | 导出时间 ${now.toLocaleString('zh-CN')} =====\n`;
+      fs.writeFileSync(result.filePath, header + logText, 'utf8');
       addLog('LOG', '导出日志', `${logText.length} 字节 → ${result.filePath}`);
       return { success: true, filePath: result.filePath, length: logText.length };
     } catch (e) {
@@ -6211,7 +6231,8 @@ app.whenReady().then(async () => {
   createMainWindow();
   setupIPC();
   createTray();
-  addLog('INFO', '飞毛腿浏览器启动完成');
+  // v1.5.1: 启动日志带版本号（排查用户反馈时先核对版本，避免怀疑版本不一致）
+  addLog('INFO', '飞毛腿浏览器启动完成', `v${app.getVersion()} / Electron ${process.versions.electron} / Chromium ${process.versions.chrome}`);
 
   // 启动时把已安装的浏览器扩展（如沉浸式翻译）重新加载进内核
   // 先等内置沉浸式翻译部署+加载完成，再部署有道/火山/字幕精灵/轻氧（从本机 Edge 复制），
