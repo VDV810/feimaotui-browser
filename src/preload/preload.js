@@ -80,6 +80,62 @@ ipcRenderer.on('feimaotui-font-zoom-changed', (event, factor) => {
   } catch (e) {}
 })();
 
+// v2.5.0: 弹窗遮罩自动识别标记 —— 自动点X时发现同源遮罩则当场隐藏+自动入库规则
+// （一次行为永久生效: 入库后走首帧CSS注入, 下次弹窗遮罩从出生即死, 零渐隐零闪现）
+function fmtOverlaySelectorOf(el) {
+  try {
+    if (el.id) return '#' + CSS.escape(el.id);
+    var base = el.tagName.toLowerCase();
+    if (el.className && typeof el.className === 'string') {
+      var cs = el.className.trim().split(/\s+/).filter(Boolean).slice(0, 3);
+      if (cs.length) {
+        base += '.' + cs.map(function(c) { return CSS.escape(c); }).join('.');
+        var p = el.parentElement;
+        if (p && p !== document.body && p.className && typeof p.className === 'string') {
+          var pcs = p.className.trim().split(/\s+/).filter(Boolean).slice(0, 2);
+          if (pcs.length) base = p.tagName.toLowerCase() + '.' + pcs.map(function(c){return CSS.escape(c);}).join('.') + ' > ' + base;
+        }
+        return base;
+      }
+    }
+  } catch (e) {}
+  return '';
+}
+function fmtFindModalOverlays(rootEl) {
+  var out = [];
+  var vw = window.innerWidth || 1280, vh = window.innerHeight || 800;
+  function isOverlay(el) {
+    try {
+      if (!el || el === document.body || el === document.documentElement) return false;
+      if (rootEl && (el === rootEl || rootEl.contains(el) || el.contains(rootEl))) return false;
+      var cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.pointerEvents === 'none') return false;
+      if (cs.position !== 'fixed' && cs.position !== 'absolute') return false;
+      var rect = el.getBoundingClientRect();
+      if (rect.width < vw * 0.8 || rect.height < vh * 0.8) return false;
+      var m = (cs.backgroundColor || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+      if (m) {
+        var a = (m[4] === undefined) ? 1 : parseFloat(m[4]);
+        if (a > 0.05 && a < 0.98) return true;
+      }
+      if (cs.backdropFilter && cs.backdropFilter !== 'none') return true;
+      return false;
+    } catch (e) { return false; }
+  }
+  var candidates = [];
+  Array.prototype.slice.call(document.body.children).forEach(function(el) { candidates.push(el); });
+  var p = rootEl ? rootEl.parentElement : null, depth = 0;
+  while (p && p !== document.body && depth < 4) {
+    candidates.push(p);
+    Array.prototype.slice.call(p.children).forEach(function(el) { candidates.push(el); });
+    p = p.parentElement; depth++;
+  }
+  candidates.forEach(function(el) {
+    if (out.indexOf(el) === -1 && isOverlay(el)) out.push(el);
+  });
+  return out;
+}
+
 // v2.3.0: 标记过的弹窗自动关闭 —— 事件驱动(响应≤1帧, 告别1秒轮询的"卡/慢")
 // MutationObserver 只收集新增节点(O(1)入队), rAF 每帧批量检查一次;
 // 快速预筛用 className 字符串 includes(纳秒级), 命中才做 querySelectorAll(合并选择器单次查询);
@@ -103,6 +159,17 @@ ipcRenderer.on('feimaotui-font-zoom-changed', (event, factor) => {
         var target = best || card;
         if (target.__fmtCloseTried) return;
         target.__fmtCloseTried = true;
+        // v2.5.0: 遮罩自动识别 —— 当场内联隐藏(零渐隐) + 自动入库(下次首帧CSS零闪现)
+        try {
+          fmtFindModalOverlays(target).forEach(function(ov) {
+            try {
+              var osel = fmtOverlaySelectorOf(ov);
+              if (!osel) return;
+              ov.style.setProperty('display', 'none', 'important');
+              ipcRenderer.send('fmt-auto-mark-overlay', { selector: osel, host: location.host });
+            } catch (e) {}
+          });
+        } catch (e) {}
         var btn = target.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
         if (btn) {
           try { btn.click(); clicked++; console.warn('[AD-PRELOAD] 已自动点击弹窗关闭按钮'); } catch (e) {}

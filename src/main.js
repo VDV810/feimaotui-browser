@@ -1051,6 +1051,32 @@ function buildModalCloseClickJS(selectors) {
 })();`;
 }
 
+// v2.5.0: preload 自动识别弹窗遮罩后回写规则库 —— 一次行为永久生效
+ipcMain.on('fmt-auto-mark-overlay', (event, data) => {
+  try {
+    const sel = String(data && data.selector || '').trim();
+    if (!sel || sel.length > 300) return;
+    const exists = globalState.customAdRules.some(r => r.selector === sel);
+    if (exists) return;
+    globalState.customAdRules.push({
+      selector: sel, urlPattern: '',
+      domain: String(data.host || '*').split(':')[0], createdAt: Date.now()
+    });
+    saveData();
+    addLog('ADBLOCK', '自动标记弹窗遮罩', sel);
+    // 立即给匹配标签补注入（本次会话内其它标签也遮上）
+    const decl = sel + ' { display:none !important; visibility:hidden !important; }';
+    for (const tab of globalState.tabs.values()) {
+      try {
+        if (tab.webContents && !tab.webContents.isDestroyed()) {
+          const u = tab.webContents.getURL() || '';
+          if (u.includes(String(data.host || ''))) tab.webContents.insertCSS(decl).catch(() => {});
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+});
+
 // v2.2.0: 弹窗类标记规则选择器列表（preload 轮询自动关闭用）
 // 返回宽松版（去 nth）—— 精确版在 SPA 刷新后结构漂移即失配（8.txt 实锤：轮询一次都没命中），
 // 宽松版仅依赖 class 链，刷新后仍能找到弹窗卡片，再向上定位弹窗根点 X
