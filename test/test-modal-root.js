@@ -31,14 +31,8 @@ getSelector;
 
 const html = `<!doctype html><html><head><meta charset="utf-8"></head><body>
 <div class="page"><span class="plain-text">正常页面内容</span></div>
+<div class="global-fade-mask" style="position:fixed;left:0;top:0;width:100vw;height:100vh;background:rgba(0,0,0,0.45);z-index:98;"></div>
 <div class="ocean-vmok-plugin-oc-modal" style="position:fixed;left:0;top:0;width:100vw;height:100vh;background:rgba(0,0,0,0.5);z-index:99;">
-  <div class="tools-vmok-plugin-modal__body ocean-vmok-plugin-oc-modal-body" style="width:600px;height:400px;background:#fff;margin:100px auto;">
-    <button class="oc-close" style="position:absolute;right:8px;top:8px;">X</button>
-    <div class="new-comer-report-custom-body" style="height:300px;">
-      <span class="ad-text">暂未起量,继续优化释放潜力,加油!</span>
-    </div>
-  </div>
-</div>
 <script>
 // 站点自己的关闭逻辑: 点 oc-close → 移除整个弹窗(含遮罩)
 document.querySelector('.oc-close').addEventListener('click', function() {
@@ -90,24 +84,64 @@ app.whenReady().then(async () => {
         return el;
       }
       ${GET_SELECTOR_JS}
+      // findModalOverlays(与 main.js v2.4.0 一致)
+      function findModalOverlays(rootEl) {
+        var out = [];
+        var vw = window.innerWidth || 1280, vh = window.innerHeight || 800;
+        function isOverlay(el) {
+          try {
+            if (!el || el === document.body || el === document.documentElement) return false;
+            if (rootEl && (el === rootEl || rootEl.contains(el) || el.contains(rootEl))) return false;
+            var cs = getComputedStyle(el);
+            if (cs.display === 'none' || cs.visibility === 'hidden' || cs.pointerEvents === 'none') return false;
+            if (cs.position !== 'fixed' && cs.position !== 'absolute') return false;
+            var rect = el.getBoundingClientRect();
+            if (rect.width < vw * 0.8 || rect.height < vh * 0.8) return false;
+            var m = (cs.backgroundColor || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+            if (m) {
+              var a = (m[4] === undefined) ? 1 : parseFloat(m[4]);
+              if (a > 0.05 && a < 0.98) return true;
+            }
+            if (cs.backdropFilter && cs.backdropFilter !== 'none') return true;
+            return false;
+          } catch (e) { return false; }
+        }
+        var candidates = [];
+        Array.prototype.slice.call(document.body.children).forEach(function(el) { candidates.push(el); });
+        var p = rootEl ? rootEl.parentElement : null, depth = 0;
+        while (p && p !== document.body && depth < 4) {
+          candidates.push(p);
+          Array.prototype.slice.call(p.children).forEach(function(el) { candidates.push(el); });
+          p = p.parentElement; depth++;
+        }
+        candidates.forEach(function(el) {
+          if (out.indexOf(el) === -1 && isOverlay(el)) out.push(el);
+        });
+        return out;
+      }
       var el = nearestVisible(window.__fmtCtxTarget);
       var before = el.className;
       el = upgradeToModalRoot(el);
+      var overlays = findModalOverlays(el);
       var sel = getSelector(el);
-      // 注入选择器, 验证: 卡片+遮罩背景一起消失, 普通页面不受影响
+      // v2.4.0: 遮罩扫描结果也生成选择器, 全部注入(模拟 buildAdblockCss)
+      var overlaySels = overlays.map(function(ov) { return getSelector(ov); });
       var s = document.createElement('style');
-      s.textContent = sel + ' { display:none !important; }';
+      s.textContent = [sel].concat(overlaySels).map(function(x){ return x + ' { display:none !important; }'; }).join('\n');
       document.head.appendChild(s);
       var card = document.querySelector('.new-comer-report-custom-body');
       var root = document.querySelector('.ocean-vmok-plugin-oc-modal');
+      var maskEl = document.querySelector('.global-fade-mask');
       var plain = document.querySelector('.plain-text');
       var cardRect = card.getBoundingClientRect();
       // display 不继承, 祖先隐藏后后代 computedStyle 仍为 block;
       // "不可见"的正确判据是渲染尺寸为零(不参与布局)
       return JSON.stringify({
         beforeCls: before, afterCls: el.className, sel: sel,
+        overlaySels: overlaySels,
         cardGone: cardRect.width === 0 && cardRect.height === 0,
         maskRootHidden: getComputedStyle(root).display === 'none',
+        fadeMaskHidden: maskEl ? getComputedStyle(maskEl).display === 'none' : 'no-mask-el',
         plainOk: getComputedStyle(plain).display !== 'none'
       });
     })()
@@ -115,7 +149,7 @@ app.whenReady().then(async () => {
   const d = JSON.parse(r);
   console.log('[升级前]', d.beforeCls);
   console.log('[升级后]', d.afterCls, '| 选择器:', d.sel);
-  console.log('[结果] 卡片已不渲染(零尺寸):', d.cardGone, '| 遮罩根隐藏:', d.maskRootHidden, '| 普通页面不受影响:', d.plainOk);
+  console.log('[结果] 卡片已不渲染(零尺寸):', d.cardGone, '| 遮罩根隐藏:', d.maskRootHidden, '| 独立遮罩兄弟被扫出并隐藏:', d.fadeMaskHidden, '| 普通页面不受影响:', d.plainOk);
 
   // ── 测试2: v2.2.0 自动关闭 —— 模拟"刷新后结构漂移": 精确选择器失效, 宽松选择器命中卡片
   //    → 向上定位弹窗根 → 点站点X → 整个弹窗(含遮罩)被站点移除 ──

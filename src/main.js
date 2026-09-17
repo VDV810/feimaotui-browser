@@ -1591,6 +1591,44 @@ function showPageContextMenu(tabId, params) {
             return el;
           }
 
+          // v2.4.0: 扫描与弹窗同源的全屏半透明遮罩（标记时弹窗和遮罩同时在DOM里）
+          // 判据: position fixed/absolute + 覆盖视口≥80% + 背景半透明(rgba alpha 0.05~0.98)或毛玻璃
+          // 候选范围: body直下元素 + 弹窗根祖先链上的各级兄弟/祖先(遮罩通常是弹窗根的兄弟或父级背景)
+          function findModalOverlays(rootEl) {
+            var out = [];
+            var vw = window.innerWidth || 1280, vh = window.innerHeight || 800;
+            function isOverlay(el) {
+              try {
+                if (!el || el === document.body || el === document.documentElement) return false;
+                if (rootEl && (el === rootEl || rootEl.contains(el) || el.contains(rootEl))) return false;
+                var cs = getComputedStyle(el);
+                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.pointerEvents === 'none') return false;
+                if (cs.position !== 'fixed' && cs.position !== 'absolute') return false;
+                var rect = el.getBoundingClientRect();
+                if (rect.width < vw * 0.8 || rect.height < vh * 0.8) return false;
+                var m = (cs.backgroundColor || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+                if (m) {
+                  var a = (m[4] === undefined) ? 1 : parseFloat(m[4]);
+                  if (a > 0.05 && a < 0.98) return true; // 半透明 = 遮罩本色
+                }
+                if (cs.backdropFilter && cs.backdropFilter !== 'none') return true;
+                return false;
+              } catch (e) { return false; }
+            }
+            var candidates = [];
+            Array.prototype.slice.call(document.body.children).forEach(function(el) { candidates.push(el); });
+            var p = rootEl ? rootEl.parentElement : null, depth = 0;
+            while (p && p !== document.body && depth < 4) {
+              candidates.push(p);
+              Array.prototype.slice.call(p.children).forEach(function(el) { candidates.push(el); });
+              p = p.parentElement; depth++;
+            }
+            candidates.forEach(function(el) {
+              if (out.indexOf(el) === -1 && isOverlay(el)) out.push(el);
+            });
+            return out;
+          }
+
           function addElement(el) {
             if (!el || el === document.body || el === document.documentElement) return;
             if (seenElements.has(el)) return;
@@ -1654,15 +1692,31 @@ function showPageContextMenu(tabId, params) {
             if (!el) return null;
             // v1.9.0: 升级到弹窗组件根（遮罩+卡片一起消失），详见公共函数注释
             el = upgradeToModalRoot(el);
+            // v2.4.0: 扫描并标记与弹窗同源的"全屏半透明遮罩"——遮罩没有标记规则覆盖时，
+            // 点X/隐藏卡片后它仍裸奔回来，就是"变白后又变灰"的残影来源。
+            // 遮罩规则进入规则库后走首帧CSS注入，遮罩从出生就是 display:none。
+            var overlayEls = [];
+            try { findModalOverlays(el).forEach(function(ov) { overlayEls.push(ov); }); } catch (e) {}
+            var elements = [{
+              selector: getSelector(el),
+              tagName: el.tagName,
+              text: (el.textContent || '').substring(0, 50).trim(),
+              className: el.className || ''
+            }];
+            overlayEls.forEach(function(ov) {
+              try {
+                elements.push({
+                  selector: getSelector(ov),
+                  tagName: ov.tagName,
+                  text: '[遮罩]',
+                  className: ov.className || ''
+                });
+              } catch (e) {}
+            });
             return JSON.stringify({
               mode: 'single',
-              count: 1,
-              elements: [{
-                selector: getSelector(el),
-                tagName: el.tagName,
-                text: (el.textContent || '').substring(0, 50).trim(),
-                className: el.className || ''
-              }]
+              count: elements.length,
+              elements: elements
             });
           }
         })();
