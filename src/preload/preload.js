@@ -507,13 +507,23 @@ new MutationObserver(scanVideoElements).observe(document.documentElement || docu
         return el.contains(other) && !other.contains(el);
       });
     });
-    
+
+    // v1.4.1: 误伤防护（与主进程标记脚本一致）——跳过超大容器，上限 15→8
+    var vw = window.innerWidth || 1280, vh = window.innerHeight || 800;
+    result = result.filter(function(el) {
+      try {
+        var r = el.getBoundingClientRect();
+        if (r.width > vw * 0.6 && r.height > vh * 0.6) return false;
+      } catch (e) {}
+      return true;
+    });
+
     // 限制最多收集的元素数量，避免误隐藏太多内容
-    var MAX_ELEMENTS = 15;
+    var MAX_ELEMENTS = 8;
     if (result.length > MAX_ELEMENTS) {
       result = result.slice(0, MAX_ELEMENTS);
     }
-    
+
     return result;
   }
   

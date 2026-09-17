@@ -1377,29 +1377,47 @@ function showPageContextMenu(tabId, params) {
       addLog('ADBLOCK', '开始标记广告', `坐标: x=${params.x}, y=${params.y}`);
       tab.webContents.executeJavaScript(`
         (function() {
-          // 生成CSS选择器
+          // 生成CSS选择器（v1.4.1: 对齐手机版 v2.4.53 策略）
+          // 优先级: id > class+父级nth-child消歧 > data-*/role/aria属性 > 短路径(≤4级)
+          // 旧版"一路到body的完整nth-of-type路径"在 React/Vue SPA 刷新后 DOM 结构漂移即失效，
+          // 是"标记后重新打开网页广告又出现"的根因；class 是构建产物哈希，刷新间稳定（手机版实测）。
+          function sibIdx(n) {
+            var i = 1, s = n;
+            while (s.previousElementSibling) { s = s.previousElementSibling; i++; }
+            return i;
+          }
           function getSelector(element) {
             if (element.id) return '#' + CSS.escape(element.id);
+            var classes = (element.className && typeof element.className === 'string')
+              ? element.className.trim().split(/\\s+/).filter(function(c){return c;}).slice(0, 3)
+              : [];
+            if (classes.length > 0) {
+              var base = element.tagName.toLowerCase() + classes.map(function(c){return '.' + CSS.escape(c);}).join('');
+              var p = element.parentElement;
+              if (p && p !== document.body) {
+                var pcs = (p.className && typeof p.className === 'string')
+                  ? p.className.trim().split(/\\s+/).filter(function(c){return c;}).slice(0, 2).map(function(c){return '.' + CSS.escape(c);}).join('')
+                  : '';
+                return p.tagName.toLowerCase() + pcs + ':nth-child(' + sibIdx(p) + ') > ' + base + ':nth-child(' + sibIdx(el) + ')';
+              }
+              return base + ':nth-child(' + sibIdx(el) + ')';
+            }
+            var stableAttrs = [];
+            for (var i = 0; i < element.attributes.length; i++) {
+              var a = element.attributes[i];
+              if (a.name.indexOf('data-') === 0 || a.name === 'role' || a.name === 'aria-label') {
+                stableAttrs.push('[' + a.name + '="' + a.value.replace(/"/g, String.fromCharCode(92) + '"') + '"]');
+              }
+            }
+            if (stableAttrs.length > 0) return element.tagName.toLowerCase() + stableAttrs.slice(0, 3).join('');
             var path = [];
-            var current = element;
-            while (current && current !== document.body) {
-              var selector = current.tagName.toLowerCase();
-              if (current.className && typeof current.className === 'string') {
-                var classes = current.className.trim().split(/\\s+/).filter(c => c && !/^ad|^banner|^sponsor/i.test(c));
-                if (classes.length > 0) {
-                  selector += '.' + classes.map(c => CSS.escape(c)).join('.');
-                }
-              }
-              var parent = current.parentElement;
-              if (parent) {
-                var siblings = Array.from(parent.children).filter(c => c.tagName === current.tagName);
-                if (siblings.length > 1) {
-                  var index = siblings.indexOf(current) + 1;
-                  selector += ':nth-of-type(' + index + ')';
-                }
-              }
-              path.unshift(selector);
-              current = parent;
+            var cur = element;
+            while (cur && cur.nodeType === 1 && cur !== document.body && path.length < 4) {
+              var parent = cur.parentElement;
+              if (!parent) break;
+              var idx = Array.prototype.slice.call(parent.children).indexOf(cur) + 1;
+              path.unshift(cur.tagName.toLowerCase() + ':nth-child(' + idx + ')');
+              cur = parent;
             }
             return path.join(' > ');
           }
@@ -1464,8 +1482,18 @@ function showPageContextMenu(tabId, params) {
                 return other !== el && el.contains(other) && !other.contains(el);
               });
             });
-            
-            if (result.length > 15) result = result.slice(0, 15);
+
+            // v1.4.1: 误伤防护——跳过超大容器（占视口宽或高 60% 以上的"容器"多半是
+            // 页面主体结构而非广告单元，标记它=错标整块内容），上限 15→8
+            var vw = window.innerWidth || 1280, vh = window.innerHeight || 800;
+            result = result.filter(function(el) {
+              try {
+                var r = el.getBoundingClientRect();
+                if (r.width > vw * 0.6 && r.height > vh * 0.6) return false;
+              } catch (e) {}
+              return true;
+            });
+            if (result.length > 8) result = result.slice(0, 8);
             return result;
           }
           
@@ -1505,8 +1533,14 @@ function showPageContextMenu(tabId, params) {
               elements: elementsToMark
             });
           } else {
-            // 单个标记模式：右键点击的元素
-            var el = document.elementFromPoint(${params.x}, ${params.y});
+            // 单个标记模式（v1.4.1）：优先用主世界记录的右键目标（event.target 直取，缩放/DPI 无关），
+            // 目标已从 DOM 移除（SPA 重渲染）才退回 elementFromPoint 坐标兜底
+            var el = null;
+            try {
+              var recorded = window.__fmtCtxTarget;
+              if (recorded && recorded.nodeType === 1 && document.contains(recorded)) el = recorded;
+            } catch (e) {}
+            if (!el) el = document.elementFromPoint(${params.x}, ${params.y});
             if (!el) return null;
             return JSON.stringify({
               mode: 'single',
@@ -2797,6 +2831,15 @@ function createTab(url = null, options = {}) {
               try { console.log('[CLOSE-STUB] page called window.close (blocked)'); } catch (e2) {}
               try { document.dispatchEvent(new CustomEvent('fmt-page-close-attempt')); } catch (e2) {}
             };
+          } catch (e) {}
+          // v1.4.1: 记录右键目标元素（主世界，事件 target 直取）
+          // "标记为广告"改用此记录，替代 elementFromPoint(params.x,y) ——
+          // 页面缩放/Windows DPI 下 context-menu 坐标与页面视口坐标会错位，
+          // 导致右键点 A 标到 B（标记不到/错误标记）。手机版精准的本质就是零坐标换算。
+          try {
+            document.addEventListener('contextmenu', function(ev) {
+              try { window.__fmtCtxTarget = ev.target; } catch (err) {}
+            }, true);
           } catch (e) {}
         })();
       `, true).catch(() => {});
