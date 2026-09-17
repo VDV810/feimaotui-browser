@@ -159,6 +159,22 @@ function fmtFindModalOverlays(rootEl) {
         var target = best || card;
         if (target.__fmtCloseTried) return;
         target.__fmtCloseTried = true;
+        // v2.7.0: 弹窗根本身常是半透明全屏遮罩(oc-modal背景即灰罩, 17:16日志实锤) ——
+        // 点X后站点渐隐动画在这个根上播放=残余灰闪; 当场内联隐藏(零渐隐)+自动入库(下次首帧CSS)
+        try {
+          var tcs = getComputedStyle(target);
+          var trect = target.getBoundingClientRect();
+          var tm = (tcs.backgroundColor || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+          var ta = tm ? ((tm[4] === undefined) ? 1 : parseFloat(tm[4])) : 1;
+          if ((tcs.position === 'fixed' || tcs.position === 'absolute') &&
+              trect.width >= (window.innerWidth || 1280) * 0.8 &&
+              trect.height >= (window.innerHeight || 800) * 0.8 &&
+              ta > 0.05 && ta < 0.98) {
+            target.style.setProperty('display', 'none', 'important');
+            var rsel = fmtOverlaySelectorOf(target);
+            if (rsel) ipcRenderer.send('fmt-auto-mark-overlay', { selector: rsel, host: location.host });
+          }
+        } catch (e) {}
         // v2.5.0: 遮罩自动识别 —— 当场内联隐藏(零渐隐) + 自动入库(下次首帧CSS零闪现)
         try {
           fmtFindModalOverlays(target).forEach(function(ov) {

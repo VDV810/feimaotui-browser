@@ -1041,6 +1041,19 @@ function buildModalCloseClickJS(selectors) {
         var target = best || card;
         if (target.__fmtCloseTried) return;
         target.__fmtCloseTried = true;
+        // v2.7.0: 弹窗根本身常是半透明全屏遮罩(oc-modal背景即灰罩) —— 当场内联隐藏+自动入库
+        try {
+          var tcs = getComputedStyle(target);
+          var trect = target.getBoundingClientRect();
+          var tm = (tcs.backgroundColor || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+          var ta = tm ? ((tm[4] === undefined) ? 1 : parseFloat(tm[4])) : 1;
+          if ((tcs.position === 'fixed' || tcs.position === 'absolute') &&
+              trect.width >= (window.innerWidth || 1280) * 0.8 &&
+              trect.height >= (window.innerHeight || 800) * 0.8 &&
+              ta > 0.05 && ta < 0.98) {
+            target.style.setProperty('display', 'none', 'important');
+          }
+        } catch (e) {}
         var btn = target.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
         if (btn) { try { btn.click(); clicked++; } catch (e) {} }
         else { try { target.style.setProperty('display', 'none', 'important'); forceHidden++; } catch (e) {} }
