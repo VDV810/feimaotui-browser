@@ -1,5 +1,5 @@
-// 关闭延迟测试 v2.3.0: 动态插入带X的弹窗, 测量"插入→被自动关闭"耗时
-// 断言: < 200ms (v2.2.0 的1秒轮询无法达到; v2.3.0 事件驱动应 <50ms)
+// 关闭延迟测试 v2.6.0: 动态插入带X的弹窗, 测量"插入→被自动关闭"耗时
+// 断言: < 16ms (一帧之内 —— queueMicrotask 同步处理, 渲染前隐藏, 零闪现)
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -52,7 +52,7 @@ app.whenReady().then(async () => {
   const latency = d.removedAt > 0 ? (d.removedAt - d.insertedAt) : -1;
   console.log('[关闭延迟] 插入于', d.insertedAt, 'ms, 被关闭于', d.removedAt, 'ms, 延迟:', latency, 'ms | 弹窗仍在DOM:', d.modalInDom);
   fs.unlinkSync(tmp);
-  const pass = latency >= 0 && latency < 200 && !d.modalInDom;
-  console.log(pass ? 'CLOSE LATENCY TEST PASS (延迟 ' + latency + 'ms < 200ms)' : 'CLOSE LATENCY TEST FAIL');
+  const pass = latency >= 0 && latency <= 16 && !d.modalInDom;
+  console.log(pass ? 'CLOSE LATENCY TEST PASS (延迟 ' + latency + 'ms, 一帧内零闪现)' : 'CLOSE LATENCY TEST FAIL (延迟 ' + latency + 'ms)');
   app.exit(pass ? 0 : 1);
 });

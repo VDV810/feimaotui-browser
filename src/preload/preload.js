@@ -180,33 +180,40 @@ function fmtFindModalOverlays(rootEl) {
       return clicked;
     }
 
-    // 事件驱动: 收集新增节点(入队O(1)), rAF 每帧批量预筛+命中才查 DOM
+    // 事件驱动 v2.6.0: MO 收集新增节点(入队O(1)) → queueMicrotask 同步处理。
+    // 关键: 微任务在"当前任务结束、浏览器绘制之前"执行 —— 弹窗插入的那一帧画不出来,
+    // 彻底消灭 rAF 方案存在的"先画一帧再隐藏"的可见窗口(实测残余0.0X秒闪现的根源)。
+    // 性能: 同一任务内多次DOM变更合并为一次微任务; 合并选择器单次查询, 构建期开销可忽略。
     const pending = new Set();
+    let microScheduled = false;
     const mo = new MutationObserver(function(muts) {
       for (const m of muts) {
         for (const n of m.addedNodes) {
           if (n.nodeType === 1) pending.add(n);
         }
       }
+      if (!microScheduled) {
+        microScheduled = true;
+        queueMicrotask(function() {
+          microScheduled = false;
+          try {
+            if (pending.size > 0) {
+              let hit = false;
+              pending.forEach(function(n) {
+                try {
+                  var cls = (n.className && typeof n.className === 'string') ? n.className : '';
+                  // 纳秒级预筛: 节点自身/子树都不含弹窗类关键字则跳过
+                  if (MODAL_RE.test(cls) || (n.querySelector && n.querySelector('[class*="modal" i],[class*="dialog" i],[class*="popup" i],[class*="mask" i],[class*="overlay" i],[class*="drawer" i],[class*="layer" i]'))) hit = true;
+                } catch (e) {}
+              });
+              pending.clear();
+              if (hit) closeIn(document);
+            }
+          } catch (e) {}
+        });
+      }
     });
     mo.observe(document.documentElement || document, { childList: true, subtree: true });
-    (function drain() {
-      try {
-        if (pending.size > 0) {
-          let hit = false;
-          pending.forEach(function(n) {
-            try {
-              var cls = (n.className && typeof n.className === 'string') ? n.className : '';
-              // 纳秒级预筛: 节点自身/子树都不含弹窗类关键字则跳过
-              if (MODAL_RE.test(cls) || (n.querySelector && n.querySelector('[class*="modal" i],[class*="dialog" i],[class*="popup" i],[class*="mask" i],[class*="overlay" i],[class*="drawer" i],[class*="layer" i]'))) hit = true;
-            } catch (e) {}
-          });
-          pending.clear();
-          if (hit) closeIn(document);
-        }
-      } catch (e) {}
-      requestAnimationFrame(drain);
-    })();
 
     // 兜底轮询(合并选择器单次查询, 2s 低频)
     setInterval(function() { try { closeIn(document); } catch (e) {} }, 2000);
