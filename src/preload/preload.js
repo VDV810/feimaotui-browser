@@ -80,6 +80,31 @@ ipcRenderer.on('feimaotui-font-zoom-changed', (event, factor) => {
   } catch (e) {}
 })();
 
+// v2.1.0: 标记过的弹窗自动关闭（点站点自带 X）
+// 弹窗类规则(选择器含 modal/dialog/popup/drawer/mask/overlay/layer)匹配的元素出现时，
+// 点击其内部关闭按钮 —— 站点自己的关闭逻辑会把遮罩/portal/弹窗状态整套正确清理，
+// 页面立即恢复，不留灰色蒙层。CSS 隐藏仅作关闭失败时的兜底。
+(function autoCloseMarkedModals() {
+  try {
+    const modalSelectors = ipcRenderer.sendSync('feimaotui-get-modal-selectors');
+    if (!modalSelectors || modalSelectors.length === 0) return;
+    setInterval(function() {
+      try {
+        modalSelectors.forEach(function(sel) {
+          document.querySelectorAll(sel).forEach(function(el) {
+            if (el.__fmtCloseTried) return;
+            el.__fmtCloseTried = true;
+            var btn = el.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
+            if (btn) {
+              try { btn.click(); console.warn('[AD-PRELOAD] 已自动点击弹窗关闭按钮'); } catch (e) {}
+            }
+          });
+        });
+      } catch (e) {}
+    }, 1000);
+  } catch (e) {}
+})();
+
 // v1.3.82: 页面主世界的 window.close 桩（main.js did-start-navigation 注入）被调用时，
 // 通过 DOM 自定义事件跨世界通知 preload，再转发主进程记录"页面关闭信号"，
 // 用于主窗口 close 时区分「用户点X正常退出」与「页面冒泡关闭(拦截)」。

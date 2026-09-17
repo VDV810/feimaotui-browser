@@ -1014,6 +1014,44 @@ ipcMain.on('feimaotui-get-adblock-css', (event) => {
   }
 });
 
+// v2.1.0: 弹窗类规则追加"点击站点自带关闭按钮"——让站点自己清理遮罩/portal/弹窗状态。
+// 只做 CSS 隐藏时，卡片藏了遮罩还盖着（千川新人弹窗实测整页灰蒙蒙）；
+// 站点的 X 关闭逻辑会把整套组件正确卸载，页面立即恢复。
+// className 含 modal/dialog/popup/drawer/mask/overlay/layer 的规则视为弹窗类。
+function buildModalCloseClickJS(rules) {
+  const modalRules = (rules || []).filter(r =>
+    /modal|dialog|popup|drawer|mask|overlay|layer/i.test(r.className || r.selector || ''));
+  if (modalRules.length === 0) return '';
+  return `
+(function() {
+  var sels = ${JSON.stringify(modalRules.map(r => r.selector))};
+  var clicked = 0;
+  sels.forEach(function(sel) {
+    try {
+      document.querySelectorAll(sel).forEach(function(el) {
+        if (el.__fmtCloseTried) return;
+        el.__fmtCloseTried = true;
+        var btn = el.querySelector('[class*="close" i], [aria-label*="close" i], [aria-label*="关闭"]');
+        if (btn) { try { btn.click(); clicked++; } catch (e) {} }
+      });
+    } catch (e) {}
+  });
+  return clicked;
+})();`;
+}
+
+// v2.1.0: 弹窗类标记规则选择器列表（preload 轮询自动关闭用）
+ipcMain.on('feimaotui-get-modal-selectors', (event) => {
+  try {
+    if (!globalState.settings.adblockEnabled) { event.returnValue = []; return; }
+    event.returnValue = (globalState.customAdRules || [])
+      .filter(r => r.selector && /modal|dialog|popup|drawer|mask|overlay|layer/i.test(r.selector))
+      .map(r => r.selector);
+  } catch (e) {
+    event.returnValue = [];
+  }
+});
+
 function applyFontSizeToAllTabs() {
   for (const tab of globalState.tabs.values()) applyFontSizeToTab(tab);
 }
@@ -1644,14 +1682,15 @@ function showPageContextMenu(tabId, params) {
             saveData();
             addLog('ADBLOCK', '批量保存完成', '新增: ' + addedCount + ' 条, 已存在: ' + existCount + ' 条');
             
-            // 立即隐藏当前页面的所有匹配元素
+            // 立即隐藏当前页面的所有匹配元素（v2.1.0: 弹窗类先点站点X关闭, 遮罩/portal一起清理）
+            const markRules = data.elements.map(e => ({ selector: e.selector, className: e.className || '' }));
             tab.webContents.executeJavaScript(`
               (function() {
-                var rules = ${JSON.stringify(data.elements.map(e => e.selector))};
+                var rules = ${JSON.stringify(markRules)};
                 var totalCount = 0;
-                rules.forEach(function(selector) {
+                rules.forEach(function(rule) {
                   try {
-                    var els = document.querySelectorAll(selector);
+                    var els = document.querySelectorAll(rule.selector);
                     els.forEach(function(el) {
                       el.setAttribute('style', 'display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important;');
                       totalCount++;
@@ -1665,6 +1704,12 @@ function showPageContextMenu(tabId, params) {
             }).catch(err => {
               addLog('ADBLOCK', '隐藏元素失败', err.message);
             });
+            const closeClickJS = buildModalCloseClickJS(markRules);
+            if (closeClickJS) {
+              tab.webContents.executeJavaScript(closeClickJS).then(n => {
+                if (n > 0) addLog('ADBLOCK', '已点击弹窗关闭按钮', n + ' 个（站点自行清理遮罩/弹窗状态）');
+              }).catch(() => {});
+            }
           } catch(e) {
             addLog('ADBLOCK', '解析失败', e.message);
           }
