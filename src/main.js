@@ -979,19 +979,36 @@ ipcMain.on('feimaotui-get-font-zoom', (event) => {
   event.returnValue = normalizeFontSize(globalState.settings.fontSize) / 16;
 });
 
-// v1.3.94: 标记广告规则 CSS 首帧注入（参考手机版 v2.5.2 方案）
-// preload 在 document_start 通过 sendSync 拉取全量规则，广告元素从第一帧起就是 display:none，
-// 彻底消除"页面先渲染广告、did-finish-load 才隐藏"的闪现。
-// 全量注入不分域名：选择器是用户标记时的精确结构特征，跨站碰撞概率极低（手机版实测结论）。
+// v1.5.1: 标记广告规则 CSS 统一生成（三处注入点共用，收敛重复逻辑）
+// 宽松版选择器（v1.5.1）: 去掉 :nth-child/:nth-of-type 的完整 class 链。
+// 精确版要求兄弟位置完全一致，SPA"两段式异步插入"的中间态（外壳已插入、子层未插入）
+// 不匹配 → 外壳可见几百毫秒 = 闪现（test-flash-modal.js 实锤 675 帧）。
+// 宽松版仅依赖 class 组合（构建产物哈希/语义类，刷新间稳定），外壳一出生就被摁住。
+function looseSelectorOf(sel) {
+  const loose = String(sel)
+    .replace(/:nth-(child|of-type)\(\d+\)/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return loose && loose !== sel ? loose : '';
+}
+function buildAdblockCss() {
+  if (!globalState.settings.adblockEnabled) return '';
+  const rules = globalState.customAdRules || [];
+  if (rules.length === 0) return '';
+  const lines = new Set();
+  const DECL = ' { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; }';
+  for (const r of rules) {
+    if (!r.selector) continue;
+    lines.add(r.selector + DECL);
+    const loose = looseSelectorOf(r.selector);
+    if (loose) lines.add(loose + DECL);
+  }
+  return [...lines].join('\n');
+}
+
 ipcMain.on('feimaotui-get-adblock-css', (event) => {
   try {
-    if (!globalState.settings.adblockEnabled) { event.returnValue = ''; return; }
-    const rules = globalState.customAdRules || [];
-    if (rules.length === 0) { event.returnValue = ''; return; }
-    event.returnValue = rules
-      .filter(r => r.selector)
-      .map(r => `${r.selector} { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; }`)
-      .join('\n');
+    event.returnValue = buildAdblockCss();
   } catch (e) {
     event.returnValue = '';
   }
@@ -2580,13 +2597,10 @@ function createTab(url = null, options = {}) {
   // 链路: preload document_start 首帧注入(最早) → dom-ready insertCSS → did-finish-load insertCSS(最后)
   view.webContents.on('dom-ready', () => {
     try {
-      if (globalState.settings.adblockEnabled && globalState.customAdRules && globalState.customAdRules.length > 0) {
-        const adCss = globalState.customAdRules
-          .filter(r => r.selector)
-          .map(r => `${r.selector} { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; }`)
-          .join('\n');
+      const adCss = buildAdblockCss();
+      if (adCss) {
         view.webContents.insertCSS(adCss).catch(() => {});
-        addLog('ADBLOCK', 'dom-ready早期兜底注入', `${globalState.customAdRules.length} 条规则`);
+        addLog('ADBLOCK', 'dom-ready早期兜底注入', `${adCss.split('\n').length} 条(含宽松版)`);
       }
     } catch (e) {}
   });
@@ -2625,14 +2639,10 @@ function createTab(url = null, options = {}) {
     // 注入自定义广告规则CSS：did-finish-load 兜底（v1.3.94）
     // 首帧注入在 preload（参考手机版 v2.5.2），此处仅作双保险——防 preload 注入的 style 被站点清理，
     // 并覆盖 preload 注入之后才新增的标记。开关关闭时不注入（与首帧注入一致）。
-    if (globalState.settings.adblockEnabled && globalState.customAdRules && globalState.customAdRules.length > 0) {
-      const currentDomain = new URL(tab.url).hostname;
-      const domainRules = globalState.customAdRules.filter(r => r.domain === currentDomain || r.domain === '*');
-      if (domainRules.length > 0) {
-        const adCss = domainRules.map(r => `${r.selector} { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; }`).join('\n');
-        view.webContents.insertCSS(adCss).catch(() => {});
-        addLog('ADBLOCK', '注入广告规则CSS', `${domainRules.length} 条规则 (${currentDomain})`);
-      }
+    const adCssFinal = buildAdblockCss();
+    if (adCssFinal) {
+      view.webContents.insertCSS(adCssFinal).catch(() => {});
+      addLog('ADBLOCK', 'did-finish-load兜底注入', `${adCssFinal.split('\n').length} 条(含宽松版)`);
     }
 
     // 注入 CSS：隐藏其他翻译扩展的悬浮 UI（只留沉浸式自带的粉色浮球）
