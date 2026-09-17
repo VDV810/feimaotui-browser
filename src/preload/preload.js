@@ -16,36 +16,67 @@ ipcRenderer.on('feimaotui-font-zoom-changed', (event, factor) => {
   } catch (e) {}
 });
 
-// v1.3.94: 标记广告规则 CSS 首帧注入（参考手机版 v2.5.2 方案，消除广告闪现）
-// preload 运行于 document_start，此处注入的 CSS 在浏览器解析页面之前就位——
-// 广告元素从第一帧起就是 display:none，压根没渲染过，而不是渲染后再隐藏。
-// 兜底链：本首帧注入 → did-finish-load 的 insertCSS 兜底 → 右键标记立即隐藏。
+// v1.5.1: 标记广告规则 CSS 首帧注入 + 防丢（对齐手机版 v2.5.2 最终方案）
+// document_start 注入让广告从第一帧起就是 display:none；站点脚本可能清除未知 style，
+// 故挂载后保留轻量轮询：style 被删则重挂（不做全文档 MutationObserver——手机版 v2.4.101
+// 教训：动态页每秒数千次 DOM 变化会把 JS 线程塞死）。
 (function injectAdRulesEarly() {
   try {
     const adCss = ipcRenderer.sendSync('feimaotui-get-adblock-css');
     if (!adCss) return;
-    const inject = () => {
+    const STYLE_ID = 'feimaotui-ad-rules';
+    let mounted = false;
+    const mount = () => {
       try {
-        if (document.getElementById('feimaotui-ad-rules')) return;
-        const s = document.createElement('style');
-        s.id = 'feimaotui-ad-rules';
-        s.textContent = adCss;
-        // document_start 时 html 元素已创建但 head/body 可能还没解析，挂到 html 上即可生效
-        (document.head || document.documentElement).appendChild(s);
-      } catch (e) {}
-    };
-    if (document.documentElement) {
-      inject();
-    } else {
-      // DOM 未挂载（v2.5.1 教训）：MutationObserver 等 DOM 一出现立刻挂载，任何元素出现之前
-      const mo = new MutationObserver(() => {
-        if (document.documentElement) {
-          mo.disconnect();
-          inject();
+        const root = document.head || document.documentElement;
+        if (!root) return false;
+        let s = document.getElementById(STYLE_ID);
+        if (!s) {
+          s = document.createElement('style');
+          s.id = STYLE_ID;
+          root.appendChild(s);
         }
-      });
-      mo.observe(document, { childList: true });
+        if (!s.textContent) s.textContent = adCss;
+        if (!mounted) {
+          mounted = true;
+          console.warn('[AD-PRELOAD] 标记广告规则CSS已注入 ' + adCss.split('\n').length + ' 条, 挂载于 <' + root.tagName + '>');
+        }
+        return true;
+      } catch (e) { return false; }
+    };
+    if (mount()) return;
+    // DOM 尚未挂载: 零间隔轮询（早于任何渲染）+ DOMContentLoaded 兜底 + 2s 超时
+    const iv = setInterval(function() { if (mount()) clearInterval(iv); }, 0);
+    document.addEventListener('DOMContentLoaded', function() { clearInterval(iv); mount(); }, { once: true });
+    setTimeout(function() { clearInterval(iv); mount(); }, 2000);
+
+    // 防丢(v1.5.1): 站点脚本删除 style 的瞬间立即重挂。
+    // 只监听根节点直接子级(childList, 非subtree)——监视范围极小无性能问题；
+    // MutationObserver 回调在渲染前的微任务阶段触发, 重挂零闪现。
+    // (低频 setInterval 会在删除与重挂之间留下数百毫秒可见窗口 = 用户看到的闪现, 已弃用)
+    const ro = new MutationObserver(function() {
+      if (!document.getElementById(STYLE_ID)) {
+        console.warn('[AD-PRELOAD] 检测到规则CSS被移除, 立即重挂');
+        mounted = false;
+        mount();
+      }
+    });
+    const startWatch = () => {
+      try {
+        const root = document.head || document.documentElement;
+        if (root) { ro.observe(root, { childList: true }); return true; }
+      } catch (e) {}
+      return false;
+    };
+    if (!startWatch()) {
+      document.addEventListener('DOMContentLoaded', startWatch, { once: true });
     }
+    // 兜底轮询保留(防 observe 意外失效), 但只做重挂不做闪烁窗口来源
+    setInterval(function() {
+      try {
+        if (!document.getElementById(STYLE_ID)) { mounted = false; mount(); }
+      } catch (e) {}
+    }, 3000);
   } catch (e) {}
 })();
 

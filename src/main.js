@@ -2576,6 +2576,21 @@ function createTab(url = null, options = {}) {
     }
   });
 
+  // v1.5.1: dom-ready 早期兜底注入标记规则CSS（比 did-finish-load 提前一整个渲染阶段）
+  // 链路: preload document_start 首帧注入(最早) → dom-ready insertCSS → did-finish-load insertCSS(最后)
+  view.webContents.on('dom-ready', () => {
+    try {
+      if (globalState.settings.adblockEnabled && globalState.customAdRules && globalState.customAdRules.length > 0) {
+        const adCss = globalState.customAdRules
+          .filter(r => r.selector)
+          .map(r => `${r.selector} { display: none !important; visibility: hidden !important; height: 0 !important; overflow: hidden !important; }`)
+          .join('\n');
+        view.webContents.insertCSS(adCss).catch(() => {});
+        addLog('ADBLOCK', 'dom-ready早期兜底注入', `${globalState.customAdRules.length} 条规则`);
+      }
+    } catch (e) {}
+  });
+
   view.webContents.on('did-finish-load', () => {
     tab.title = view.webContents.getTitle() || tab.url;
     tab.url = view.webContents.getURL();
