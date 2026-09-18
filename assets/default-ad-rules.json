@@ -1,0 +1,142 @@
+{
+  "appName": "飞毛腿浏览器",
+  "type": "ad-rules",
+  "exportTime": "2026-09-18T00:58:40.233Z",
+  "rules": [
+    {
+      "selector": "div:nth-of-type(1) > div > div > div > div.app-content:nth-of-type(4) > div.promotion-announcement-banner-host:nth-of-type(6) > div > div > section.productUpgradeBanner-v6OcEU",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789540784118
+    },
+    {
+      "selector": "div:nth-of-type(1) > div > div > div > div.app-content:nth-of-type(4) > div.content-body.no-left:nth-of-type(8) > div.right-content.uni-page > div > div:nth-of-type(4) > div.qc-table.uni-ad-list.uni-ad-table-1 > div:nth-of-type(2) > div.sub-header:nth-of-type(2) > div.overall-notice:nth-of-type(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789540795795
+    },
+    {
+      "selector": "div:nth-of-type(1) > div > div > div > div.app-content:nth-of-type(4) > div.content-body.no-left:nth-of-type(8) > div.right-content.uni-page > div > div:nth-of-type(4) > div.qc-table.uni-ad-list.uni-ad-table-1 > div:nth-of-type(2) > div:nth-of-type(1) > div > div.product-general.product-general-banner > div.title:nth-of-type(2)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789540815112
+    },
+    {
+      "selector": "div:nth-of-type(1) > div > div > div > div.app-content:nth-of-type(4) > div.content-body.no-left:nth-of-type(8) > div.right-content.uni-page > div > div:nth-of-type(4) > div.qc-table.uni-ad-list.uni-ad-table-1 > div:nth-of-type(2) > div:nth-of-type(1) > div > div.product-general.product-general-banner",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789540817728
+    },
+    {
+      "selector": "div:nth-of-type(1) > div > div > div > div.app-content:nth-of-type(3) > div.promotion-announcement-banner-host:nth-of-type(6) > div > div > section.productUpgradeBanner-v6OcEU > div.upgradeCopy-KdJJvt",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789554224884
+    },
+    {
+      "selector": "div:nth-of-type(1) > div > div > div > div.app-content:nth-of-type(3) > div.promotion-announcement-banner-host:nth-of-type(6) > div > div > section.productUpgradeBanner-v6OcEU",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789554227541
+    },
+    {
+      "selector": "div.wrapper_new.pc-index-login.smart_input_superman.smart_input_height_superman.search-box-new.liuhe-brand-upgrade.feed-list-wrapper.feed-list-wrapper-sample1.feed-list-wrapper-peek:nth-of-type(1) > div:nth-of-type(3) > div.s-isindex-wrap.head_wrapper.s-title-img.search-box-new-head-wrapper:nth-of-type(3) > div.s_form.s_form_login.s_form_fresh:nth-of-type(1) > div.s_form_wrapper > div.s-p-top.s-p-top-new:nth-of-type(1) > map > area",
+      "domain": "www.baidu.com",
+      "createdAt": 1789613506846
+    },
+    {
+      "selector": "div:nth-child(1) > div:nth-child(1) > map:nth-child(4) > area:nth-child(1)",
+      "domain": "www.baidu.com",
+      "createdAt": 1789613676460
+    },
+    {
+      "selector": "#lg",
+      "domain": "www.baidu.com",
+      "createdAt": 1789614476592
+    },
+    {
+      "selector": "a.hot-refresh.c-font-normal:nth-child(2) > span.hot-refresh-text:nth-child(2)",
+      "domain": "www.baidu.com",
+      "createdAt": 1789614481459
+    },
+    {
+      "selector": "a.hot-refresh.c-font-normal:nth-child(2) > i.c-icon.refresh-icon:nth-child(1)",
+      "domain": "www.baidu.com",
+      "createdAt": 1789614483814
+    },
+    {
+      "selector": "div.aweme-auto-pull-modal-content:nth-child(1) > div.aweme-auto-pull-modal-right:nth-child(2)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789614562910
+    },
+    {
+      "selector": "div.tools-vmok-plugin-modal__body.ocean-vmok-plugin-oc-modal-body:nth-child(2) > div.aweme-auto-pull-modal-content:nth-child(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789614565389
+    },
+    {
+      "selector": "div.ocean-vmok-plugin-oc-space-item:nth-child(1) > div.delivery-data-header:nth-child(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789631262198
+    },
+    {
+      "selector": "div.new-comer-report-custom-body:nth-child(1) > div.newcomer-data-report-right-panel:nth-child(2)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789631265499
+    },
+    {
+      "selector": "div.tools-vmok-plugin-modal__body.ocean-vmok-plugin-oc-modal-body:nth-child(2) > div.new-comer-report-custom-body:nth-child(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789631267964
+    },
+    {
+      "selector": "div.tools-vmok-plugin-popup__mask.tools-vmok-plugin-popuppopup-fade-enter-from.tools-vmok-plugin-popuppopup-fade-enter-active",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789637050971
+    },
+    {
+      "selector": "div:nth-child(199) > div.activity-card-modal.high-cost-card-modal:nth-child(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789691748988
+    },
+    {
+      "selector": "span[data-v-e5e1869c=\"\"]",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789691777150
+    },
+    {
+      "selector": "div.aweme-auto-pull-card:nth-child(1) > div.header:nth-child(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789691779794
+    },
+    {
+      "selector": "div.content:nth-child(2) > div.desc:nth-child(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789691783284
+    },
+    {
+      "selector": "div.aweme-auto-pull-card:nth-child(1) > div.content:nth-child(2)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789691786452
+    },
+    {
+      "selector": "#\\39 03513104",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789691791588
+    },
+    {
+      "selector": "div.content-xpsl_a:nth-child(1) > div.titleWrapper-DF89hz:nth-child(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789691821443
+    },
+    {
+      "selector": "div.aurora-qc-popover-content:nth-child(1) > div.content-xpsl_a:nth-child(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789691823828
+    },
+    {
+      "selector": "div.sub-header:nth-child(2) > div.overall-notice:nth-child(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789691857594
+    },
+    {
+      "selector": "div.aurora-image.css-1kyfq89:nth-child(1) > img.aurora-image-img.css-1kyfq89:nth-child(1)",
+      "domain": "qianchuan.jinritemai.com",
+      "createdAt": 1789692761173
+    }
+  ]
+}

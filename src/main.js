@@ -6513,9 +6513,44 @@ async function restoreSessionCookies() {
   }
 }
 
+// v2.9.0: 内置默认广告标记规则播种 —— 新人安装启动自动获得全部标记（免逐个标记），
+// 老用户按 selector+domain 去重，已有标记一条不重复加。
+function seedDefaultAdRules() {
+  try {
+    const seedPath = path.join(__dirname, '..', 'assets', 'default-ad-rules.json');
+    if (!fs.existsSync(seedPath)) return;
+    const parsed = JSON.parse(fs.readFileSync(seedPath, 'utf8'));
+    const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.rules) ? parsed.rules : null);
+    if (!list || list.length === 0) return;
+    const existingKeys = new Set(globalState.customAdRules.map(r => r.selector + '|' + r.domain));
+    let added = 0;
+    list.forEach(item => {
+      try {
+        const selector = String(item.selector || '').trim();
+        if (!selector || selector.length > 500) return;
+        const domain = String(item.domain || '*').split(':')[0];
+        const key = selector + '|' + domain;
+        if (existingKeys.has(key)) return;
+        existingKeys.add(key);
+        globalState.customAdRules.push({
+          selector, urlPattern: '', domain, createdAt: Date.now()
+        });
+        added++;
+      } catch (e) {}
+    });
+    if (added > 0) {
+      saveData();
+      addLog('ADBLOCK', '内置默认标记规则', `新增 ${added} 条（本地已有 ${existingKeys.size - added} 条, 全部 ${globalState.customAdRules.length} 条）`);
+    }
+  } catch (e) {
+    addLog('WARN', '内置默认标记规则播种失败', e.message);
+  }
+}
+
 app.whenReady().then(async () => {
   setupWxProxy();
   loadData();
+  seedDefaultAdRules();
   // 会话Cookie回填：必须在建窗口前完成（限时3秒防挂起阻塞启动）
   await Promise.race([restoreSessionCookies(), new Promise(r => setTimeout(r, 3000))]);
   applyProxyToSessions().catch(e => addLog('PROXY', '启动应用代理异常', e.message));
