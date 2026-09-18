@@ -1,6 +1,6 @@
 {
   "name": "feimaotui-browser",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "飞毛腿浏览器 - 快速、安全、功能强大的浏览器",
   "main": "src/main.js",
   "scripts": {

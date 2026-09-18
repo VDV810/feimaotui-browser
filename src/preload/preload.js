@@ -877,6 +877,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   importBookmarks: () => ipcRenderer.invoke('import-bookmarks'),
   importBookmarksFromFile: (filePath) => ipcRenderer.invoke('import-bookmarks-from-file', filePath),
 
+  // v2.8.0: 标记广告规则导入导出
+  exportAdRules: () => ipcRenderer.invoke('export-ad-rules'),
+  importAdRules: () => ipcRenderer.invoke('import-ad-rules'),
+
   // 历史记录
   getHistory: () => ipcRenderer.invoke('get-history'),
   clearHistory: () => ipcRenderer.invoke('clear-history'),

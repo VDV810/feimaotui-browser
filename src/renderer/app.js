@@ -90,6 +90,8 @@ const elements = {
     clearHistoryBtn: document.getElementById('clearHistoryBtn'),
     customAdRulesList: document.getElementById('customAdRulesList'),
     clearAllAdRulesBtn: document.getElementById('clearAllAdRulesBtn'),
+  exportAdRulesBtn: document.getElementById('exportAdRulesBtn'),
+  importAdRulesBtn: document.getElementById('importAdRulesBtn'),
     exportBookmarksBtn: document.getElementById('exportBookmarksBtn'),
     importBookmarksBtn: document.getElementById('importBookmarksBtn'),
     appVersion: document.getElementById('appVersion'),
@@ -461,6 +463,39 @@ function setupEventListeners() {
                 }
             } catch (e) {
                 alert('导入书签失败: ' + e.message);
+            }
+        });
+    }
+
+    // v2.8.0: 导出广告标记
+    if (elements.exportAdRulesBtn) {
+        elements.exportAdRulesBtn.addEventListener('click', async () => {
+            try {
+                const result = await window.electronAPI.exportAdRules();
+                if (result.success) {
+                    alert(`广告标记导出成功！共 ${result.count} 条标记\n文件: ${result.filePath}`);
+                } else if (!result.canceled) {
+                    alert(`导出失败：${result.error || '未知错误'}`);
+                }
+            } catch (e) {
+                alert('导出标记失败: ' + e.message);
+            }
+        });
+    }
+
+    // v2.8.0: 导入广告标记
+    if (elements.importAdRulesBtn) {
+        elements.importAdRulesBtn.addEventListener('click', async () => {
+            try {
+                const result = await window.electronAPI.importAdRules();
+                if (result.success) {
+                    await loadCustomAdRules();
+                    alert(`广告标记导入完成！新增 ${result.added} 条，重复跳过 ${result.duplicated} 条\n已立即对打开的网页生效`);
+                } else if (!result.canceled) {
+                    alert(`导入失败：${result.error || '未知错误'}`);
+                }
+            } catch (e) {
+                alert('导入标记失败: ' + e.message);
             }
         });
     }

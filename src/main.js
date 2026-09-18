@@ -5247,6 +5247,93 @@ function setupIPC() {
   });
 
   // 导出书签（飞毛腿格式 JSON）
+  // ==================== v2.8.0: 标记广告规则导入导出（分享给新人一键屏蔽） ====================
+  ipcMain.handle('export-ad-rules', async (event) => {
+    try {
+      const exportData = {
+        appName: '飞毛腿浏览器',
+        type: 'ad-rules',
+        exportTime: new Date().toISOString(),
+        rules: (globalState.customAdRules || []).map(r => ({
+          selector: r.selector,
+          domain: r.domain,
+          createdAt: r.createdAt
+        }))
+      };
+      const { dialog } = require('electron');
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: '导出广告标记',
+        defaultPath: '飞毛腿浏览器广告标记.json',
+        filters: [
+          { name: '飞毛腿广告标记文件', extensions: ['json'] },
+          { name: '所有文件', extensions: ['*'] }
+        ]
+      });
+      if (result.canceled || !result.filePath) return { success: false, canceled: true };
+      fs.writeFileSync(result.filePath, JSON.stringify(exportData, null, 2), 'utf8');
+      addLog('ADBLOCK', '导出标记', `${exportData.rules.length} 条 → ${result.filePath}`);
+      return { success: true, count: exportData.rules.length, filePath: result.filePath };
+    } catch (e) {
+      addLog('ERROR', '导出标记失败', e.message);
+      return { success: false, error: e.message };
+    }
+  });
+
+  ipcMain.handle('import-ad-rules', async (event) => {
+    try {
+      const { dialog } = require('electron');
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: '导入广告标记',
+        filters: [
+          { name: '飞毛腿广告标记文件', extensions: ['json'] },
+          { name: '所有文件', extensions: ['*'] }
+        ],
+        properties: ['openFile']
+      });
+      if (result.canceled || !result.filePaths || !result.filePaths[0]) return { success: false, canceled: true };
+      const content = fs.readFileSync(result.filePaths[0], 'utf8');
+      const parsed = JSON.parse(content);
+      // 兼容两种格式: 直接数组 / { rules: [...] }（导出格式）
+      const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.rules) ? parsed.rules : null);
+      if (!list || list.length === 0) return { success: false, error: '文件中没有标记规则' };
+      const existingKeys = new Set(globalState.customAdRules.map(r => r.selector + '|' + r.domain));
+      let added = 0, dup = 0;
+      list.forEach(item => {
+        try {
+          const selector = String(item.selector || '').trim();
+          if (!selector || selector.length > 500) return;
+          const domain = String(item.domain || '*').split(':')[0];
+          const key = selector + '|' + domain;
+          if (existingKeys.has(key)) { dup++; return; }
+          existingKeys.add(key);
+          globalState.customAdRules.push({
+            selector, urlPattern: '', domain, createdAt: Date.now()
+          });
+          added++;
+        } catch (e) {}
+      });
+      if (added > 0) {
+        saveData();
+        // 立即对所有已打开标签页生效
+        const adCss = buildAdblockCss();
+        if (adCss) {
+          for (const tab of globalState.tabs.values()) {
+            try {
+              if (tab.webContents && !tab.webContents.isDestroyed()) {
+                tab.webContents.insertCSS(adCss).catch(() => {});
+              }
+            } catch (e) {}
+          }
+        }
+      }
+      addLog('ADBLOCK', '导入标记', `新增 ${added} 条，重复 ${dup} 条`);
+      return { success: true, added, duplicated: dup, total: list.length };
+    } catch (e) {
+      addLog('ERROR', '导入标记失败', e.message);
+      return { success: false, error: e.message };
+    }
+  });
+
   ipcMain.handle('export-bookmarks', async (event) => {
     try {
       const exportData = {
