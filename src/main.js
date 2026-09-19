@@ -5945,7 +5945,7 @@ function setupIPC() {
       // 已有相同规则（比如恢复前又手动标了一次），只丢弃回收站记录
       saveDeletedAdRules();
       addLog('ADBLOCK', '恢复标记跳过', '相同规则已存在: ' + rule.selector);
-      return { success: true, restored: false, rule };
+      return { success: true, restored: false, rule, remaining: deletedAdRulesStack.length };
     }
     delete rule.deletedAt;
     globalState.customAdRules.push(rule);
@@ -5957,7 +5957,7 @@ function setupIPC() {
         tab.view.webContents.reload();
       }
     });
-    return { success: true, restored: true, rule };
+    return { success: true, restored: true, rule, remaining: deletedAdRulesStack.length };
   });
 
   ipcMain.handle('clear-custom-ad-rules', () => {

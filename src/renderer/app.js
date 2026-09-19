@@ -508,14 +508,17 @@ function setupEventListeners() {
                 const result = await window.electronAPI.undoDeleteAdRule();
                 if (result.success) {
                     await loadCustomAdRules();
+                    const remainTxt = typeof result.remaining === 'number' ? `（还可恢复${result.remaining}条）` : '';
                     if (result.restored === false) {
-                        alert('这条标记恢复前页面里已经存在相同规则，已跳过');
+                        alert('这条标记恢复前页面里已经存在相同规则，已跳过' + remainTxt);
+                        undoDeleteAdRuleBtn.textContent = '恢复上个标记' + remainTxt;
                     } else {
                         const num = result.rule && result.rule.seq ? '（序号' + result.rule.seq + '）' : '';
-                        undoDeleteAdRuleBtn.textContent = `已恢复${num}`;
-                        setTimeout(() => { undoDeleteAdRuleBtn.textContent = '恢复上个标记'; }, 2000);
+                        undoDeleteAdRuleBtn.textContent = `已恢复${num}${remainTxt}`;
+                        setTimeout(() => { undoDeleteAdRuleBtn.textContent = '恢复上个标记' + remainTxt; }, 2000);
                     }
                 } else {
+                    undoDeleteAdRuleBtn.textContent = '恢复上个标记';
                     alert(result.error || '恢复失败');
                 }
             } catch (e) {
