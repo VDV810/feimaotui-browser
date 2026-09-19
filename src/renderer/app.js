@@ -2077,8 +2077,8 @@ async function loadCustomAdRules() {
             elements.customAdRulesList.innerHTML = '<div class="empty-state" style="padding: 10px; color: #888; font-size: 13px;">暂无已标记的广告元素</div>';
             return;
         }
-        // 按稳定序号从小到大排序（v2.9.1）：删除的序号留空不复用，方便按序号排查异常标记
-        const sortedRules = [...rules].sort((a, b) => (a.seq || 0) - (b.seq || 0) || (b.createdAt || 0) - (a.createdAt || 0));
+        // 按稳定序号从大到小排序（v2.9.2）：最新标记在最上面，异常多为新标记导致，免得往下拉
+        const sortedRules = [...rules].sort((a, b) => (b.seq || 0) - (a.seq || 0) || (b.createdAt || 0) - (a.createdAt || 0));
         let html = '';
         sortedRules.forEach((rule, displayIndex) => {
             // 找到原始数组中的真实索引
