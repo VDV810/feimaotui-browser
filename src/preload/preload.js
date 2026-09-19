@@ -1,11 +1,21 @@
 const { contextBridge, ipcRenderer, webFrame } = require('electron');
 
+// ==================== v2.10.0 preload 初始化（合并同步 IPC）====================
+// 旧实现：下面三处分别在 document_start 做一次 sendSync（字体缩放 / 标记广告CSS / 弹窗选择器）。
+// sendSync 会同步阻塞渲染进程等主进程返回，而 preload 会注入到每个页面 + 每个 iframe，
+// 主进程忙时（下载、规则匹配）页面就会白屏僵住 → 用户体感"点了没反应"。
+// 现合并为 1 次往返；取值失败时各项回退默认值，行为与旧版完全一致。
+const __fmtInit = (function () {
+  try { return ipcRenderer.sendSync('feimaotui-preload-init') || {}; }
+  catch (e) { return {}; }
+})();
+
 // v1.3.85: 字体大小设置改用 Chromium 文本缩放（webFrame.setTextZoomFactor）实现。
 // 旧方案在页面注入 html { font-size: 16px !important } 会破坏微云等 rem 布局站点
 // （它们默认 html font-size:100px，被强制改小后整页高度塌缩、登录框错位）。
 // 文本缩放与 Chrome「字体大小」设置同机制：等比缩放文字，不改动站点自身布局。
 try {
-  const fontZoomFactor = ipcRenderer.sendSync('feimaotui-get-font-zoom');
+  const fontZoomFactor = __fmtInit.fontZoom;   // v2.10.0 来自合并初始化（原 sendSync 单发）
   if (typeof fontZoomFactor === 'number' && fontZoomFactor > 0 && fontZoomFactor !== 1) {
     webFrame.setTextZoomFactor(fontZoomFactor);
   }
@@ -22,7 +32,7 @@ ipcRenderer.on('feimaotui-font-zoom-changed', (event, factor) => {
 // 教训：动态页每秒数千次 DOM 变化会把 JS 线程塞死）。
 (function injectAdRulesEarly() {
   try {
-    const adCss = ipcRenderer.sendSync('feimaotui-get-adblock-css');
+    const adCss = __fmtInit.adCss;   // v2.10.0 来自合并初始化（原 sendSync 单发）
     if (!adCss) return;
     const STYLE_ID = 'feimaotui-ad-rules';
     let mounted = false;
@@ -142,7 +152,7 @@ function fmtFindModalOverlays(rootEl) {
 // 2s 低频轮询仅作兜底。点X让站点正确清理遮罩/portal/状态, 无X则内联隐藏弹窗根。
 (function autoCloseMarkedModals() {
   try {
-    const modalSelectors = ipcRenderer.sendSync('feimaotui-get-modal-selectors');
+    const modalSelectors = __fmtInit.modalSelectors || [];   // v2.10.0 来自合并初始化（原 sendSync 单发）
     if (!modalSelectors || modalSelectors.length === 0) return;
     const COMBINED_SEL = modalSelectors.join(',');
     const MODAL_RE = /(modal|dialog|popup|drawer|mask|overlay|layer)/i;
@@ -498,10 +508,14 @@ function getVisibleTextCandidates(root) {
   const candidates = [];
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
   let node = root;
-  while (node) {
-    const style = window.getComputedStyle(node);
-    if (style.display !== 'none' && style.visibility !== 'hidden') {
-      const text = (node.innerText || node.textContent || '').trim();
+  // v2.10.0 性能根治：原先对每个节点调用 getComputedStyle（强制样式重算/reflow）+
+  // innerText（同样触发布局），而这段代码跑在 video play 事件的同步路径上，直接造成卡顿。
+  // 现改为：不做样式/布局查询，只用 textContent（零布局成本）+ 限制遍历节点数（≤400）。
+  let visited = 0;
+  while (node && visited < 400) {
+    visited++;
+    const text = (node.textContent || '').trim();
+    if (text && text.length <= 200) {
       text.split(/\n+/).forEach(line => {
         const value = line.trim();
         if (isUsefulVideoTitle(value)) candidates.push(value);
@@ -577,7 +591,19 @@ window.addEventListener('DOMContentLoaded', scanVideoElements, { once: true });
 window.addEventListener('load', scanVideoElements, { once: true });
 setInterval(scanVideoElements, 2000);
 
-new MutationObserver(scanVideoElements).observe(document.documentElement || document, {
+// v2.10.0 节流：原先每次 DOM 变化（全文档 subtree）都直接跑 scanVideoElements
+// （内部是全文档 querySelectorAll('video')）。动态页（SPA/瀑布流/千川后台）每秒数千次 DOM 变化，
+// JS 线程被塞满 → 页面滚不动、点不动——正是本项目文档里记过的"动态页把 JS 线程塞死"的教训。
+// 现改为 400ms 合并一次，页面本身无感知。
+let __videoScanTimer = null;
+function scheduleVideoScan() {
+  if (__videoScanTimer) return;
+  __videoScanTimer = setTimeout(function () {
+    __videoScanTimer = null;
+    try { scanVideoElements(); } catch (e) {}
+  }, 400);
+}
+new MutationObserver(scheduleVideoScan).observe(document.documentElement || document, {
   childList: true,
   subtree: true
 });

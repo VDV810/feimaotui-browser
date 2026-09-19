@@ -933,10 +933,25 @@ function setupIPCEvents() {
         });
     }
 
+    // v2.10.0 进度类事件节流：下载/媒体进度回调极其密集（每个数据块都会触发一次），
+    // 原先每次都「整表 innerHTML 重建 + 一次 IPC 往返拉全量记录」，面板疯狂闪烁、
+    // 整个渲染进程被占满 → 主窗口跟着卡。现改为 300ms 合并刷新（进度条视觉上仍流畅）。
+    let __progressRenderTimer = null;
+    const scheduleProgressRender = (kind) => {
+        if (__progressRenderTimer) return;
+        __progressRenderTimer = setTimeout(() => {
+            __progressRenderTimer = null;
+            try {
+                if (kind === 'media') { if (appState.panels.media) renderMediaList(); }
+                else { if (appState.panels.download) renderDownloadList(); }
+            } catch (e) {}
+        }, 300);
+    };
+
     if (window.electronAPI.onMediaDownloadProgress) {
         window.electronAPI.onMediaDownloadProgress((data) => {
             appState.mediaDownloads.set(data.mediaUrl || data.url, data);
-            if (appState.panels.media) renderMediaList();
+            if (appState.panels.media) scheduleProgressRender('media');
         });
     }
 
@@ -961,7 +976,7 @@ function setupIPCEvents() {
     window.electronAPI.onDownloadProgress((data) => {
         if (isMediaDownloadRecord(data)) return;
         appState.downloads.set(data.id, data);
-        if (appState.panels.download) renderDownloadList();
+        if (appState.panels.download) scheduleProgressRender('download');   // v2.10.0 节流
     });
 
     window.electronAPI.onDownloadCompleted((data) => {
@@ -1855,11 +1870,20 @@ function setupBookmarkOverflow() {
     }
 
     // 窗口大小变化时关闭弹层（原生子窗口位置需重新计算，重新打开即可）
+    // v2.10.0 节流：原先每个 resize 事件都跑 checkBookmarkOverflow（逐条 getBoundingClientRect
+    // + 写 style，读写交替强制 reflow），拖拽窗口边缘时明显卡顿；改为 150ms 合并一次。
+    let __resizeTimer = null;
     window.addEventListener('resize', () => {
-        if (appState.bookmarks.length > 0) {
-            checkBookmarkOverflow(appState.bookmarks);
-        }
-        closeBookmarkOverflow();
+        if (__resizeTimer) return;
+        __resizeTimer = setTimeout(() => {
+            __resizeTimer = null;
+            try {
+                if (appState.bookmarks.length > 0) {
+                    checkBookmarkOverflow(appState.bookmarks);
+                }
+                closeBookmarkOverflow();
+            } catch (e) {}
+        }, 150);
     });
     // ESC 关闭弹层（焦点在主窗口时；子窗口内按 ESC 由子窗口自身处理）
     document.addEventListener('keydown', (e) => {

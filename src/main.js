@@ -291,34 +291,69 @@ const AD_BLOCK_RULES = [
   '*://*.adroll.com/*',
 ];
 
+// ==================== v2.10.0 广告规则预编译缓存（性能根治）====================
+// 旧实现：每个请求 × 每条规则都做 5 次字符串 replace + new RegExp。
+// 过滤器挂在 *://*/* 上 → 一个重页面几百个请求 ×（17 条内置 + 用户自标记可达数百条）
+// = 每次加载数万次正则编译，主进程 CPU 打满，期间切标签/地址栏/右键菜单全部排队，
+// 用户体感就是"整个浏览器卡住、点了没反应"。
+// 现改为：规则变更时预编译一次，请求时只做 regex.test（纳秒级）。
+let _adBuiltinRegexes = null;      // 内置规则编译结果
+let _adCustomRegexes = null;       // 自定义 urlPattern 编译结果
+let _adCustomSignature = '';       // 自定义规则签名（变化才重建）
+
+function _wildcardToRegex(rule) {
+  const p = rule
+    .replace(/\*\:\/\//g, 'https?://')
+    .replace(/\*\./g, '([a-zA-Z0-9-]+\.)*')
+    .replace(/\.\*/g, '\.([a-zA-Z0-9-]+)*')
+    .replace(/\*/g, '.*')
+    .replace(/\//g, '\\/');
+  try { return new RegExp(p, 'i'); } catch (e) { return null; }
+}
+
+function _getBuiltinAdRegexes() {
+  if (!_adBuiltinRegexes) {
+    _adBuiltinRegexes = AD_BLOCK_RULES.map(_wildcardToRegex).filter(Boolean);
+  }
+  return _adBuiltinRegexes;
+}
+
+function _getCustomAdRegexes() {
+  const rules = globalState.customAdRules || [];
+  // 轻量签名：长度 + 每条 urlPattern 的长度/首尾字符（能感知增删改，避免每次全量 join）
+  let sig = String(rules.length);
+  for (const r of rules) {
+    const p = (r && r.urlPattern) || '';
+    sig += '|' + p.length + ':' + (p ? p.charCodeAt(0) : 0) + ':' + (p ? p.charCodeAt(p.length - 1) : 0);
+  }
+  if (sig !== _adCustomSignature) {
+    _adCustomSignature = sig;
+    _adCustomRegexes = rules
+      .filter(r => r && r.urlPattern)
+      .map(r => { try { return new RegExp(r.urlPattern, 'i'); } catch (e) { return null; } })
+      .filter(Boolean);
+  }
+  return _adCustomRegexes;
+}
+
+/** 自定义规则变更后调用，强制下次请求重建缓存 */
+function invalidateAdRuleCache() {
+  _adCustomSignature = '';
+  _adCustomRegexes = null;
+}
+
 function isAdUrl(url) {
   if (!globalState.settings.adblockEnabled) return false;
-  // 检查内置规则
-  for (const rule of AD_BLOCK_RULES) {
-    const regexPattern = rule
-      .replace(/\*\:\/\//g, 'https?://')
-      .replace(/\*\./g, '([a-zA-Z0-9-]+\.)*')
-      .replace(/\.\*/g, '\.([a-zA-Z0-9-]+)*')
-      .replace(/\*/g, '.*')
-      .replace(/\//g, '\\/');
-    try {
-      const regex = new RegExp(regexPattern, 'i');
-      if (regex.test(url)) {
-        addLog('ADBLOCK', '拦截广告', url);
-        return true;
-      }
-    } catch (e) {}
+  for (const regex of _getBuiltinAdRegexes()) {
+    if (regex.test(url)) {
+      addLog('ADBLOCK', '拦截广告', url);
+      return true;
+    }
   }
-  // 检查用户自定义规则（URL模式）
-  for (const rule of globalState.customAdRules) {
-    if (rule.urlPattern) {
-      try {
-        const regex = new RegExp(rule.urlPattern, 'i');
-        if (regex.test(url)) {
-          addLog('ADBLOCK', '拦截自定义广告', url);
-          return true;
-        }
-      } catch (e) {}
+  for (const regex of _getCustomAdRegexes()) {
+    if (regex.test(url)) {
+      addLog('ADBLOCK', '拦截自定义广告', url);
+      return true;
     }
   }
   return false;
@@ -597,18 +632,49 @@ function applyDarkModeToTab(tab, enabled) {
   }
 }
 
+// ==================== v2.10.0 数据落盘：防抖 + 异步 ====================
+// 旧实现：saveData() 同步写 8 个 JSON，且被下载进度/媒体嗅探/广告标记等高频路径调用。
+// 下载进行中时主进程每隔几毫秒就要序列化整本历史 + 全部媒体URL并阻塞写盘 → 窗口卡死。
+// 现改为：默认只排一个 800ms 防抖任务，用 fs.promises 异步写；退出时 flushSaveDataSync() 同步落盘。
+const SAVE_DEBOUNCE_MS = 800;
+let _saveTimer = null;
+
+function _writeAllDataFiles(write) {
+  ensureAdRuleSeqs(); // v2.9.1: 新入库的标记自动补永久序号
+  write('bookmarks.json', JSON.stringify(globalState.bookmarks));
+  write('history.json', JSON.stringify(globalState.history.slice(-1000)));
+  write('settings.json', JSON.stringify(globalState.settings));
+  write('downloads.json', JSON.stringify(Array.from(globalState.downloads.values()).slice(-500)));
+  write('media-urls.json', JSON.stringify(Array.from(globalState.mediaUrls.entries())));
+  write('custom-ad-rules.json', JSON.stringify(globalState.customAdRules || []));
+  saveDeletedAdRules();
+  saveTabsSession();
+}
+
+/** 异步写单文件（失败仅记日志，不阻塞主流程） */
+function _asyncWriteDataFile(file, content) {
+  fs.promises.writeFile(path.join(dataPath, file), content).catch(e => {
+    try { addLog('ERROR', '异步保存失败', file + ': ' + e.message); } catch (_) { /* ignore */ }
+  });
+}
+
+/** 防抖保存：高频调用只重置定时器，不做任何 I/O，不阻塞主进程 */
 function saveData() {
+  if (globalState.isQuitting) return;   // 退出流程由 flushSaveDataSync() 负责
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(() => {
+    _saveTimer = null;
+    try { _writeAllDataFiles(_asyncWriteDataFile); }
+    catch (e) { addLog('ERROR', '保存数据失败', e.message); }
+  }, SAVE_DEBOUNCE_MS);
+}
+
+/** 立即同步落盘（仅退出/关键节点使用） */
+function flushSaveDataSync() {
+  if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
   try {
-    ensureAdRuleSeqs(); // v2.9.1: 新入库的标记自动补永久序号
-    fs.writeFileSync(path.join(dataPath, 'bookmarks.json'), JSON.stringify(globalState.bookmarks));
-    fs.writeFileSync(path.join(dataPath, 'history.json'), JSON.stringify(globalState.history.slice(-1000)));
-    fs.writeFileSync(path.join(dataPath, 'settings.json'), JSON.stringify(globalState.settings));
-    fs.writeFileSync(path.join(dataPath, 'downloads.json'), JSON.stringify(Array.from(globalState.downloads.values()).slice(-500)));
-    fs.writeFileSync(path.join(dataPath, 'media-urls.json'), JSON.stringify(Array.from(globalState.mediaUrls.entries())));
-    fs.writeFileSync(path.join(dataPath, 'custom-ad-rules.json'), JSON.stringify(globalState.customAdRules || []));
-    saveDeletedAdRules();
-    saveTabsSession();
-  } catch (e) { addLog('ERROR', '保存数据失败', e.message); }
+    _writeAllDataFiles((file, content) => fs.writeFileSync(path.join(dataPath, file), content));
+  } catch (e) { addLog('ERROR', '保存数据失败(同步)', e.message); }
 }
 
 // 千川全域投放页的日期筛选（dr=YYYY-MM-DD,YYYY-MM-DD）存在 URL 但用户改页面筛选时不更新 URL，
@@ -874,10 +940,16 @@ function createMainWindow() {
     addLog('RENDERER', `[${levels[level] || 'log'}] ${message}`, `${sourceId}:${line}`);
   });
 
+  // v2.10.0 resize 节流：原先每个 resize 事件都 setBounds 一次，拖拽窗口边缘时明显卡顿，
+  // 改为 60ms 合并一次（主进程无 rAF，用 setTimeout 节流）
+  let _resizeThrottle = null;
   mainWindow.on('resize', () => {
-    if (globalState.activeTabId) {
-      resizeActiveTab();
-    }
+    if (!globalState.activeTabId) return;
+    if (_resizeThrottle) return;
+    _resizeThrottle = setTimeout(() => {
+      _resizeThrottle = null;
+      try { resizeActiveTab(); } catch (e) {}
+    }, 60);
   });
 
   mainWindow.on('close', (event) => {
@@ -1140,6 +1212,29 @@ ipcMain.on('feimaotui-get-modal-selectors', (event) => {
   } catch (e) {
     event.returnValue = [];
   }
+});
+
+// ==================== v2.10.0 preload 初始化合并 IPC ====================
+// 旧实现：preload 在每个页面、每个 iframe 的 document_start 做 3 次 sendSync
+// （字体缩放 / 标记广告CSS / 弹窗选择器）。sendSync 会同步阻塞渲染进程等主进程返回，
+// 主进程一旦忙（下载、规则匹配）页面就白屏僵住，表现为"点链接/切标签没反应"。
+// 现合并为 1 次往返（语义与返回值完全不变），阻塞点减少 2/3。
+ipcMain.on('feimaotui-preload-init', (event) => {
+  const payload = { fontZoom: 1, adCss: '', modalSelectors: [] };
+  try { payload.fontZoom = normalizeFontSize(globalState.settings.fontSize) / 16; } catch (e) {}
+  try { payload.adCss = buildAdblockCss(); } catch (e) {}
+  try {
+    if (globalState.settings.adblockEnabled) {
+      const sels = new Set();
+      for (const r of (globalState.customAdRules || [])) {
+        if (!r.selector || !/modal|dialog|popup|drawer|mask|overlay|layer/i.test(r.selector)) continue;
+        const loose = looseSelectorOf(r.selector);
+        if (loose) sels.add(loose);
+      }
+      payload.modalSelectors = [...sels];
+    }
+  } catch (e) {}
+  event.returnValue = payload;
 });
 
 function applyFontSizeToAllTabs() {
@@ -2271,11 +2366,11 @@ function setupSessionHandlersForPartition(sess, partitionLabel) {
           if (idx > -1) {
             list.splice(idx, 1);
             addLog('MEDIA', '过滤小文件', `${found.title}: ${actualSize} bytes < 800KB`);
-            saveData();
+            saveData();   // 列表有增删（低频）才存盘
           }
           return;
         }
-        saveData();
+        // v2.10.0 仅更新大小不存盘（原先每个媒体响应完成都同步写盘 → 浏览视频站必卡）
         addLog('MEDIA', '更新媒体文件大小', `${found.title}: ${actualSize} bytes`);
       }
     }
@@ -2604,7 +2699,7 @@ function registerMediaCandidate(webContentsId, url, meta = {}) {
       contentType: meta.contentType || found.contentType,
       title: meta.title || found.title || getFileNameFromUrl(url)
     });
-    saveData();
+    saveData();   // 媒体元信息升级（低频，保留）
     return found;
   }
 
@@ -2634,7 +2729,7 @@ function registerMediaCandidate(webContentsId, url, meta = {}) {
   };
   existing.push(mediaInfo);
   addLog('MEDIA', `嗅探到媒体(${mediaInfo.source})`, url);
-  saveData();
+  saveData();   // 新媒体入库（防抖异步，非阻塞）
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('media-detected', { tabId, media: mediaInfo });
   }
@@ -3223,6 +3318,19 @@ function activateTab(tabId) {
   const tab = globalState.tabs.get(tabId);
   addLog('TAB', '激活标签页', tabId);
 
+  // v2.10.0 后台标签静音 + 后台节流：原先隐藏标签里的视频/音频/动画/定时器继续全速跑，
+  // 开一堆标签后 CPU/内存持续占用，用户体感"越用越卡"。切走即静音，后台标签降频，切回恢复。
+  try {
+    globalState.tabs.forEach((t, id) => {
+      if (!t || !t.webContents || t.webContents.isDestroyed()) return;
+      const isActive = id === tabId;
+      try { t.webContents.setAudioMuted(!isActive); } catch (e) {}
+      if (typeof t.webContents.setBackgroundThrottling === 'function') {
+        try { t.webContents.setBackgroundThrottling(!isActive); } catch (e) {}
+      }
+    });
+  } catch (e) {}
+
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.setBrowserView(tab.view);
     resizeActiveTab();
@@ -3583,7 +3691,8 @@ function handleDownload(event, item, webContents) {
     info.totalBytes = item.getTotalBytes();
     info.state = state;
     info.paused = item.isPaused();
-    saveData();
+    // v2.10.0 不再在每个下载进度回调里存盘（进度只走内存 + IPC），
+    // 下载完成/退出时统一落盘，根治"一下载整个窗口就卡"
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send(isMediaDownload ? 'media-download-progress' : 'download-progress', info);
     }
@@ -3610,11 +3719,19 @@ function handleDownload(event, item, webContents) {
 function getAllMediaUrls() {
   const result = [];
   const seen = new Set();
+  // v2.10.0 性能：原先每个媒体都对 downloads 做全量线性查找（O(n²)），媒体/下载多时明显卡；
+  // 改为先建一次 Map 索引（O(n)）后 O(1) 命中。
+  const mediaDownloadIndex = new Map();
+  globalState.downloads.forEach(item => {
+    if (!item || item.category !== 'media') return;
+    if (item.mediaUrl) mediaDownloadIndex.set(item.mediaUrl, item);
+    if (item.url && !mediaDownloadIndex.has(item.url)) mediaDownloadIndex.set(item.url, item);
+  });
   globalState.mediaUrls.forEach((items, tabId) => {
     (items || []).forEach(media => {
       if (!media || !media.url || seen.has(media.url)) return;
       seen.add(media.url);
-      const download = Array.from(globalState.downloads.values()).find(item => item.category === 'media' && (item.mediaUrl === media.url || item.url === media.url));
+      const download = mediaDownloadIndex.get(media.url);
       result.push({ ...media, tabId, download });
     });
   });
@@ -6695,7 +6812,7 @@ app.on('before-quit', (event) => {
     fs.writeFileSync(path.join(dataPath, 'tabs-session.json'), JSON.stringify([]));
     addLog('SESSION', '正常退出，清空会话');
   } catch (e) {}
-  saveData();
+  flushSaveDataSync();   // v2.10.0 退出必须同步刷盘（saveData 已改防抖异步）
   // 销毁托盘，避免 3 秒延迟期间用户重复点击
   if (tray) {
     try { tray.destroy(); } catch (e) {}
