@@ -944,6 +944,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 自定义广告规则
   getCustomAdRules: () => ipcRenderer.invoke('get-custom-ad-rules'),
   deleteCustomAdRule: (index) => ipcRenderer.invoke('delete-custom-ad-rule', index),
+  // 恢复上一个删除的标记（v2.9.1，可连续恢复）
+  undoDeleteAdRule: () => ipcRenderer.invoke('undo-delete-ad-rule'),
   clearCustomAdRules: () => ipcRenderer.invoke('clear-custom-ad-rules'),
 
   // 日志功能

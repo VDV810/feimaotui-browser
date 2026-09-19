@@ -500,6 +500,30 @@ function setupEventListeners() {
         });
     }
 
+    // v2.9.1: 恢复上一个删除的标记（可连续点击，按删除时间倒序依次恢复）
+    const undoDeleteAdRuleBtn = document.getElementById('undoDeleteAdRuleBtn');
+    if (undoDeleteAdRuleBtn) {
+        undoDeleteAdRuleBtn.addEventListener('click', async () => {
+            try {
+                const result = await window.electronAPI.undoDeleteAdRule();
+                if (result.success) {
+                    await loadCustomAdRules();
+                    if (result.restored === false) {
+                        alert('这条标记恢复前页面里已经存在相同规则，已跳过');
+                    } else {
+                        const num = result.rule && result.rule.seq ? '（序号' + result.rule.seq + '）' : '';
+                        undoDeleteAdRuleBtn.textContent = `已恢复${num}`;
+                        setTimeout(() => { undoDeleteAdRuleBtn.textContent = '恢复上个标记'; }, 2000);
+                    }
+                } else {
+                    alert(result.error || '恢复失败');
+                }
+            } catch (e) {
+                alert('恢复标记失败: ' + e.message);
+            }
+        });
+    }
+
     // 翻译功能
     if (elements.translateTextBtn) {
         elements.translateTextBtn.addEventListener('click', async () => {
@@ -2053,8 +2077,8 @@ async function loadCustomAdRules() {
             elements.customAdRulesList.innerHTML = '<div class="empty-state" style="padding: 10px; color: #888; font-size: 13px;">暂无已标记的广告元素</div>';
             return;
         }
-        // 按时间从新到旧排序（createdAt 大的在前）
-        const sortedRules = [...rules].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        // 按稳定序号从小到大排序（v2.9.1）：删除的序号留空不复用，方便按序号排查异常标记
+        const sortedRules = [...rules].sort((a, b) => (a.seq || 0) - (b.seq || 0) || (b.createdAt || 0) - (a.createdAt || 0));
         let html = '';
         sortedRules.forEach((rule, displayIndex) => {
             // 找到原始数组中的真实索引
@@ -2063,7 +2087,9 @@ async function loadCustomAdRules() {
             const domain = rule.domain || '*';
             const shortSelector = selector.length > 50 ? selector.substring(0, 50) + '...' : selector;
             const timeStr = rule.createdAt ? new Date(rule.createdAt).toLocaleString('zh-CN', {month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '';
+            const ruleNum = rule.seq || (displayIndex + 1);
             html += '<div style="display: flex; align-items: center; justify-content: space-between; padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 12px;">';
+            html += '<span title="标记序号（永久编号，删除后留空不复用）" style="flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; border-radius: 50%; background: #e6f4ff; color: #1677ff; font-size: 11px; font-weight: 600; margin-right: 8px; padding: 0 3px;">' + ruleNum + '</span>';
             html += '<div style="flex: 1; overflow: hidden;">';
             html += '<div style="font-weight: 600; color: #333;">' + domain + ' <span style="color: #bbb; font-weight: normal; font-size: 11px;">' + timeStr + '</span></div>';
             html += '<div style="color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="' + selector.replace(/"/g, '&quot;') + '">' + shortSelector + '</div>';

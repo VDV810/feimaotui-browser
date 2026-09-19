@@ -499,7 +499,39 @@ function loadData() {
       globalState.customAdRules = JSON.parse(fs.readFileSync(ap, 'utf8'));
       addLog('ADBLOCK', '加载自定义广告规则', `${globalState.customAdRules.length} 条`);
     }
+    // v2.9.1: 加载广告标记回收站 + 补齐稳定序号
+    loadDeletedAdRules();
+    ensureAdRuleSeqs();
   } catch (e) { addLog('ERROR', '加载数据失败', e.message); }
+}
+
+// ==================== 广告标记：稳定序号 + 回收站（v2.9.1） ====================
+// seq 是每条标记的永久编号：删除后序号留空不复用（1,2,3,4,6,7），
+// 用户可以按序号逐条排查是哪条标记导致的页面异常，配合"恢复上个标记"随时反悔。
+let adRuleSeqCounter = 1;
+function ensureAdRuleSeqs() {
+  try {
+    const rules = globalState.customAdRules || [];
+    rules.forEach(rule => {
+      if (typeof rule.seq !== 'number') rule.seq = adRuleSeqCounter++;
+      else if (rule.seq >= adRuleSeqCounter) adRuleSeqCounter = rule.seq + 1;
+    });
+  } catch (e) {}
+}
+
+// 回收站：最近删除的标记，支持连续"恢复上个标记"，最多保留 30 条
+let deletedAdRulesStack = [];
+const DELETED_AD_RULES_MAX = 30;
+function loadDeletedAdRules() {
+  try {
+    const dp = path.join(dataPath, 'custom-ad-rules-deleted.json');
+    if (fs.existsSync(dp)) deletedAdRulesStack = JSON.parse(fs.readFileSync(dp, 'utf8')) || [];
+  } catch (e) { deletedAdRulesStack = []; }
+}
+function saveDeletedAdRules() {
+  try {
+    fs.writeFileSync(path.join(dataPath, 'custom-ad-rules-deleted.json'), JSON.stringify(deletedAdRulesStack.slice(-DELETED_AD_RULES_MAX), null, 2), 'utf8');
+  } catch (e) {}
 }
 
 function saveTabsSession() {
@@ -567,12 +599,14 @@ function applyDarkModeToTab(tab, enabled) {
 
 function saveData() {
   try {
+    ensureAdRuleSeqs(); // v2.9.1: 新入库的标记自动补永久序号
     fs.writeFileSync(path.join(dataPath, 'bookmarks.json'), JSON.stringify(globalState.bookmarks));
     fs.writeFileSync(path.join(dataPath, 'history.json'), JSON.stringify(globalState.history.slice(-1000)));
     fs.writeFileSync(path.join(dataPath, 'settings.json'), JSON.stringify(globalState.settings));
     fs.writeFileSync(path.join(dataPath, 'downloads.json'), JSON.stringify(Array.from(globalState.downloads.values()).slice(-500)));
     fs.writeFileSync(path.join(dataPath, 'media-urls.json'), JSON.stringify(Array.from(globalState.mediaUrls.entries())));
     fs.writeFileSync(path.join(dataPath, 'custom-ad-rules.json'), JSON.stringify(globalState.customAdRules || []));
+    saveDeletedAdRules();
     saveTabsSession();
   } catch (e) { addLog('ERROR', '保存数据失败', e.message); }
 }
@@ -5879,14 +5913,18 @@ function setupIPC() {
 
   // 自定义广告规则管理
   ipcMain.handle('get-custom-ad-rules', () => {
+    ensureAdRuleSeqs(); // v2.9.1: 老数据没有 seq 的补齐后返回
     return globalState.customAdRules || [];
   });
 
   ipcMain.handle('delete-custom-ad-rule', (event, index) => {
     if (globalState.customAdRules && index >= 0 && index < globalState.customAdRules.length) {
       const removed = globalState.customAdRules.splice(index, 1);
+      // v2.9.1: 删除的规则进回收站，支持"恢复上个标记"；seq 永久保留不复用
+      removed.forEach(r => { r.deletedAt = Date.now(); deletedAdRulesStack.push(r); });
+      if (deletedAdRulesStack.length > DELETED_AD_RULES_MAX) deletedAdRulesStack = deletedAdRulesStack.slice(-DELETED_AD_RULES_MAX);
       saveData();
-      addLog('ADBLOCK', '删除广告规则', removed[0].selector);
+      addLog('ADBLOCK', '删除广告规则', `${removed[0].seq ? '序号' + removed[0].seq + ' ' : ''}${removed[0].selector}`);
       // 通知所有标签页重新加载以移除CSS
       globalState.tabs.forEach((tab) => {
         if (tab.view && tab.view.webContents && !tab.view.webContents.isDestroyed()) {
@@ -5898,8 +5936,36 @@ function setupIPC() {
     return { success: false, error: '索引无效' };
   });
 
+  // v2.9.1: 恢复上一个删除的标记（可连续点，按删除时间倒序依次恢复）
+  ipcMain.handle('undo-delete-ad-rule', () => {
+    if (!deletedAdRulesStack.length) return { success: false, error: '没有可恢复的标记了' };
+    const rule = deletedAdRulesStack.pop();
+    const exists = (globalState.customAdRules || []).some(r => r.selector === rule.selector && r.domain === rule.domain);
+    if (exists) {
+      // 已有相同规则（比如恢复前又手动标了一次），只丢弃回收站记录
+      saveDeletedAdRules();
+      addLog('ADBLOCK', '恢复标记跳过', '相同规则已存在: ' + rule.selector);
+      return { success: true, restored: false, rule };
+    }
+    delete rule.deletedAt;
+    globalState.customAdRules.push(rule);
+    ensureAdRuleSeqs();
+    saveData();
+    addLog('ADBLOCK', '恢复标记', `${rule.seq ? '序号' + rule.seq : ''} ${rule.selector}`);
+    globalState.tabs.forEach((tab) => {
+      if (tab.view && tab.view.webContents && !tab.view.webContents.isDestroyed()) {
+        tab.view.webContents.reload();
+      }
+    });
+    return { success: true, restored: true, rule };
+  });
+
   ipcMain.handle('clear-custom-ad-rules', () => {
     const count = (globalState.customAdRules || []).length;
+    // v2.9.1: 清空的规则也进回收站，同样可以逐条"恢复上个标记"
+    const now = Date.now();
+    globalState.customAdRules.forEach(r => { r.deletedAt = now; deletedAdRulesStack.push(r); });
+    if (deletedAdRulesStack.length > DELETED_AD_RULES_MAX) deletedAdRulesStack = deletedAdRulesStack.slice(-DELETED_AD_RULES_MAX);
     globalState.customAdRules = [];
     saveData();
     addLog('ADBLOCK', '清空所有广告规则', `${count} 条`);
