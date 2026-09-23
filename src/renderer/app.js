@@ -234,6 +234,11 @@ function setupEventListeners() {
                 }
             }
         });
+        // v2.11.0: 失焦回同步 —— 用户输入了但没回车就点开页面时，地址栏恢复显示当前真实 URL
+        // （与 Chrome 行为一致）；配合 updateUI 的编辑保护，输入期间不会被任何事件打断。
+        elements.addressInput.addEventListener('blur', () => {
+            updateUI();
+        });
     }
 
     // 面板切换 - 关键修复：使用mousedown而不是click，避免被BrowserView拦截
@@ -1307,7 +1312,13 @@ function handleTabDragEnd() {
 function updateUI() {
     const tab = appState.activeTabId ? appState.tabs.get(appState.activeTabId) : null;
     if (tab) {
-        elements.addressInput.value = tab.url || '';
+        // v2.11.0: 地址栏编辑保护 —— 用户正在输入时(输入框持有焦点)，任何 tab 事件
+        // (did-start-loading/SPA页内跳转/标题更新等触发的 onTabUpdated)都不得覆盖输入内容。
+        // 旧页面还活着时这类事件频繁发生，tab.url 仍是旧地址，直接覆盖就是
+        // "还没回车地址就被跳回原地址"的根因。失焦(blur)时统一回同步。
+        if (document.activeElement !== elements.addressInput) {
+            elements.addressInput.value = tab.url || '';
+        }
         elements.addressInput.placeholder = tab.title || '输入网址或搜索内容...';
     } else {
         elements.addressInput.value = '';

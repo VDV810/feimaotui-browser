@@ -5346,6 +5346,12 @@ function setupIPC() {
         }
       }
       addLog('NAVIGATE', '导航到', targetUrl);
+      // v2.11.0: 立即同步 tab.url 为请求地址 —— loadURL 到 did-navigate 提交之间有窗口期，
+      // 此期间 did-start-loading 等事件通知渲染端时 tab.url 还是旧地址，会把地址栏打回原形
+      if (tab.url !== targetUrl) {
+        tab.url = targetUrl;
+        notifyTabUpdate(tabId, { url: targetUrl });
+      }
       tab.webContents.loadURL(targetUrl);
     }
   });
