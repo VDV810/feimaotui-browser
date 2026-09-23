@@ -536,6 +536,8 @@ function loadData() {
     }
     // v2.9.1: 加载广告标记回收站 + 补齐稳定序号
     loadDeletedAdRules();
+    // v2.12.0: 加载已删除规则墓碑（防内置默认规则重启复活）
+    loadAdRuleTombstones();
     ensureAdRuleSeqs();
   } catch (e) { addLog('ERROR', '加载数据失败', e.message); }
 }
@@ -566,6 +568,34 @@ function loadDeletedAdRules() {
 function saveDeletedAdRules() {
   try {
     fs.writeFileSync(path.join(dataPath, 'custom-ad-rules-deleted.json'), JSON.stringify(deletedAdRulesStack.slice(-DELETED_AD_RULES_MAX), null, 2), 'utf8');
+  } catch (e) {}
+}
+
+// v2.12.0: 已删除规则墓碑 —— seedDefaultAdRules 每次启动都按"当前列表"去重重种内置默认规则，
+// 用户删掉的内置规则(如千川 notice-container)会被当成"新人缺的规则"重新加回 = 删除后重启复活。
+// 墓碑永久记录删除过的 selector|domain 键，播种时跳过；撤销恢复/重新手动标记不受影响。
+let deletedAdRuleTombstones = new Set();
+function loadAdRuleTombstones() {
+  try {
+    const tp = path.join(dataPath, 'custom-ad-rules-tombstones.json');
+    if (fs.existsSync(tp)) deletedAdRuleTombstones = new Set(JSON.parse(fs.readFileSync(tp, 'utf8')) || []);
+  } catch (e) { deletedAdRuleTombstones = new Set(); }
+}
+function saveAdRuleTombstones() {
+  try {
+    fs.writeFileSync(path.join(dataPath, 'custom-ad-rules-tombstones.json'), JSON.stringify([...deletedAdRuleTombstones]), 'utf8');
+  } catch (e) {}
+}
+function tombstoneAdRules(rules) {
+  try {
+    let changed = false;
+    (rules || []).forEach(r => {
+      if (r && r.selector) {
+        const key = r.selector + '|' + String(r.domain || '*').split(':')[0];
+        if (!deletedAdRuleTombstones.has(key)) { deletedAdRuleTombstones.add(key); changed = true; }
+      }
+    });
+    if (changed) saveAdRuleTombstones();
   } catch (e) {}
 }
 
@@ -6043,6 +6073,8 @@ function setupIPC() {
   ipcMain.handle('delete-custom-ad-rule', (event, index) => {
     if (globalState.customAdRules && index >= 0 && index < globalState.customAdRules.length) {
       const removed = globalState.customAdRules.splice(index, 1);
+      // v2.12.0: 记墓碑 —— 内置默认规则播种时永久跳过，删除后重启不再复活
+      tombstoneAdRules(removed);
       // v2.9.1: 删除的规则进回收站，支持"恢复上个标记"；seq 永久保留不复用
       removed.forEach(r => { r.deletedAt = Date.now(); deletedAdRulesStack.push(r); });
       if (deletedAdRulesStack.length > DELETED_AD_RULES_MAX) deletedAdRulesStack = deletedAdRulesStack.slice(-DELETED_AD_RULES_MAX);
@@ -6085,6 +6117,8 @@ function setupIPC() {
 
   ipcMain.handle('clear-custom-ad-rules', () => {
     const count = (globalState.customAdRules || []).length;
+    // v2.12.0: 全部记墓碑（清空后重启不再被播种加回）
+    tombstoneAdRules(globalState.customAdRules);
     // v2.9.1: 清空的规则也进回收站，同样可以逐条"恢复上个标记"
     const now = Date.now();
     globalState.customAdRules.forEach(r => { r.deletedAt = now; deletedAdRulesStack.push(r); });
@@ -6719,7 +6753,8 @@ function seedDefaultAdRules() {
         if (!selector || selector.length > 500) return;
         const domain = String(item.domain || '*').split(':')[0];
         const key = selector + '|' + domain;
-        if (existingKeys.has(key)) return;
+        // v2.12.0: 墓碑命中 —— 用户删过的规则永不重种（删除后重启复活的根因修复）
+        if (existingKeys.has(key) || deletedAdRuleTombstones.has(key)) return;
         existingKeys.add(key);
         globalState.customAdRules.push({
           selector, urlPattern: '', domain, createdAt: Date.now()
