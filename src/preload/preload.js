@@ -1109,21 +1109,41 @@ contextBridge.exposeInMainWorld('electronAPI', {
     console.warn('[QC-AUTO] 千川自动设置已加载: ' + location.hostname + location.pathname);
     var stepIndex = 0;
     var attempts = 0;
-    var MAX_ATTEMPTS = 60;      // 500ms × 60 = 30s 放弃
+    var forced = {};            // v2.18.0: 误判强制点击已用标记(每步最多一次, 防止空转)
+    // v2.18.0: 30s→120s。千川这页数据重、子tab(商品自选)渲染晚, 30s窗口有时不够(用户实测"大部分能到、一两个没点到")
+    var MAX_ATTEMPTS = 240;     // 500ms × 240 = 120s
     var done = false;
 
+    // v2.18.0: 激活判定只看"自身 + 直接父级", 支持 is-active/is-selected/is-checked 写法。
+    // 旧实现向上找4级祖先, 容器类名恰好含 active 时会把未激活的 tab 误判成已到位而跳过
+    // (用户实测: 全域投放/推商品都点到了, 商品自选没点 —— 疑似被误判跳过)。
+    function activeMatch(cls) {
+      if (!cls) return false;
+      // 词边界匹配: active / is-active / tab-active / selected / is-selected / checked / type-checked
+      if (/(^|[\s_-])(active|selected|checked)([\s_-]|$)/i.test(cls)) return true;
+      return false;
+    }
     function isActive(el) {
-      var cur = el, up = 0;
-      while (cur && cur.nodeType === 1 && up < 5) {
+      var chain = [el, el.parentElement];
+      for (var i = 0; i < chain.length; i++) {
+        var cur = chain[i];
+        if (!cur || cur.nodeType !== 1) continue;
         try {
           if (cur.getAttribute && (cur.getAttribute('aria-selected') === 'true' || cur.getAttribute('aria-current'))) return true;
           var cls = (cur.className && typeof cur.className === 'string') ? cur.className : '';
-          if (/(^|\s)(active|selected|checked)(\s|$)/i.test(cls)) return true;
+          if (activeMatch(cls)) return true;
         } catch (e) {}
-        cur = cur.parentElement;
-        up++;
       }
       return false;
+    }
+    // 诊断: 说明"为什么跳过/为什么点"(用户日志里能一眼看出是没找到还是被误判)
+    function describeState(el) {
+      try {
+        var self = (el.className && typeof el.className === 'string') ? el.className : '';
+        var p = el.parentElement;
+        var pcls = (p && p.className && typeof p.className === 'string') ? p.className : '';
+        return 'self="' + self.substring(0, 60) + '" parent="' + pcls.substring(0, 60) + '"';
+      } catch (e) { return ''; }
     }
 
     function findTabsByText(text) {
@@ -1170,10 +1190,33 @@ contextBridge.exposeInMainWorld('electronAPI', {
           if (leaves.length === 0) leaves = tabs;
           // 同名 tab 可能多处(如"全域投放"在顶部导航+投放类型行), 一活一灭只补灭的
           var inactive = leaves.filter(function(t) { return !isActive(t); });
-          if (inactive.length === 0) { stepIndex++; continue; }
+          if (inactive.length === 0) {
+            // v2.18.0 防误判: 判定"已到位"的依据若来自祖先共享类名(同行兄弟全都 active), 信号不可信 →
+            // 每步最多强制点击一次(治"商品自选被误判跳过"), 不空转
+            var row = leaves[0].parentElement;
+            var sibCount = 0, sibActive = 0;
+            try {
+              if (row) {
+                for (var ci = 0; ci < row.children.length; ci++) {
+                  var ch = row.children[ci];
+                  if ((ch.textContent || '').trim()) { sibCount++; if (isActive(ch)) sibActive++; }
+                }
+              }
+            } catch (e) {}
+            if (sibCount >= 2 && sibActive === sibCount && !forced[stepIndex]) {
+              forced[stepIndex] = true;
+              leaves[0].click();
+              console.warn('[QC-AUTO] 步骤' + (stepIndex + 1) + '(' + usedAlt + ') 同行兄弟全被判激活, 疑似误判 → 强制点击一次 | ' + describeState(leaves[0]));
+              return;
+            }
+            console.warn('[QC-AUTO] 步骤' + (stepIndex + 1) + '(' + usedAlt + ') 判定已到位, 跳过 | ' + describeState(leaves[0]));
+            stepIndex++;
+            continue;
+          }
           var target = (leaves.length > 1 && inactive.length < leaves.length) ? inactive[0] : leaves[0];
           target.click();
-          console.warn('[QC-AUTO] 已自动点击: ' + usedAlt + ' (第' + attempts + '次尝试)');
+          console.warn('[QC-AUTO] 已自动点击: ' + usedAlt + ' (第' + attempts + '次尝试, 候选' + leaves.length + '个' +
+            (leaves.length > 1 ? '(一活一灭补点)' : '') + ') ' + describeState(target));
           return;                                  // 一次只点一个, 等 React 重渲染
         }
         done = true;
@@ -1185,7 +1228,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     var timer = null;
     function stop(timeout) {
       if (timer) { clearInterval(timer); timer = null; }
-      if (timeout) console.warn('[QC-AUTO] 30秒内未能完成自动设置, 放弃(不影响页面)');
+      if (timeout) console.warn('[QC-AUTO] 120秒内未能完成自动设置, 放弃(不影响页面)。最后状态: 步骤' + (stepIndex + 1) + ' 未完成, 已尝试' + attempts + '次');
     }
     timer = setInterval(attempt, 500);
     document.addEventListener('DOMContentLoaded', function() { if (!done) attempt(); }, { once: true });
