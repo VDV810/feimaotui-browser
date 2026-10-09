@@ -58,9 +58,14 @@ const AUTO_SETUP_SRC = `
           if (found.length > 0) { tabs = found; usedAlt = STEPS[stepIndex].alts[ai]; break; }
         }
         if (!tabs) return;
-        var inactive = tabs.filter(function(t) { return !isActive(t); });
+        // 与 preload 一致: 只取叶子元素再点击(冒泡命中任意层级处理器)
+        var leaves = tabs.filter(function(t) {
+          return !tabs.some(function(o) { return o !== t && t.contains(o); });
+        });
+        if (leaves.length === 0) leaves = tabs;
+        var inactive = leaves.filter(function(t) { return !isActive(t); });
         if (inactive.length === 0) { stepIndex++; continue; }
-        var target = (tabs.length > 1 && inactive.length < tabs.length) ? inactive[0] : tabs[0];
+        var target = (leaves.length > 1 && inactive.length < leaves.length) ? inactive[0] : leaves[0];
         target.click();
         window.__qcLog.push(usedAlt);
         return;
@@ -147,6 +152,43 @@ function buildUniPromPage(pushActive, selfActive) {
 </body></html>`;
 }
 
+// v2.16.0 回归: click 处理器只挂在内层 <span> 上(模拟 React 把 onClick 挂在内层节点),
+// 若点外层容器则完全不触发 —— 叶子点击(冒泡)必须能命中
+function buildInnerHandlerPage() {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<div class="brand">千川乘方</div>
+<header>
+  <div class="nav-item active" data-key="chengfang"><span>乘方</span></div>
+  <div class="nav-item" data-key="nav-outer"><span id="nav-inner">全域投放</span></div>
+</header>
+<div class="objective-tabs">
+  <div class="obj-tab active"><span>直播</span></div>
+  <div class="obj-tab"><span>商品</span></div>
+</div>
+<div class="sub-tabs">
+  <div class="sub-tab active"><span>全店托管</span></div>
+  <div class="sub-tab"><span>商品自选</span></div>
+</div>
+<script>
+  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0 };
+  window.__outerClicked = 0;
+  document.querySelector('[data-key="nav-outer"]').addEventListener('click', function() {
+    // 外层收到点击(不应由自动化触发, 因为处理器实际在内层; 由内层冒泡上来时会有 inner 标记)
+    window.__outerClicked++;
+  });
+  // 处理器只挂在内层 span 上(点击后切激活态, 模拟真实 tab 行为)
+  document.getElementById('nav-inner').addEventListener('click', function(e) {
+    if (e.target === this) {
+      window.__clickCount.nav++; window.__qcLog.push('全域投放');
+      var outer = this.parentElement;
+      Array.prototype.forEach.call(outer.parentElement.children, function(c){ c.classList.remove('active'); });
+      outer.classList.add('active');
+    }
+  });
+</script>
+</body></html>`;
+}
+
 // 非目标页(数据页): 无"千川乘方", 有自己的"商品"字样干扰项
 function buildDataPage() {
   return `<!doctype html><html><head><meta charset="utf-8"></head><body>
@@ -228,6 +270,13 @@ app.whenReady().then(async () => {
   const overallHtml = buildChengfangPage().replace('<div class="brand">千川乘方</div>', '');
   const d5 = await run('overall-prom直开', overallHtml, '/overall-prom', 2500);
   assert(d5.log.length >= 1 && d5.log[0] === '全域投放' && d5.clicks.nav === 1, '场景5: overall-prom 页自动点击导航全域投放');
+
+  // 场景6(v2.16.0 回归): click 处理器只在内层 span 上 → 叶子点击(冒泡)必须命中
+  const d6 = await run('内层span处理器', buildInnerHandlerPage(), '/overall-prom', 2500);
+  assert(d6.clicks.nav === 1, '场景6: 处理器挂在内层 span 时仍能点到(叶子+冒泡)');
+  const outerHits = await win.webContents.executeJavaScript('window.__outerClicked');
+  console.log('外层容器收到的点击次数(应为1, 由内层冒泡而来):', outerHits);
+  assert(outerHits === 1, '场景6: 事件由内层冒泡至外层, 未直接点外层容器');
 
   fs.unlinkSync(tmp);
   console.log(pass ? '\nQC AUTO SETUP v2.14.0 TEST PASS (四场景全部通过)' : '\nTEST FAIL');

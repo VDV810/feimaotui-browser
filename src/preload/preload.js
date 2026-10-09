@@ -1096,13 +1096,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
 (function qianchuanAutoSetup() {
   try {
     if (window.top !== window) return;
-    if (!/jinriritemai\.com$/i.test(location.hostname)) return;
+    // v2.16.0: 域名实测为 qianchuan.jinritemai.com(单个ri) —— 旧守卫只认 jinriritemai.com 导致整段跳过;
+    // 两个域都放行(jinritemai 是实际域名, jinriritemai 为兼容另一种写法)。
+    if (!/(jinritemai|jinriritemai)\.com$/i.test(location.hostname)) return;
 
     var STEPS = [
       { alts: ['全域投放'] },
       { alts: ['推商品'] },          // 只认全域投放页的"推商品"; 乘方页自己的"商品"tab 不碰
       { alts: ['商品自选'] }
     ];
+    // 诊断: 明确记录脚本已在千川页加载(排查"完全没日志"时区分是守卫跳过还是逻辑没跑)
+    console.warn('[QC-AUTO] 千川自动设置已加载: ' + location.hostname + location.pathname);
     var stepIndex = 0;
     var attempts = 0;
     var MAX_ATTEMPTS = 60;      // 500ms × 60 = 30s 放弃
@@ -1157,10 +1161,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
             if (found.length > 0) { tabs = found; usedAlt = STEPS[stepIndex].alts[ai]; break; }
           }
           if (!tabs) return;                       // 还没渲染出来, 下次再试
+          // v2.16.0: 只取"叶子"元素(textContent 精确等于目标词且内部无同级候选)再点击 ——
+          // 点最内层节点, 事件冒泡会经过所有祖先, 无论 React 把 click 处理器挂在哪一层都能命中;
+          // 点外层容器则可能因处理器在内层而完全没反应(实测踩坑)。
+          var leaves = tabs.filter(function(t) {
+            return !tabs.some(function(o) { return o !== t && t.contains(o); });
+          });
+          if (leaves.length === 0) leaves = tabs;
           // 同名 tab 可能多处(如"全域投放"在顶部导航+投放类型行), 一活一灭只补灭的
-          var inactive = tabs.filter(function(t) { return !isActive(t); });
+          var inactive = leaves.filter(function(t) { return !isActive(t); });
           if (inactive.length === 0) { stepIndex++; continue; }
-          var target = (tabs.length > 1 && inactive.length < tabs.length) ? inactive[0] : tabs[0];
+          var target = (leaves.length > 1 && inactive.length < leaves.length) ? inactive[0] : leaves[0];
           target.click();
           console.warn('[QC-AUTO] 已自动点击: ' + usedAlt + ' (第' + attempts + '次尝试)');
           return;                                  // 一次只点一个, 等 React 重渲染
