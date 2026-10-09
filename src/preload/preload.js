@@ -1087,23 +1087,25 @@ contextBridge.exposeInMainWorld('electronAPI', {
   }, true);
 })();
 
-// ============ 千川 uni-prom 页自动设置: 全域投放 → 推商品 → 商品自选 (v2.13.0) ============
-// 每次打开千川投放页都要手动点三层 tab, 这里自动点到位。
-// 设计要点:
-// - 仅主框架 + 仅千川(qianchuan.*.jinriritemai.com)/uni-prom 路径生效;
-// - 文本精确匹配(textContent===目标词)锁定"叶子"tab元素, 不依赖会漂移的 class;
-// - 已激活则跳过(激活判定: 自身+4级祖先含 active/selected/checked 类或 aria-selected);
-// - 每次尝试只点一个(给 React 重渲染留时间), 全部到位后永久停止 —— 不干扰用户后续手动切换。
+// ============ 千川页自动设置: 全域投放 → 商品(推商品) → 商品自选 (v2.14.0) ============
+// v2.13.0 只守 /uni-prom 路径, 实测用户打开的落地页是"乘方"页(路径未知)直接没跑。
+// v2.14.0 改为动态识别: uni-prom 路径 或 页面含"千川乘方"字样才动手 —— 数据/工具/财务等
+// 页面绝不会被劫持跳走。步骤支持备选文本: 全域投放页 tab 是"推商品", 乘方页是"商品"。
+// 其余要点同前: 文本精确匹配叶子元素 / 激活检测跳过已到位层 / 一活一灭只补灭的 /
+// 一次只点一个(等 React 重渲染) / 全部到位永久停止 / 30秒放弃。
 (function qianchuanAutoSetup() {
   try {
     if (window.top !== window) return;
     if (!/jinriritemai\.com$/i.test(location.hostname)) return;
-    if (!/^\/uni-prom/i.test(location.pathname)) return;
 
-    var STEPS = ['全域投放', '推商品', '商品自选'];
-    var stepIndex = 0;          // 当前进行到的步骤
-    var attempts = 0;           // 已尝试次数
-    var MAX_ATTEMPTS = 60;      // 500ms × 60 = 30s 放弃(页面变体/未登录等情况不无限折腾)
+    var STEPS = [
+      { alts: ['全域投放'] },
+      { alts: ['推商品'] },          // 只认全域投放页的"推商品"; 乘方页自己的"商品"tab 不碰
+      { alts: ['商品自选'] }
+    ];
+    var stepIndex = 0;
+    var attempts = 0;
+    var MAX_ATTEMPTS = 60;      // 500ms × 60 = 30s 放弃
     var done = false;
 
     function isActive(el) {
@@ -1131,27 +1133,40 @@ contextBridge.exposeInMainWorld('electronAPI', {
       return out;
     }
 
+    // 目标页判定: uni-prom 路径, 或当前是"乘方"落地页(页面渲染出"千川乘方"字样)。
+    // 动态判定(放在 attempt 里)是因为 SPA 内容晚渲染; 数据/工具等页面不含该字样永不误伤。
+    function onTargetPage() {
+      if (/^\/uni-prom/i.test(location.pathname)) return true;
+      try {
+        return (document.body && document.body.textContent || '').indexOf('千川乘方') !== -1;
+      } catch (e) { return false; }
+    }
+
     function attempt() {
       if (done) return;
       attempts++;
       if (attempts > MAX_ATTEMPTS) { stop(true); return; }
       try {
+        if (!onTargetPage()) return;               // 非目标页(数据/工具/财务等)绝不动手
         while (stepIndex < STEPS.length) {
-          var tabs = findTabsByText(STEPS[stepIndex]);
-          if (tabs.length === 0) return;             // 还没渲染出来, 下次再试
-          // "全域投放"在顶部导航和投放类型行各有一个, 可能一活一灭:
-          // 全部激活→此层到位; 有灭的→点灭的那个(补齐另一处); 全灭→点第一个(导航层)
+          // 备选文本依次找: 找到任一即可操作
+          var tabs = null, usedAlt = '';
+          for (var ai = 0; ai < STEPS[stepIndex].alts.length; ai++) {
+            var found = findTabsByText(STEPS[stepIndex].alts[ai]);
+            if (found.length > 0) { tabs = found; usedAlt = STEPS[stepIndex].alts[ai]; break; }
+          }
+          if (!tabs) return;                       // 还没渲染出来, 下次再试
+          // 同名 tab 可能多处(如"全域投放"在顶部导航+投放类型行), 一活一灭只补灭的
           var inactive = tabs.filter(function(t) { return !isActive(t); });
           if (inactive.length === 0) { stepIndex++; continue; }
           var target = (tabs.length > 1 && inactive.length < tabs.length) ? inactive[0] : tabs[0];
           target.click();
-          console.warn('[QC-AUTO] 已自动点击: ' + STEPS[stepIndex] + ' (第' + attempts + '次尝试)');
-          return;                                    // 一次只点一个, 等 React 重渲染
+          console.warn('[QC-AUTO] 已自动点击: ' + usedAlt + ' (第' + attempts + '次尝试)');
+          return;                                  // 一次只点一个, 等 React 重渲染
         }
-        // 三层全部到位
         done = true;
         stop(false);
-        console.warn('[QC-AUTO] 千川页面已自动设置为 全域投放/推商品/商品自选');
+        console.warn('[QC-AUTO] 千川页面已自动设置为 全域投放/商品/商品自选');
       } catch (e) {}
     }
 
@@ -1161,7 +1176,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
       if (timeout) console.warn('[QC-AUTO] 30秒内未能完成自动设置, 放弃(不影响页面)');
     }
     timer = setInterval(attempt, 500);
-    // DOM 就绪即可开跑(SPA 渲染晚也没关系, attempt 会自己等)
     document.addEventListener('DOMContentLoaded', function() { if (!done) attempt(); }, { once: true });
   } catch (e) {}
 })();
