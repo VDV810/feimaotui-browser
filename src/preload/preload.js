@@ -1133,10 +1133,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       return out;
     }
 
-    // 目标页判定: uni-prom 路径, 或当前是"乘方"落地页(页面渲染出"千川乘方"字样)。
-    // 动态判定(放在 attempt 里)是因为 SPA 内容晚渲染; 数据/工具等页面不含该字样永不误伤。
+    // 目标页判定: uni-prom / overall-prom 路径(工作台点账户落地的乘方智能营销页),
+    // 或页面渲染出"千川乘方"字样。动态判定(放在 attempt 里)是因为 SPA 内容晚渲染;
+    // 数据/工具等页面不含该字样永不误伤。
     function onTargetPage() {
-      if (/^\/uni-prom/i.test(location.pathname)) return true;
+      if (/^\/(uni-prom|overall-prom)/i.test(location.pathname)) return true;
       try {
         return (document.body && document.body.textContent || '').indexOf('千川乘方') !== -1;
       } catch (e) { return false; }

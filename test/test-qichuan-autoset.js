@@ -39,7 +39,9 @@ const AUTO_SETUP_SRC = `
     return out;
   }
   function onTargetPage() {
-    if (window.__mockPath === '/uni-prom') return true;
+    // 注意: 此函数在模板字面量内, 路径匹配不用正则(\/ 转义会被模板字面量吃掉变语法错误)
+    var p = window.__mockPath || '';
+    if (p.indexOf('/uni-prom') === 0 || p.indexOf('/overall-prom') === 0) return true;
     try { return (document.body && document.body.textContent || '').indexOf('千川乘方') !== -1; }
     catch (e) { return false; }
   }
@@ -155,16 +157,38 @@ function buildDataPage() {
 }
 
 app.whenReady().then(async () => {
+  // 看门狗: 任何环节卡死都强退, 不让测试挂死
+  setTimeout(() => { console.log('WATCHDOG TIMEOUT (25s)'); app.exit(2); }, 25000).unref();
   let pass = true;
   const assert = (cond, msg) => { console.log((cond ? '[PASS] ' : '[FAIL] ') + msg); if (!cond) pass = false; };
   const win = new BrowserWindow({ width: 1000, height: 700, show: false });
   const tmp = path.join(app.getPath('temp'), 'fmt-qc-auto.html');
 
   async function run(name, html, mockPath, waitMs) {
-    fs.writeFileSync(tmp, html);
-    await win.loadFile(tmp);
-    await win.webContents.executeJavaScript(`window.__mockQcHost = true; window.__mockPath = ${JSON.stringify(mockPath)};`);
-    await win.webContents.executeJavaScript(AUTO_SETUP_SRC);
+    console.log(`>>> 开始场景: ${name}`);
+    win.webContents.removeAllListeners('console-message');
+    win.webContents.on('console-message', (e, level, message) => {
+      if (level >= 2) console.log(`  [渲染console] ${String(message).substring(0, 200)}`);
+    });
+    try {
+      fs.writeFileSync(tmp, html);
+      await win.loadFile(tmp);
+    } catch (e) {
+      console.log(`[场景异常] ${name} loadFile: ${e.message}`);
+      return { log: ['<exception>'], clicks: { nav: -1, push: -1, self: -1 } };
+    }
+    try {
+      await win.webContents.executeJavaScript(`window.__mockQcHost = true; window.__mockPath = ${JSON.stringify(mockPath)};`);
+    } catch (e) {
+      console.log(`[场景异常] ${name} mockvars注入: ${e.message}`);
+      return { log: ['<exception>'], clicks: { nav: -1, push: -1, self: -1 } };
+    }
+    try {
+      await win.webContents.executeJavaScript(AUTO_SETUP_SRC);
+    } catch (e) {
+      console.log(`[场景异常] ${name} 模块注入: ${e.message}`);
+      return { log: ['<exception>'], clicks: { nav: -1, push: -1, self: -1 } };
+    }
     await new Promise(r => setTimeout(r, waitMs));
     const d = JSON.parse(await win.webContents.executeJavaScript(
       `JSON.stringify({ log: window.__qcLog, clicks: window.__clickCount })`
@@ -199,6 +223,11 @@ app.whenReady().then(async () => {
   // 场景4: 非目标页(数据页, 无"千川乘方") → 零点击不劫持(虽有同名"全域投放"和"商品")
   const d4 = await run('非目标页不劫持', buildDataPage(), '/data', 2500);
   assert(d4.log.length === 0 && d4.clicks.nav === 0, '场景4: 数据页零点击, 不会被劫持跳走');
+
+  // 场景5(v2.15.0): 工作台点账户落地的 overall-prom 页(即使无"千川乘方"字样) → 点导航全域投放
+  const overallHtml = buildChengfangPage().replace('<div class="brand">千川乘方</div>', '');
+  const d5 = await run('overall-prom直开', overallHtml, '/overall-prom', 2500);
+  assert(d5.log.length >= 1 && d5.log[0] === '全域投放' && d5.clicks.nav === 1, '场景5: overall-prom 页自动点击导航全域投放');
 
   fs.unlinkSync(tmp);
   console.log(pass ? '\nQC AUTO SETUP v2.14.0 TEST PASS (四场景全部通过)' : '\nTEST FAIL');
