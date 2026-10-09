@@ -1086,3 +1086,82 @@ contextBridge.exposeInMainWorld('electronAPI', {
     } catch (err) {}
   }, true);
 })();
+
+// ============ 千川 uni-prom 页自动设置: 全域投放 → 推商品 → 商品自选 (v2.13.0) ============
+// 每次打开千川投放页都要手动点三层 tab, 这里自动点到位。
+// 设计要点:
+// - 仅主框架 + 仅千川(qianchuan.*.jinriritemai.com)/uni-prom 路径生效;
+// - 文本精确匹配(textContent===目标词)锁定"叶子"tab元素, 不依赖会漂移的 class;
+// - 已激活则跳过(激活判定: 自身+4级祖先含 active/selected/checked 类或 aria-selected);
+// - 每次尝试只点一个(给 React 重渲染留时间), 全部到位后永久停止 —— 不干扰用户后续手动切换。
+(function qianchuanAutoSetup() {
+  try {
+    if (window.top !== window) return;
+    if (!/jinriritemai\.com$/i.test(location.hostname)) return;
+    if (!/^\/uni-prom/i.test(location.pathname)) return;
+
+    var STEPS = ['全域投放', '推商品', '商品自选'];
+    var stepIndex = 0;          // 当前进行到的步骤
+    var attempts = 0;           // 已尝试次数
+    var MAX_ATTEMPTS = 60;      // 500ms × 60 = 30s 放弃(页面变体/未登录等情况不无限折腾)
+    var done = false;
+
+    function isActive(el) {
+      var cur = el, up = 0;
+      while (cur && cur.nodeType === 1 && up < 5) {
+        try {
+          if (cur.getAttribute && (cur.getAttribute('aria-selected') === 'true' || cur.getAttribute('aria-current'))) return true;
+          var cls = (cur.className && typeof cur.className === 'string') ? cur.className : '';
+          if (/(^|\s)(active|selected|checked)(\s|$)/i.test(cls)) return true;
+        } catch (e) {}
+        cur = cur.parentElement;
+        up++;
+      }
+      return false;
+    }
+
+    function findTabsByText(text) {
+      var out = [];
+      try {
+        var all = document.querySelectorAll('a, span, div, li, button, [role="tab"], [role="menuitem"]');
+        for (var i = 0; i < all.length; i++) {
+          if ((all[i].textContent || '').trim() === text) out.push(all[i]);
+        }
+      } catch (e) {}
+      return out;
+    }
+
+    function attempt() {
+      if (done) return;
+      attempts++;
+      if (attempts > MAX_ATTEMPTS) { stop(true); return; }
+      try {
+        while (stepIndex < STEPS.length) {
+          var tabs = findTabsByText(STEPS[stepIndex]);
+          if (tabs.length === 0) return;             // 还没渲染出来, 下次再试
+          // "全域投放"在顶部导航和投放类型行各有一个, 可能一活一灭:
+          // 全部激活→此层到位; 有灭的→点灭的那个(补齐另一处); 全灭→点第一个(导航层)
+          var inactive = tabs.filter(function(t) { return !isActive(t); });
+          if (inactive.length === 0) { stepIndex++; continue; }
+          var target = (tabs.length > 1 && inactive.length < tabs.length) ? inactive[0] : tabs[0];
+          target.click();
+          console.warn('[QC-AUTO] 已自动点击: ' + STEPS[stepIndex] + ' (第' + attempts + '次尝试)');
+          return;                                    // 一次只点一个, 等 React 重渲染
+        }
+        // 三层全部到位
+        done = true;
+        stop(false);
+        console.warn('[QC-AUTO] 千川页面已自动设置为 全域投放/推商品/商品自选');
+      } catch (e) {}
+    }
+
+    var timer = null;
+    function stop(timeout) {
+      if (timer) { clearInterval(timer); timer = null; }
+      if (timeout) console.warn('[QC-AUTO] 30秒内未能完成自动设置, 放弃(不影响页面)');
+    }
+    timer = setInterval(attempt, 500);
+    // DOM 就绪即可开跑(SPA 渲染晚也没关系, attempt 会自己等)
+    document.addEventListener('DOMContentLoaded', function() { if (!done) attempt(); }, { once: true });
+  } catch (e) {}
+})();
