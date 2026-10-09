@@ -1111,6 +1111,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     var attempts = 0;
     var forced = {};            // v2.18.0: 误判强制点击已用标记(每步最多一次, 防止空转)
     var stepTries = {};         // v2.19.0: 每步已点击次数(驱动策略阶梯升级: 外层→叶子→完整鼠标事件)
+    var clickCounts = {};       // v2.20.0: 每步真实点击次数(闭环控制用)
+    var sigBase = {};           // v2.20.0: 每步点击前的行状态基线(判断"点击是否已产生效果")
+    var MAX_CLICKS_PER_STEP = 6;
     // v2.18.0: 30s→120s。千川这页数据重、子tab(商品自选)渲染晚, 30s窗口有时不够(用户实测"大部分能到、一两个没点到")
     var MAX_ATTEMPTS = 240;     // 500ms × 240 = 120s
     var done = false;
@@ -1158,7 +1161,38 @@ contextBridge.exposeInMainWorld('electronAPI', {
       return out;
     }
 
-    // v2.19.0: 可见性过滤 —— 站点的隐藏副本/测量节点文本相同, 点到它们等于没点
+    // v2.20.0: 行状态签名 —— 用于判断"刚才那一下点击是否真的改变了页面"
+    // (千川的选中态未必是 active 类名, 识别不出来时会误以为没点上而反复点 → 误点隔壁tab)
+    function rowSignature(row) {
+      try {
+        if (!row) return '';
+        var parts = [String(row.className || ''), String(row.children.length)];
+        for (var i = 0; i < row.children.length; i++) {
+          var c = row.children[i];
+          // 纳入内联样式 —— 站点常用 style 而非 class 表示选中(千川即如此)
+          parts.push(String(c.className || '') + '/' + ((c.textContent || '').trim().length) + '/' +
+            String((c.style && c.style.cssText) || '').substring(0, 80));
+        }
+        return parts.join('|');
+      } catch (e) { return ''; }
+    }
+    // 兄弟是否被误选(目标未选中但同行兄弟被选中 = 选错/误点)
+    function siblingSelected(target) {
+      try {
+        var row = target.parentElement;
+        if (!row) return false;
+        var myText = (target.textContent || '').trim();
+        for (var i = 0; i < row.children.length; i++) {
+          var c = row.children[i];
+          var t = (c.textContent || '').trim();
+          if (!t || t === myText) continue;
+          if (isActive(c)) return true;
+        }
+      } catch (e) {}
+      return false;
+    }
+
+    // v2.20.0: 可见性过滤 —— 站点的隐藏副本/测量节点文本相同, 点到它们等于没点
     function isVisible(el) {
       try {
         var r = el.getBoundingClientRect();
@@ -1228,6 +1262,31 @@ contextBridge.exposeInMainWorld('electronAPI', {
           // 点击目标优先"外层可点元素"(v2.14.0 实测有效的做法), 该层不响应时按策略阶梯升级。
           var visible = tabs.filter(isVisible);
           var pool = visible.length > 0 ? visible : tabs;
+          // v2.20.0: 剔除"嵌在其它 tab 内部"的候选 —— 点它会冒泡到隔壁 tab 的处理器上,
+          // 造成"明明点商品自选, 结果选中全店托管"(用户实测的问题现场)
+          var otherLabels = [];
+          STEPS.forEach(function(s, si) {
+            if (si === stepIndex) return;
+            s.alts.forEach(function(a) { if (otherLabels.indexOf(a) === -1) otherLabels.push(a); });
+          });
+          pool = pool.filter(function(t) {
+            var p = t.parentElement, up = 0;
+            while (p && p.nodeType === 1 && up < 3) {
+              var pt = (p.textContent || '').trim();
+              // 只在小范围元素(tab 行级别)内上溯: 文本超 40 字说明已到页面容器层, 停止
+              // (否则祖先必然含其它 tab 名, 会把所有候选都剔除)
+              if (pt.length > 40) break;
+              for (var oi = 0; oi < otherLabels.length; oi++) {
+                if (pt.indexOf(otherLabels[oi]) !== -1) {
+                  console.warn('[QC-AUTO] 步骤' + (stepIndex + 1) + '(' + usedAlt + ') 候选嵌于其它tab(' + otherLabels[oi] + ')内部, 已剔除');
+                  return false;
+                }
+              }
+              p = p.parentElement; up++;
+            }
+            return true;
+          });
+          if (pool.length === 0) return;           // 全部被剔除, 等下次重查
           var outerMost = pool.filter(function(t) {
             return !pool.some(function(o) { return o !== t && o.contains(t); });
           });
@@ -1258,12 +1317,29 @@ contextBridge.exposeInMainWorld('electronAPI', {
             continue;
           }
           var target = (candidates.length > 1 && inactive.length < candidates.length) ? inactive[0] : candidates[0];
-          // 策略阶梯: 该步骤已试次数越多, 越往后升级(外层 → 叶子 → 完整鼠标事件)
-          var tries = stepTries[stepIndex] || 0;
-          stepTries[stepIndex] = tries + 1;
-          var strat = STRATEGIES[Math.min(Math.floor(tries / 4), STRATEGIES.length - 1)];
+
+          // v2.20.0 闭环: 先判断"是否点歪了"(隔壁tab被选中), 再决定点法, 但统一计数与阶梯升级 ——
+          // 旧实现把"纠正"单独短路, 导致它永远用第一级策略重复空点(处理器在内层时点不动)。
+          var misSelected = siblingSelected(target);
+          var clicks = clickCounts[stepIndex] || 0;
+          var baseSig = sigBase[stepIndex];
+          var curSig = rowSignature(target.parentElement);
+          var changedButUnconfirmed = (typeof baseSig === 'string') && baseSig !== '' && curSig !== baseSig && !isActive(target);
+          // 点过多下, 或"点了确实有变化但选中态识别不出来" → 停手观察
+          // (用户实测: 点完商品自选又被点去全店托管, 就是无脑连点造成的)
+          if (clicks >= MAX_CLICKS_PER_STEP || (clicks >= 1 && changedButUnconfirmed)) {
+            console.warn('[QC-AUTO] 步骤' + (stepIndex + 1) + '(' + usedAlt + ') 已点击' + clicks + '次' +
+              (changedButUnconfirmed ? '且页面已变化但选中态无法确认' : '达上限') + ', 停止继续点击(避免误点隔壁tab), 转入观察');
+            stepIndex++;
+            continue;
+          }
+          if (clicks === 0) sigBase[stepIndex] = curSig;   // 记录点击前的行状态基线
+          clickCounts[stepIndex] = clicks + 1;
+          // 策略阶梯: 每级 3 次, 依次 外层元素 → 最内层叶子 → 完整鼠标事件
+          var strat = STRATEGIES[Math.min(Math.floor(clicks / 3), STRATEGIES.length - 1)];
           strat.fn(target);
-          console.warn('[QC-AUTO] 已自动点击: ' + usedAlt + ' [策略:' + strat.name + '] (第' + attempts + '次尝试, 候选' + candidates.length + '个' +
+          console.warn('[QC-AUTO] ' + (misSelected ? '检测到隔壁tab被选中(疑似误点), 纠正点击: ' : '已自动点击: ') +
+            usedAlt + ' [策略:' + strat.name + '] (第' + attempts + '次尝试, 候选' + candidates.length + '个' +
             (candidates.length > 1 ? '(一活一灭补点)' : '') + ') ' + describeState(target));
           return;                                  // 一次只点一个, 等 React 重渲染
         }

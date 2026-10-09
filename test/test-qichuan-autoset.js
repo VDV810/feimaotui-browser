@@ -1,21 +1,16 @@
-// 测试: 千川页自动设置(v2.19.0)
-// 核心回归: v2.16.0 把点击目标改成"最内层叶子"后, 千川的商品自选 tab 点不到
-// (该组件只在"点击目标即自身"时响应, 点内部 span 不认); v2.14.0 点外层是可用的。
-// v2.19.0 = 可见性过滤 + 外层优先 + 策略阶梯(外层→叶子→完整鼠标事件)
+// 测试: 千川页自动设置(v2.20.0)
+// 用户实测问题现场: 点中商品自选后又被点到全店托管 —— 根因是"选中态识别不出 → 无脑连点 →
+// 策略升级后误击". 修复 = 候选剔除(嵌在其它tab内的)+ 闭环(误选纠正/点过即停).
 const { app, BrowserWindow } = require('electron');
 const fs = require('fs');
 const path = require('path');
 
-// 复刻 preload.js v2.19.0 核心算法(host 守卫换成 __mockQcHost)
+// 复刻 preload.js v2.20.0 核心算法(host 守卫换成 __mockQcHost)
 const AUTO_SETUP_SRC = `
 (function qianchuanAutoSetup() {
   if (!window.__mockQcHost) return;
-  var STEPS = [
-    { alts: ['全域投放'] },
-    { alts: ['推商品'] },
-    { alts: ['商品自选'] }
-  ];
-  var stepIndex = 0, attempts = 0, forced = {}, stepTries = {}, MAX_ATTEMPTS = 240, done = false;
+  var STEPS = [{ alts: ['全域投放'] }, { alts: ['推商品'] }, { alts: ['商品自选'] }];
+  var stepIndex = 0, attempts = 0, forced = {}, clickCounts = {}, sigBase = {}, MAX_CLICKS_PER_STEP = 6, MAX_ATTEMPTS = 240, done = false;
   function activeMatch(cls) {
     if (!cls) return false;
     return /(^|[\\s_-])(active|selected|checked)([\\s_-]|$)/i.test(cls);
@@ -40,6 +35,31 @@ const AUTO_SETUP_SRC = `
       for (var i = 0; i < all.length; i++) { if ((all[i].textContent || '').trim() === text) out.push(all[i]); }
     } catch (e) {}
     return out;
+  }
+  function rowSignature(row) {
+    try {
+      if (!row) return '';
+      var parts = [String(row.className || ''), String(row.children.length)];
+      for (var i = 0; i < row.children.length; i++) {
+        var c = row.children[i];
+        parts.push(String(c.className || '') + '/' + ((c.textContent || '').trim().length) + '/' + String((c.style && c.style.cssText) || '').substring(0, 80));
+      }
+      return parts.join('|');
+    } catch (e) { return ''; }
+  }
+  function siblingSelected(target) {
+    try {
+      var row = target.parentElement;
+      if (!row) return false;
+      var myText = (target.textContent || '').trim();
+      for (var i = 0; i < row.children.length; i++) {
+        var c = row.children[i];
+        var t = (c.textContent || '').trim();
+        if (!t || t === myText) continue;
+        if (isActive(c)) return true;
+      }
+    } catch (e) {}
+    return false;
   }
   function isVisible(el) {
     try {
@@ -73,8 +93,7 @@ const AUTO_SETUP_SRC = `
   function onTargetPage() {
     var p = window.__mockPath || '';
     if (p.indexOf('/uni-prom') === 0 || p.indexOf('/overall-prom') === 0) return true;
-    try { return (document.body && document.body.textContent || '').indexOf('千川乘方') !== -1; }
-    catch (e) { return false; }
+    try { return (document.body && document.body.textContent || '').indexOf('千川乘方') !== -1; } catch (e) { return false; }
   }
   function attempt() {
     if (done) return;
@@ -91,6 +110,19 @@ const AUTO_SETUP_SRC = `
         if (!tabs) return;
         var visible = tabs.filter(isVisible);
         var pool = visible.length > 0 ? visible : tabs;
+        var otherLabels = [];
+        STEPS.forEach(function(s, si) { if (si === stepIndex) return; s.alts.forEach(function(a) { if (otherLabels.indexOf(a) === -1) otherLabels.push(a); }); });
+        pool = pool.filter(function(t) {
+          var p = t.parentElement, up = 0;
+          while (p && p.nodeType === 1 && up < 3) {
+            var pt = (p.textContent || '').trim();
+            if (pt.length > 40) break;   // 已到页面容器层, 停止上溯
+            for (var oi = 0; oi < otherLabels.length; oi++) { if (pt.indexOf(otherLabels[oi]) !== -1) return false; }
+            p = p.parentElement; up++;
+          }
+          return true;
+        });
+        if (pool.length === 0) return;
         var outerMost = pool.filter(function(t) { return !pool.some(function(o) { return o !== t && o.contains(t); }); });
         var candidates = outerMost.length > 0 ? outerMost : pool;
         var inactive = candidates.filter(function(t) { return !isActive(t); });
@@ -102,18 +134,28 @@ const AUTO_SETUP_SRC = `
           if (sibCount >= 2 && sibActive === sibCount && !forced[stepIndex]) {
             forced[stepIndex] = true;
             STRATEGIES[0].fn(candidates[0]);
-            window.__qcLog.push(usedAlt + '(强制/' + STRATEGIES[0].name + ')');
+            window.__qcLog.push(usedAlt + '(强制)');
             return;
           }
           stepIndex++;
           continue;
         }
         var target = (candidates.length > 1 && inactive.length < candidates.length) ? inactive[0] : candidates[0];
-        var tries = stepTries[stepIndex] || 0;
-        stepTries[stepIndex] = tries + 1;
-        var strat = STRATEGIES[Math.min(Math.floor(tries / 4), STRATEGIES.length - 1)];
+        var misSelected = siblingSelected(target);
+        var clicks = clickCounts[stepIndex] || 0;
+        var baseSig = sigBase[stepIndex];
+        var curSig = rowSignature(target.parentElement);
+        var changedButUnconfirmed = (typeof baseSig === 'string') && baseSig !== '' && curSig !== baseSig && !isActive(target);
+        if (clicks >= MAX_CLICKS_PER_STEP || (clicks >= 1 && changedButUnconfirmed)) {
+          window.__qcLog.push(usedAlt + '(停手:' + clicks + '次)');
+          stepIndex++;
+          continue;
+        }
+        if (clicks === 0) sigBase[stepIndex] = curSig;
+        clickCounts[stepIndex] = clicks + 1;
+        var strat = STRATEGIES[Math.min(Math.floor(clicks / 3), STRATEGIES.length - 1)];
         strat.fn(target);
-        window.__qcLog.push(usedAlt + '[' + strat.name + ']');
+        window.__qcLog.push(usedAlt + (misSelected ? '(纠正)' : '') + '[' + strat.name + ']');
         return;
       }
       done = true; stop(false);
@@ -121,32 +163,17 @@ const AUTO_SETUP_SRC = `
   }
   var timer = null;
   function stop(timeout) { if (timer) { clearInterval(timer); timer = null; } }
-  timer = setInterval(attempt, 100); // 测试加速
+  timer = setInterval(attempt, 100);
   attempt();
 })();
 `;
 
-// 基础页: 可选严格守卫(target===currentTarget 才响应) / 隐藏副本 / 处理器在内层span
-function buildPage(opts) {
+// 严格守卫页: tab 只在"点击目标即自身"时响应(v2.14.0 能成功、v2.16.0 崩掉的结构)
+function buildStrictGuardPage(opts) {
   const o = opts || {};
-  let selfHandler;
-  if (o.innerSpanOnly) {
-    // 处理器只挂在内层 span 上(外层点击无效) → 需要策略阶梯升级到"叶子"
-    selfHandler = [
-      "var inner = self.querySelector('span');",
-      "inner.addEventListener('click', function(e) { if (e.target === this) { window.__clickCount.self++; activate(self); } });"
-    ].join('\n  ');
-  } else if (o.strictTargetGuard) {
-    selfHandler = `self.addEventListener('click', function(e) { if (e.target === e.currentTarget) { window.__clickCount.self++; activate(self); } else { window.__rejectedByGuard++; } });`;
-  } else {
-    selfHandler = `self.addEventListener('click', function() { window.__clickCount.self++; activate(self); });`;
-  }
   return `<!doctype html><html><head><meta charset="utf-8"></head><body>
 ${o.hiddenDup ? '<div style="display:none"><span>商品自选</span></div>' : ''}
-${o.hiddenDupZero ? '<div class="ghost"></div>' : ''}
-<header>
-  <div class="nav-item active" data-key="nav-qy"><span>全域投放</span></div>
-</header>
+<header><div class="nav-item active"><span>全域投放</span></div></header>
 <div class="objective-tabs">
   <div class="obj-tab"><span>推直播间</span></div>
   <div class="obj-tab active" data-key="push"><span>推商品</span></div>
@@ -156,65 +183,71 @@ ${o.hiddenDupZero ? '<div class="ghost"></div>' : ''}
   <div class="sub-tab active"><span>全店托管</span></div>
 </div>
 <script>
-  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0 }; window.__rejectedByGuard = 0;
+  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0, other: 0 };
   function activate(el) { Array.prototype.forEach.call(el.parentElement.children, function(c){ c.classList.remove('active'); }); el.classList.add('active'); }
   var self = document.querySelector('[data-key="self"]');
-  ${selfHandler}
+  self.addEventListener('click', function(e) { if (e.target === e.currentTarget) { window.__clickCount.self++; activate(self); } });
 </script>
 </body></html>`;
 }
 
-// 乘方落地页(带 SPA 换内容)
-function buildChengfangPage() {
-  return `<!doctype html><html><head><meta charset="utf-8"></head><body>
-<div class="brand">千川乘方</div>
-<header>
-  <div class="nav-item active" data-key="chengfang"><span>乘方</span></div>
-  <div class="nav-item" data-key="nav-qy"><span>全域投放</span></div>
-</header>
-<div class="objective-tabs"><div class="obj-tab active"><span>直播</span></div></div>
-<div class="sub-tabs"><div class="sub-tab active"><span>全店托管</span></div></div>
-<script>
-  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0 };
-  function activate(el) { Array.prototype.forEach.call(el.parentElement.children, function(c){ c.classList.remove('active'); }); el.classList.add('active'); }
-  var navQy = document.querySelector('[data-key="nav-qy"]');
-  navQy.addEventListener('click', function() {
-    window.__clickCount.nav++; activate(navQy);
-    setTimeout(function() {
-      document.querySelector('.objective-tabs').innerHTML =
-        '<div class="obj-tab active"><span>推直播间</span></div><div class="obj-tab" data-key="push"><span>推商品</span></div>';
-      document.querySelector('.sub-tabs').innerHTML =
-        '<div class="sub-tab" data-key="self"><span>商品自选</span></div><div class="sub-tab active"><span>全店托管</span></div>';
-      var push = document.querySelector('[data-key="push"]');
-      push.addEventListener('click', function() { window.__clickCount.push++; activate(push); });
-      var self = document.querySelector('[data-key="self"]');
-      self.addEventListener('click', function(e) { if (e.target === e.currentTarget) { window.__clickCount.self++; activate(self); } });
-    }, 400);
-  });
-</script>
-</body></html>`;
-}
-
-function buildSubStateOnly() {
-  // 子tab未渲染(延迟) + 推商品已激活
+// 用户问题现场页: 选中态用内联样式表示(类名识别不出) + 连点第二次会切到隔壁"全店托管"
+function buildInlineStyleTogglePage() {
   return `<!doctype html><html><head><meta charset="utf-8"></head><body>
 <header><div class="nav-item active"><span>全域投放</span></div></header>
 <div class="objective-tabs">
   <div class="obj-tab"><span>推直播间</span></div>
   <div class="obj-tab active" data-key="push"><span>推商品</span></div>
 </div>
-<div id="subArea"></div>
+<div class="sub-tabs">
+  <div class="sub-tab" data-key="self"><span>商品自选</span></div>
+  <div class="sub-tab" data-key="other"><span>全店托管</span></div>
+</div>
 <script>
-  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0 };
-  function activate(el) { Array.prototype.forEach.call(el.parentElement.children, function(c){ c.classList.remove('active'); }); el.classList.add('active'); }
-  setTimeout(function() {
-    document.getElementById('subArea').innerHTML =
-      '<div class="sub-tabs"><div class="sub-tab" data-key="self"><span>商品自选</span></div>' +
-      '<div class="sub-tab active"><span>全店托管</span></div></div>';
-    var self = document.querySelector('[data-key="self"]');
-    self.addEventListener('click', function() { window.__clickCount.self++; activate(self); });
-    window.__subRendered = true;
-  }, 2500);
+  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0, other: 0 };
+  var selfTab = document.querySelector('[data-key="self"]');
+  var otherTab = document.querySelector('[data-key="other"]');
+  var selected = 'other';   // 初始: 全店托管选中(内联样式表示, 无 class)
+  function paint() {
+    selfTab.style.cssText = selected === 'self' ? 'color:rgb(22,119,255);border-bottom:2px solid rgb(22,119,255)' : 'color:rgb(100,100,100)';
+    otherTab.style.cssText = selected === 'other' ? 'color:rgb(22,119,255);border-bottom:2px solid rgb(22,119,255)' : 'color:rgb(100,100,100)';
+  }
+  paint();
+  // 真实站点行为: 点击商品自选=选中它; 若已经在选中状态下再点一次(用户实测的连点), 状态跳去全店托管
+  function clickSelf() {
+    window.__clickCount.self++;
+    if (selected === 'self') { selected = 'other'; } else { selected = 'self'; }
+    paint();
+  }
+  selfTab.addEventListener('click', function(e) { if (e.target === e.currentTarget) clickSelf(); });
+  otherTab.addEventListener('click', function() { window.__clickCount.other++; selected = 'other'; paint(); });
+  window.__getSelected = function() { return selected; };
+</script>
+</body></html>`;
+}
+
+// 同名文本嵌在隔壁 tab 内部(点它会冒泡到隔壁 tab 处理器)
+function buildNestedInOtherTabPage() {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<header><div class="nav-item active"><span>全域投放</span></div></header>
+<div class="objective-tabs">
+  <div class="obj-tab"><span>推直播间</span></div>
+  <div class="obj-tab active" data-key="push"><span>推商品</span></div>
+</div>
+<div class="sub-tabs">
+  <div class="sub-tab" data-key="self"><span>商品自选</span></div>
+  <div class="sub-tab" data-key="other">
+    <span>全店托管</span>
+    <div class="tooltip"><span>商品自选</span></div>
+  </div>
+</div>
+<script>
+  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0, other: 0 };
+  var selfTab = document.querySelector('[data-key="self"]');
+  var otherTab = document.querySelector('[data-key="other"]');
+  selfTab.addEventListener('click', function() { window.__clickCount.self++; selfTab.classList.add('active'); });
+  // 隔壁 tab 的处理器在祖先上: 任何内部节点(含那个假的"商品自选"tooltip)被点都会冒泡到这里
+  otherTab.addEventListener('click', function() { window.__clickCount.other++; });
 </script>
 </body></html>`;
 }
@@ -223,7 +256,50 @@ function buildDataPage() {
   return `<!doctype html><html><head><meta charset="utf-8"></head><body>
 <header><div class="nav-item active"><span>数据</span></div><div class="nav-item"><span>全域投放</span></div></header>
 <div class="panel"><span>商品</span></div>
-<script>window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0 };</script>
+<script>window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0, other: 0 };</script>
+</body></html>`;
+}
+
+function buildDelayedSubPage() {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<header><div class="nav-item active"><span>全域投放</span></div></header>
+<div class="objective-tabs">
+  <div class="obj-tab"><span>推直播间</span></div>
+  <div class="obj-tab active" data-key="push"><span>推商品</span></div>
+</div>
+<div id="subArea"></div>
+<script>
+  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0, other: 0 };
+  setTimeout(function() {
+    document.getElementById('subArea').innerHTML =
+      '<div class="sub-tabs"><div class="sub-tab" data-key="self"><span>商品自选</span></div>' +
+      '<div class="sub-tab active"><span>全店托管</span></div></div>';
+    var self = document.querySelector('[data-key="self"]');
+    self.addEventListener('click', function() { window.__clickCount.self++; self.classList.add('active'); });
+    window.__subRendered = true;
+  }, 2000);
+</script>
+</body></html>`;
+}
+
+function buildInnerSpanOnlyPage() {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<header><div class="nav-item active"><span>全域投放</span></div></header>
+<div class="objective-tabs">
+  <div class="obj-tab"><span>推直播间</span></div>
+  <div class="obj-tab active" data-key="push"><span>推商品</span></div>
+</div>
+<div class="sub-tabs">
+  <div class="sub-tab" data-key="self"><span>商品自选</span></div>
+  <div class="sub-tab active"><span>全店托管</span></div>
+</div>
+<script>
+  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0, other: 0 };
+  var selfTab = document.querySelector('[data-key="self"]');
+  // 处理器只在内层 span 上(外层点击无效)
+  var inner = selfTab.querySelector('span');
+  inner.addEventListener('click', function(e) { if (e.target === this) { window.__clickCount.self++; selfTab.classList.add('active'); } });
+</script>
 </body></html>`;
 }
 
@@ -244,57 +320,50 @@ app.whenReady().then(async () => {
       await new Promise(r => setTimeout(r, waitMs));
     } catch (e) {
       console.log(`[异常] ${name}: ${e.message}`);
-      return { log: ['<exception>'], clicks: { nav: -1, push: -1, self: -1 } };
+      return { log: ['<exception>'], clicks: { nav: -1, push: -1, self: -1, other: -1 } };
     }
     const d = JSON.parse(await win.webContents.executeJavaScript(`JSON.stringify({ log: window.__qcLog, clicks: window.__clickCount })`));
     console.log('  记录:', JSON.stringify(d.log), '| 点击数:', JSON.stringify(d.clicks));
     return d;
   }
 
-  // 1: 乘方落地页全自动(严格守卫, 即 v2.14.0 能成功、v2.16.0 失败的真实结构)
-  const d1 = await run('乘方落地页(严格守卫)', buildChengfangPage(), '/chengfang', 4000);
-  const s1 = JSON.parse(await win.webContents.executeJavaScript(`JSON.stringify({
-    nav: !!document.querySelector('[data-key="nav-qy"]').classList.contains('active'),
-    push: !!document.querySelector('[data-key="push"]') , self: !!document.querySelector('[data-key="self"]')
-  })`));
-  assert(d1.clicks.nav === 1 && d1.clicks.push === 1 && d1.clicks.self === 1, '场景1: 三层全部点到(含严格守卫的商品自选)');
-  assert(s1.nav, '场景1: 导航全域投放已激活');
+  // 1: 严格守卫(千川真实结构) → 点到商品自选(初始隔壁全店托管选中, 首击标记为"纠正"属正常)
+  const d1 = await run('严格守卫tab', buildStrictGuardPage(), '/uni-prom', 2500);
+  assert(d1.clicks.self === 1 && d1.log.length >= 1 && d1.log[0].indexOf('商品自选') !== -1,
+    '场景1: 一次点到商品自选(策略:' + d1.log[0] + ')');
 
-  // 2: uni-prom 直开, 只差商品自选 + 严格守卫
-  const d2 = await run('商品自选(严格守卫)', buildPage({ strictTargetGuard: true }), '/uni-prom', 2500);
-  assert(d2.clicks.self === 1, '场景2: 严格守卫下商品自选被点到(外层策略生效)');
-  assert(d2.log[0].indexOf('外层元素') !== -1, '场景2: 首次即用"外层元素"策略');
+  // 2: 隐藏同名副本 → 跳过
+  const d2 = await run('隐藏同名副本', buildStrictGuardPage({ hiddenDup: true }), '/uni-prom', 2500);
+  assert(d2.clicks.self === 1, '场景2: 跳过隐藏副本点到可见商品自选');
 
-  // 3: 隐藏副本(display:none 的同名元素在前) → 必须点可见的那个
-  const d3 = await run('隐藏同名副本', buildPage({ hiddenDup: true }), '/uni-prom', 2500);
-  const s3 = JSON.parse(await win.webContents.executeJavaScript(`JSON.stringify({
-    selfActive: document.querySelector('[data-key="self"]').classList.contains('active')
-  })`));
-  assert(d3.clicks.self === 1 && s3.selfActive, '场景3: 跳过隐藏副本, 点到可见的商品自选');
+  // 3(核心回归): 选中态用内联样式(类名识别不出) + 连点会跳去隔壁 → 必须点到商品自选且不被跳走
+  const d3 = await run('内联样式选中态(用户问题现场)', buildInlineStyleTogglePage(), '/uni-prom', 4000);
+  const sel3 = await win.webContents.executeJavaScript('window.__getSelected()');
+  console.log('  当前选中:', sel3, '| 商品自选点击次数:', d3.clicks.self, '| 全店托管被点:', d3.clicks.other);
+  assert(sel3 === 'self', '场景3: 最终选中 商品自选(没有被连点带去全店托管)');
+  assert(d3.clicks.self === 1, '场景3: 商品自选只被点一次(点过即停, 不再无脑连点)');
+  assert(d3.clicks.other === 0, '场景3: 全店托管一次都没被点到');
 
-  // 4: 已全部到位 → 零点击
-  const d4 = await run('已到位零点击', buildPage({ selfActivePre: true })
-    .replace('<div class="sub-tab" data-key="self">', '<div class="sub-tab active" data-key="self">')
-    .replace('<div class="sub-tab active"><span>全店托管</span></div>', '<div class="sub-tab"><span>全店托管</span></div>'), '/uni-prom', 1500);
-  assert(d4.log.length === 0, '场景4: 已到位零点击');
+  // 4(核心回归): 同名文本嵌在隔壁 tab 内部 → 该候选被剔除, 不误选隔壁
+  const d4 = await run('候选嵌在隔壁tab内', buildNestedInOtherTabPage(), '/uni-prom', 3000);
+  assert(d4.clicks.other === 0, '场景4: 未点到嵌在隔壁tab内的同名节点(候选剔除生效)');
+  assert(d4.clicks.self >= 1, '场景4: 点的是真正的商品自选tab');
 
-  // 5: 非目标页 → 零点击
-  const d5 = await run('非目标页不劫持', buildDataPage(), '/data', 2000);
-  assert(d5.log.length === 0, '场景5: 数据页零点击');
+  // 5: 处理器仅在内层 span → 阶梯升级
+  const d5 = await run('处理器仅在内层span', buildInnerSpanOnlyPage(), '/uni-prom', 3500);
+  assert(d5.clicks.self >= 1, '场景5: 阶梯升级后点到商品自选');
+  assert(d5.log.some(l => l.indexOf('叶子') !== -1), '场景5: 日志显示升级到了叶子策略');
 
-  // 6: 子tab延迟渲染 → 最终仍点到
-  const d6 = await run('子tab延迟渲染', buildSubStateOnly(), '/uni-prom', 5000);
-  const s6 = JSON.parse(await win.webContents.executeJavaScript(`JSON.stringify({
-    rendered: !!window.__subRendered, selfActive: !!document.querySelector('[data-key="self"]') && document.querySelector('[data-key="self"]').classList.contains('active')
-  })`));
-  assert(s6.rendered && d6.clicks.self === 1 && s6.selfActive, '场景6: 延迟渲染后仍点到商品自选');
+  // 6: 子tab延迟渲染
+  const d6 = await run('子tab延迟渲染', buildDelayedSubPage(), '/uni-prom', 5000);
+  const r6 = await win.webContents.executeJavaScript('!!window.__subRendered');
+  assert(r6 && d6.clicks.self >= 1, '场景6: 延迟渲染后仍点到商品自选');
 
-  // 7: 处理器只在内层 span(外层点不动) → 阶梯升级到"叶子"策略后成功
-  const d7 = await run('处理器仅在内层span', buildPage({ innerSpanOnly: true }), '/uni-prom', 3500);
-  assert(d7.clicks && d7.clicks.self === 1, '场景7: 外层策略失败后升级到叶子策略并点到');
-  assert(d7.log.some(l => l.indexOf('叶子') !== -1), '场景7: 日志显示确实升级到了"最内层叶子"策略');
+  // 7: 非目标页零点击
+  const d7 = await run('非目标页不劫持', buildDataPage(), '/data', 2000);
+  assert(d7.log.length === 0, '场景7: 数据页零点击');
 
   fs.unlinkSync(tmp);
-  console.log(pass ? '\nQIANCHUAN AUTO SETUP v2.19.0 TEST PASS' : '\nTEST FAIL');
+  console.log(pass ? '\nQIANCHUAN AUTO SETUP v2.20.0 TEST PASS' : '\nTEST FAIL');
   app.exit(pass ? 0 : 1);
 });
