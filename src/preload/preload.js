@@ -1110,6 +1110,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     var stepIndex = 0;
     var attempts = 0;
     var forced = {};            // v2.18.0: 误判强制点击已用标记(每步最多一次, 防止空转)
+    var stepTries = {};         // v2.19.0: 每步已点击次数(驱动策略阶梯升级: 外层→叶子→完整鼠标事件)
     // v2.18.0: 30s→120s。千川这页数据重、子tab(商品自选)渲染晚, 30s窗口有时不够(用户实测"大部分能到、一两个没点到")
     var MAX_ATTEMPTS = 240;     // 500ms × 240 = 120s
     var done = false;
@@ -1157,6 +1158,48 @@ contextBridge.exposeInMainWorld('electronAPI', {
       return out;
     }
 
+    // v2.19.0: 可见性过滤 —— 站点的隐藏副本/测量节点文本相同, 点到它们等于没点
+    function isVisible(el) {
+      try {
+        var r = el.getBoundingClientRect();
+        if (r.width <= 2 || r.height <= 2) return false;
+        var cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+        return true;
+      } catch (e) { return true; }
+    }
+
+    // v2.19.0: 阶梯式点击 —— v2.14.0 点外层可点元素是有效的(用户实测), 而 v2.16.0 改点最内层叶子后
+    // 商品自选点不到: 该 tab 组件只在"点击目标即自身"时响应(e.target===e.currentTarget 类守卫),
+    // 点内部 span 它不认。故按阶梯升级: 外层 → 叶子 → 外层+完整鼠标事件序列。
+    function clickOuter(el) {
+      try { el.click(); } catch (e) {}
+    }
+    function clickLeaf(el) {
+      try {
+        var leaf = el;
+        while (leaf.firstElementChild && (leaf.firstElementChild.textContent || '').trim() === (leaf.textContent || '').trim()) {
+          leaf = leaf.firstElementChild;   // 逐层下钻到最内层含同文本的元素
+        }
+        leaf.click();
+      } catch (e) { el.click(); }
+    }
+    function clickMouseSequence(el) {
+      try {
+        var r = el.getBoundingClientRect();
+        var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+        var opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0 };
+        ['mousedown', 'mouseup', 'click'].forEach(function(type) {
+          try { el.dispatchEvent(new MouseEvent(type, opts)); } catch (e) {}
+        });
+      } catch (e) { clickOuter(el); }
+    }
+    var STRATEGIES = [
+      { name: '外层元素', fn: clickOuter },
+      { name: '最内层叶子', fn: clickLeaf },
+      { name: '完整鼠标事件', fn: clickMouseSequence }
+    ];
+
     // 目标页判定: uni-prom / overall-prom 路径(工作台点账户落地的乘方智能营销页),
     // 或页面渲染出"千川乘方"字样。动态判定(放在 attempt 里)是因为 SPA 内容晚渲染;
     // 数据/工具等页面不含该字样永不误伤。
@@ -1181,19 +1224,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
             if (found.length > 0) { tabs = found; usedAlt = STEPS[stepIndex].alts[ai]; break; }
           }
           if (!tabs) return;                       // 还没渲染出来, 下次再试
-          // v2.16.0: 只取"叶子"元素(textContent 精确等于目标词且内部无同级候选)再点击 ——
-          // 点最内层节点, 事件冒泡会经过所有祖先, 无论 React 把 click 处理器挂在哪一层都能命中;
-          // 点外层容器则可能因处理器在内层而完全没反应(实测踩坑)。
-          var leaves = tabs.filter(function(t) {
-            return !tabs.some(function(o) { return o !== t && t.contains(o); });
+          // v2.19.0: 候选按可见性过滤(隐藏副本文本相同, 点到等于没点);
+          // 点击目标优先"外层可点元素"(v2.14.0 实测有效的做法), 该层不响应时按策略阶梯升级。
+          var visible = tabs.filter(isVisible);
+          var pool = visible.length > 0 ? visible : tabs;
+          var outerMost = pool.filter(function(t) {
+            return !pool.some(function(o) { return o !== t && o.contains(t); });
           });
-          if (leaves.length === 0) leaves = tabs;
+          var candidates = outerMost.length > 0 ? outerMost : pool;
           // 同名 tab 可能多处(如"全域投放"在顶部导航+投放类型行), 一活一灭只补灭的
-          var inactive = leaves.filter(function(t) { return !isActive(t); });
+          var inactive = candidates.filter(function(t) { return !isActive(t); });
           if (inactive.length === 0) {
             // v2.18.0 防误判: 判定"已到位"的依据若来自祖先共享类名(同行兄弟全都 active), 信号不可信 →
-            // 每步最多强制点击一次(治"商品自选被误判跳过"), 不空转
-            var row = leaves[0].parentElement;
+            // 每步最多强制点击一次(治"被误判跳过"), 不空转
+            var row = candidates[0].parentElement;
             var sibCount = 0, sibActive = 0;
             try {
               if (row) {
@@ -1205,18 +1249,22 @@ contextBridge.exposeInMainWorld('electronAPI', {
             } catch (e) {}
             if (sibCount >= 2 && sibActive === sibCount && !forced[stepIndex]) {
               forced[stepIndex] = true;
-              leaves[0].click();
-              console.warn('[QC-AUTO] 步骤' + (stepIndex + 1) + '(' + usedAlt + ') 同行兄弟全被判激活, 疑似误判 → 强制点击一次 | ' + describeState(leaves[0]));
+              STRATEGIES[0].fn(candidates[0]);
+              console.warn('[QC-AUTO] 步骤' + (stepIndex + 1) + '(' + usedAlt + ') 同行兄弟全被判激活, 疑似误判 → 强制点击一次 | ' + describeState(candidates[0]));
               return;
             }
-            console.warn('[QC-AUTO] 步骤' + (stepIndex + 1) + '(' + usedAlt + ') 判定已到位, 跳过 | ' + describeState(leaves[0]));
+            console.warn('[QC-AUTO] 步骤' + (stepIndex + 1) + '(' + usedAlt + ') 判定已到位, 跳过 | ' + describeState(candidates[0]));
             stepIndex++;
             continue;
           }
-          var target = (leaves.length > 1 && inactive.length < leaves.length) ? inactive[0] : leaves[0];
-          target.click();
-          console.warn('[QC-AUTO] 已自动点击: ' + usedAlt + ' (第' + attempts + '次尝试, 候选' + leaves.length + '个' +
-            (leaves.length > 1 ? '(一活一灭补点)' : '') + ') ' + describeState(target));
+          var target = (candidates.length > 1 && inactive.length < candidates.length) ? inactive[0] : candidates[0];
+          // 策略阶梯: 该步骤已试次数越多, 越往后升级(外层 → 叶子 → 完整鼠标事件)
+          var tries = stepTries[stepIndex] || 0;
+          stepTries[stepIndex] = tries + 1;
+          var strat = STRATEGIES[Math.min(Math.floor(tries / 4), STRATEGIES.length - 1)];
+          strat.fn(target);
+          console.warn('[QC-AUTO] 已自动点击: ' + usedAlt + ' [策略:' + strat.name + '] (第' + attempts + '次尝试, 候选' + candidates.length + '个' +
+            (candidates.length > 1 ? '(一活一灭补点)' : '') + ') ' + describeState(target));
           return;                                  // 一次只点一个, 等 React 重渲染
         }
         done = true;
