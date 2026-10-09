@@ -725,6 +725,32 @@ function refreshQianchuanDateParam(url) {
   } catch (e) { return url; }
 }
 
+// v2.17.0: 腾讯广告(ad.qq.com)自动把日期筛成今天。
+// 用户书签里的 URL 不带日期参数，站点就回落到"上次使用"的旧区间，每次打开都是旧数据。
+// 日期参数名来自站点自身前端代码(admanage 主包): URL 追加 &start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+function refreshAdqqDateParam(url) {
+  try {
+    const u = new URL(url);
+    if (!/(^|\.)ad\.qq\.com$/i.test(u.hostname)) return url;
+    // 仅投放管理后台页面(/atlas/<账户ID>/...)
+    if (!/^\/atlas\//i.test(u.pathname)) return url;
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const s = u.searchParams.get('start_date');
+    const e = u.searchParams.get('end_date');
+    if (s === today && e === today) return url;   // 已是今天, 原样返回
+    u.searchParams.set('start_date', today);
+    u.searchParams.set('end_date', today);
+    addLog('NAV', '腾讯广告日期跟进今天', `${s || '无'}~${e || '无'} -> ${today}`);
+    return u.toString();
+  } catch (e) { return url; }
+}
+
+// 统一的"站点日期参数刷新"入口: 千川 dr + 腾讯广告 start_date/end_date
+function refreshSiteDateParams(url) {
+  return refreshAdqqDateParam(refreshQianchuanDateParam(url));
+}
+
 let mainWindow = null;
 let tray = null;
 const TOP_OFFSET = 112;
@@ -749,7 +775,7 @@ function createMainWindow() {
   if (globalState.savedTabs && globalState.savedTabs.length > 0 && globalState.tabs.size === 0) {
     addLog('SESSION', '开始恢复会话', `${globalState.savedTabs.length} 个标签页`);
     globalState.savedTabs.forEach((savedTab, index) => {
-      const restoredUrl = refreshQianchuanDateParam(savedTab.url);
+      const restoredUrl = refreshSiteDateParams(savedTab.url);
       const restoredId = createTab(restoredUrl, {
         active: index === globalState.savedTabs.length - 1,
         title: savedTab.title
@@ -2844,8 +2870,11 @@ function getHideExtFloatUiScript() {
 
 function createTab(url = null, options = {}) {
   const tabId = `tab-${++globalState.tabCounter}`;
-  const targetUrl = url || globalState.settings.homepage;
   const referrer = options.referrer || '';
+  // v2.17.0: 站点日期刷新(腾讯广告/千川)。带 referrer 的是"页面内链接打开新标签",
+  // 尊重链接自带的日期筛选不劫持; 书签/历史/地址栏等浏览器UI发起的打开则刷新为今天。
+  const rawTargetUrl = url || globalState.settings.homepage;
+  const targetUrl = referrer ? rawTargetUrl : refreshSiteDateParams(rawTargetUrl);
   addLog('TAB', '创建标签页', referrer ? `${targetUrl} (referrer=${referrer})` : targetUrl);
 
   const view = new BrowserView({
@@ -5375,6 +5404,8 @@ function setupIPC() {
           targetUrl = engines[globalState.settings.searchEngine] || engines.baidu;
         }
       }
+      // v2.17.0: 地址栏/浏览器UI发起的导航, 站点日期刷新为今天(腾讯广告/千川)
+      targetUrl = refreshSiteDateParams(targetUrl);
       addLog('NAVIGATE', '导航到', targetUrl);
       // v2.11.0: 立即同步 tab.url 为请求地址 —— loadURL 到 did-navigate 提交之间有窗口期，
       // 此期间 did-start-loading 等事件通知渲染端时 tab.url 还是旧地址，会把地址栏打回原形
