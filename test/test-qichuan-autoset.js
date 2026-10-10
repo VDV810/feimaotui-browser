@@ -90,10 +90,25 @@ const AUTO_SETUP_SRC = `
     { name: '最内层叶子', fn: clickLeaf },
     { name: '完整鼠标事件', fn: clickMouseSequence }
   ];
+  // v2.22.0: 只认两个投放落地页路径, 并显式排除数据页(旧实现的文字回退会把数据页也当投放页)
+  // 注意: 模板字面量内不能用 \/ 正则转义(会被吃掉导致语法错误), 这里用字符串前缀比较
+  var EXCLUDE_PREFIX = ['/data', '/dataV2', '/report', '/tools', '/finance', '/marketing', '/school', '/community_security'];
   function onTargetPage() {
     var p = window.__mockPath || '';
-    if (p.indexOf('/uni-prom') === 0 || p.indexOf('/overall-prom') === 0) return true;
-    try { return (document.body && document.body.textContent || '').indexOf('千川乘方') !== -1; } catch (e) { return false; }
+    for (var i = 0; i < EXCLUDE_PREFIX.length; i++) { if (p.indexOf(EXCLUDE_PREFIX[i]) === 0) return false; }
+    return p === '/uni-prom' || p.indexOf('/uni-prom/') === 0 || p === '/overall-prom' || p.indexOf('/overall-prom/') === 0;
+  }
+  function tabLike(el) {
+    try {
+      if (el.getAttribute && (el.getAttribute('role') === 'tab' || el.hasAttribute('aria-selected'))) return true;
+      var cls = (el.className && typeof el.className === 'string') ? el.className : '';
+      return /(^|[\\s_-])tab([\\s_-]|$)/i.test(cls);   // 只认单数 tab, 排除 objective-tabs 这类容器
+    } catch (e) { return false; }
+  }
+  function upgradeToTab(el) {
+    var cur = el, up = 0;
+    while (cur && cur.nodeType === 1 && up < 4) { if (tabLike(cur)) return cur; cur = cur.parentElement; up++; }
+    return el;
   }
   function attempt() {
     if (done) return;
@@ -124,7 +139,9 @@ const AUTO_SETUP_SRC = `
         });
         if (pool.length === 0) return;
         var outerMost = pool.filter(function(t) { return !pool.some(function(o) { return o !== t && o.contains(t); }); });
-        var candidates = outerMost.length > 0 ? outerMost : pool;
+        var src3 = outerMost.length > 0 ? outerMost : pool;
+        var candidates = [];
+        src3.forEach(function(t) { var u = upgradeToTab(t); if (candidates.indexOf(u) === -1) candidates.push(u); });
         var inactive = candidates.filter(function(t) { return !isActive(t); });
         if (inactive.length === 0) {
           var row = candidates[0].parentElement, sibCount = 0, sibActive = 0;
@@ -303,6 +320,67 @@ function buildInnerSpanOnlyPage() {
 </body></html>`;
 }
 
+// v2.22.0 回归A: 数据页(/data/bidding/site-promotion) —— 页面同样含"千川乘方"字样,
+// 且同样有 全域投放/推商品/商品自选 这些元素, 但绝不能动手(旧实现会劫持回投放页)
+function buildDataHijackPage() {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<div class="brand">千川乘方</div>
+<header>
+  <div class="nav-item"><span>全域投放</span></div>
+  <div class="nav-item active"><span>数据</span></div>
+</header>
+<div class="objective-tabs">
+  <div class="obj-tab active"><span>推直播间</span></div>
+  <div class="obj-tab" data-key="push"><span>推商品</span></div>
+</div>
+<div class="sub-tabs">
+  <div class="sub-tab" data-key="self"><span>商品自选</span></div>
+  <div class="sub-tab active"><span>全店托管</span></div>
+</div>
+<script>
+  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0, other: 0 };
+  document.querySelectorAll('.nav-item, .obj-tab, .sub-tab').forEach(function(el) {
+    el.addEventListener('click', function() { window.__clickCount.nav = (window.__clickCount.nav || 0) + 1; });
+  });
+</script>
+</body></html>`;
+}
+
+// v2.22.0 回归B: 精确文本命中的是内层包裹元素(oc-space-item), 真正可点的是祖先 .ovui-tabs__tab[role=tab]
+function buildNestedWrapperTabPage() {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<header><div class="nav-item active"><span>全域投放</span></div></header>
+<div class="objective-tabs">
+  <div class="obj-tab"><span>推直播间</span></div>
+  <div class="obj-tab active" data-key="push"><span>推商品</span></div>
+</div>
+<div class="ovui-tabs__nav-list">
+  <div class="ovui-tabs__tab" data-key="self" role="tab" aria-selected="false">
+    <div class="oc-space-item"><span>商品自选</span></div>
+  </div>
+  <div class="ovui-tabs__tab" data-key="other" role="tab" aria-selected="true">
+    <div class="oc-space-item"><span>全店托管</span></div>
+  </div>
+</div>
+<script>
+  window.__qcLog = []; window.__clickCount = { nav: 0, push: 0, self: 0, other: 0 };
+  window.__innerWrapperClicked = 0;
+  document.querySelectorAll('.oc-space-item').forEach(function(w) {
+    w.addEventListener('click', function() { window.__innerWrapperClicked++; });
+  });
+  // 只有 tab 元素(role=tab)上的处理器才真正切换选中态
+  document.querySelectorAll('.ovui-tabs__tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      var isSelf = tab.dataset.key === 'self';
+      window.__clickCount[isSelf ? 'self' : 'other']++;
+      document.querySelectorAll('.ovui-tabs__tab').forEach(function(t) { t.setAttribute('aria-selected', 'false'); });
+      tab.setAttribute('aria-selected', 'true');
+    });
+  });
+</script>
+</body></html>`;
+}
+
 app.whenReady().then(async () => {
   setTimeout(() => { console.log('WATCHDOG TIMEOUT (90s)'); app.exit(2); }, 90000).unref();
   let pass = true;
@@ -363,7 +441,23 @@ app.whenReady().then(async () => {
   const d7 = await run('非目标页不劫持', buildDataPage(), '/data', 2000);
   assert(d7.log.length === 0, '场景7: 数据页零点击');
 
+  // 8(v2.22.0 回归): 数据页 /data/bidding/site-promotion 含"千川乘方"+同名tab, 仍必须零点击
+  const d8 = await run('数据页不劫持(含千川乘方字样)', buildDataHijackPage(), '/data/bidding/site-promotion', 3000);
+  console.log('  页面点击总数:', JSON.stringify(d8.clicks));
+  assert(d8.log.length === 0, '场景8: 数据页零点击(不再回退文字判定, 不劫持)');
+  assert((d8.clicks.nav || 0) === 0 && (d8.clicks.push || 0) === 0 && (d8.clicks.self || 0) === 0, '场景8: 全域投放/推商品/商品自选 均未被点');
+
+  // 9(v2.22.0 回归): 精确文本命中的是内层包裹元素 → 必须点真正的 tab 祖先
+  const d9 = await run('内层包裹元素升级到tab', buildNestedWrapperTabPage(), '/uni-prom', 3000);
+  const s9 = JSON.parse(await win.webContents.executeJavaScript(`JSON.stringify({
+    selfSelected: document.querySelector('[data-key="self"]').getAttribute('aria-selected'),
+    innerWrapperClicks: window.__innerWrapperClicked
+  })`));
+  console.log('  点击数:', JSON.stringify(d9.clicks), '| 商品自选tab aria-selected:', s9.selfSelected, '| 内层包裹被点次数:', s9.innerWrapperClicks);
+  assert(d9.clicks.self === 1 && s9.selfSelected === 'true', '场景9: 点的是 tab 祖先, 一次即生效');
+  assert(d9.clicks.other === 0, '场景9: 没有误点隔壁 tab');
+
   fs.unlinkSync(tmp);
-  console.log(pass ? '\nQIANCHUAN AUTO SETUP v2.20.0 TEST PASS' : '\nTEST FAIL');
+  console.log(pass ? '\nQIANCHUAN AUTO SETUP v2.22.0 TEST PASS' : '\nTEST FAIL');
   app.exit(pass ? 0 : 1);
 });

@@ -1203,6 +1203,28 @@ contextBridge.exposeInMainWorld('electronAPI', {
       } catch (e) { return true; }
     }
 
+    // v2.22.0: 精确文本命中的往往只是内层包裹元素(如 oc-space-item 这类间距容器),
+    // 真正可点的 tab 是它的祖先(ovui-tabs__tab / role=tab / 带 aria-selected)。
+    // 日志实测: 点 oc-space-item 连点 6 次都不生效; 必须点 tab 祖先。
+    function tabLike(el) {
+      try {
+        if (el.getAttribute && (el.getAttribute('role') === 'tab' || el.hasAttribute('aria-selected'))) return true;
+        var cls = (el.className && typeof el.className === 'string') ? el.className : '';
+        // 只认单数 tab: 匹配 obj-tab / type-tab / ovui-tabs__tab / is-tab;
+        // 排除 objective-tabs / sub-tabs 这类"行容器"(复数 tabs), 否则会升级到容器上导致点不动
+        return /(^|[\s_-])tab([\s_-]|$)/i.test(cls);
+      } catch (e) { return false; }
+    }
+    // 取"最近的" tab 祖先(逐级上溯, 首个命中即返回) —— 取最外层会命中行容器
+    function upgradeToTab(el) {
+      var cur = el, up = 0;
+      while (cur && cur.nodeType === 1 && up < 4) {
+        if (tabLike(cur)) return cur;
+        cur = cur.parentElement; up++;
+      }
+      return el;
+    }
+
     // v2.19.0: 阶梯式点击 —— v2.14.0 点外层可点元素是有效的(用户实测), 而 v2.16.0 改点最内层叶子后
     // 商品自选点不到: 该 tab 组件只在"点击目标即自身"时响应(e.target===e.currentTarget 类守卫),
     // 点内部 span 它不认。故按阶梯升级: 外层 → 叶子 → 外层+完整鼠标事件序列。
@@ -1234,14 +1256,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
       { name: '完整鼠标事件', fn: clickMouseSequence }
     ];
 
-    // 目标页判定: uni-prom / overall-prom 路径(工作台点账户落地的乘方智能营销页),
-    // 或页面渲染出"千川乘方"字样。动态判定(放在 attempt 里)是因为 SPA 内容晚渲染;
-    // 数据/工具等页面不含该字样永不误伤。
+    // v2.22.0 目标页判定: 只认两个投放落地页的路径 ——
+    //   /uni-prom      全域投放页
+    //   /overall-prom  乘方智能营销页(工作台点账户落地)
+    // 旧实现在路径不匹配时还回退到"页面含千川乘方字样", 结果数据页(/data、/dataV2)也有该字样
+    // → 在数据页也点"全域投放", 把用户的数据页劫持回投放页(用户实测的问题)。
+    // 故: 去掉文字回退, 并显式排除数据页路径, 宁可不动手也绝不劫持。
+    var EXCLUDE_PATH = /^\/(data|dataV2|report|tools|finance|marketing|school|community_security)/i;
     function onTargetPage() {
-      if (/^\/(uni-prom|overall-prom)/i.test(location.pathname)) return true;
-      try {
-        return (document.body && document.body.textContent || '').indexOf('千川乘方') !== -1;
-      } catch (e) { return false; }
+      var p = location.pathname || '';
+      if (EXCLUDE_PATH.test(p)) return false;
+      return /^\/(uni-prom|overall-prom)(\/|$)/i.test(p);
     }
 
     function attempt() {
@@ -1290,7 +1315,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
           var outerMost = pool.filter(function(t) {
             return !pool.some(function(o) { return o !== t && o.contains(t); });
           });
-          var candidates = outerMost.length > 0 ? outerMost : pool;
+          // v2.22.0: 升级到真正的 tab 元素(祖先里的 ovui-tabs__tab / role=tab),
+          // 否则点内层包裹元素不生效(日志实测连点6次无效)
+          var src = outerMost.length > 0 ? outerMost : pool;
+          var candidates = [];
+          src.forEach(function(t) {
+            var u = upgradeToTab(t);
+            if (candidates.indexOf(u) === -1) candidates.push(u);
+          });
           // 同名 tab 可能多处(如"全域投放"在顶部导航+投放类型行), 一活一灭只补灭的
           var inactive = candidates.filter(function(t) { return !isActive(t); });
           if (inactive.length === 0) {
