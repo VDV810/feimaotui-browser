@@ -6,7 +6,6 @@ const appState = {
     mediaUrls: new Map(),
     mediaDownloads: new Map(),
     settings: {},
-    showCompletedOnly: false,
     panels: {
         download: false,
         media: false,
@@ -1377,7 +1376,7 @@ function togglePanel(panelName) {
 
         switch (panelName) {
             case 'download': renderDownloadList(); break;
-            case 'media': appState.showCompletedOnly = false; renderMediaList(); break;
+            case 'media': renderMediaList(); break;
             case 'bookmark': loadBookmarks(); break;
             case 'history': loadHistory(); break;
             case 'log': loadLogs(); break;
@@ -1553,7 +1552,7 @@ async function renderMediaList() {
     // 媒体嗅探已关闭：显示提示横幅（不再捕获新视频）
     const sniffOff = appState.settings && appState.settings.mediaSniffingEnabled === false;
     
-    // 分离已下载和未下载
+    // 分离已下载和未下载（仅用于统计）
     const undownloaded = mediaList.filter(media => {
         const dl = appState.mediaDownloads.get(media.url) || media.download;
         return !dl || dl.state !== 'completed';
@@ -1562,30 +1561,20 @@ async function renderMediaList() {
         const dl = appState.mediaDownloads.get(media.url) || media.download;
         return dl && dl.state === 'completed';
     });
-    
+
     if (undownloaded.length === 0 && downloaded.length === 0) {
         elements.mediaList.innerHTML = sniffOff
             ? '<div class="empty-state">媒体嗅探已关闭，开启上方开关后重新加载页面即可嗅探</div>'
             : '<div class="empty-state">当前页面未检测到媒体资源</div>';
         return;
     }
-    
+
     elements.mediaList.innerHTML = `
         ${sniffOff ? '<div class="media-sniff-off-banner">媒体嗅探已关闭，已停止捕获新视频</div>' : ''}
         <div class="media-toolbar">
-            <button class="media-sniff-btn${appState.showCompletedOnly ? '' : ' active'}" onclick="toggleSniffView()">嗅探列表 (${undownloaded.length})</button>
-            <button class="media-downloaded-btn${appState.showCompletedOnly ? ' active' : ''}" onclick="toggleCompletedView()" title="切换显示已下载列表">已经下载 (${downloaded.length})</button>
             <button class="media-clear-all" onclick="clearMediaList()">清除列表</button>
         </div>
-        ${appState.showCompletedOnly ? '' : `
-            <div class="media-batch-row">
-                <button class="media-batch-download-btn" onclick="downloadAllMedia()">一键下载 (${undownloaded.length})</button>
-            </div>
-        `}
-        ${renderMediaItems(
-            appState.showCompletedOnly ? downloaded : undownloaded,
-            appState.showCompletedOnly
-        )}
+        ${renderMediaItems(mediaList)}
     `;
     setupMediaActionHandlers();
     elements.mediaList.querySelectorAll('.media-item').forEach(item => {
@@ -1597,7 +1586,7 @@ async function renderMediaList() {
             try {
                 url = JSON.parse(url);
             } catch (e) {}
-            const media = (appState.showCompletedOnly ? downloaded : undownloaded).find(entry => entry.url === url);
+            const media = mediaList.find(entry => entry.url === url);
             const mediaDownload = media ? (appState.mediaDownloads.get(media.url) || media.download) : null;
             if (window.electronAPI.showDownloadContextMenu) {
                 if (mediaDownload) {
@@ -1632,53 +1621,52 @@ async function renderMediaList() {
     });
 }
 
-// 渲染媒体项列表
-function renderMediaItems(mediaList, isCompletedView) {
+// 渲染媒体项列表（嗅探列表统一展示，已下载的带勾标识）
+function renderMediaItems(mediaList) {
     if (mediaList.length === 0) {
-        return `<div class="empty-state">${isCompletedView ? '暂无已下载的媒体文件' : '暂无未下载的媒体文件'}</div>`;
+        return `<div class="empty-state">当前页面未检测到媒体资源</div>`;
     }
     return mediaList.map((media) => {
         const fileName = getFileNameFromUrl(media.url);
         const displayName = media.title || fileName;
         const typeLabel = getMediaTypeLabel(media.type);
         const mediaDownload = appState.mediaDownloads.get(media.url) || media.download;
+        const isCompleted = !!(mediaDownload && mediaDownload.state === 'completed');
         const folderPath = mediaDownload && mediaDownload.filePath ? mediaDownload.filePath : '';
         const mediaProgress = mediaDownload && mediaDownload.totalBytes > 0 ? Math.round((mediaDownload.receivedBytes / mediaDownload.totalBytes) * 100) : 0;
         const mediaSizeText = mediaDownload ? `${formatBytes(mediaDownload.receivedBytes || 0)} / ${formatBytes(mediaDownload.totalBytes || 0)}` : '';
         const timeText = media.timestamp ? formatTime(media.timestamp) : '';
         return `
-            <div class="media-item" data-media-context-url='${escapeHtml(JSON.stringify(media.url || ''))}'>
-                <div class="media-icon">&#127916;</div>
+            <div class="media-item${isCompleted ? ' media-item-completed' : ''}" data-media-context-url='${escapeHtml(JSON.stringify(media.url || ''))}'>
+                ${isCompleted
+                    ? `<div class="media-icon media-icon-completed" title="已下载">&#10003;</div>`
+                    : `<div class="media-icon">&#127916;</div>`}
                 <div class="media-info">
                     <div class="media-type">${typeLabel}</div>
                     <div class="media-url">${escapeHtml(displayName)}</div>
                     <div class="media-meta">
                         <span class="media-time">${timeText}</span>
-                        ${media.size ? `<span class="media-size-hint">${formatBytes(media.size)}</span>` : ''}
+                        ${isCompleted && mediaDownload.totalBytes > 0 ? `<span class="media-size-hint">${formatBytes(mediaDownload.totalBytes)}</span>` : (media.size ? `<span class="media-size-hint">${formatBytes(media.size)}</span>` : '')}
                     </div>
-                    ${mediaDownload && !isCompletedView ? `
+                    ${mediaDownload && !isCompleted ? `
                         <div class="media-download-progress">
                             <div class="progress-bar"><div class="progress-fill" style="width: ${mediaProgress}%"></div></div>
                             <span class="download-size">${mediaSizeText}</span>
                         </div>
-                        <div class="media-download-progress-label">${mediaDownload.state === 'completed' ? '下载完成' : mediaDownload.paused ? '已暂停' : '正在下载'}</div>
-                    ` : ''}
-                    ${isCompletedView && mediaDownload && mediaDownload.totalBytes > 0 ? `
-                        <div class="media-download-progress-label" style="color:#52c41a">文件大小: ${formatBytes(mediaDownload.totalBytes)}</div>
+                        <div class="media-download-progress-label">${mediaDownload.paused ? '已暂停' : '正在下载'}</div>
                     ` : ''}
                 </div>
                 <div class="media-actions">
-                    ${(!mediaDownload || !isCompletedView) ? `<button class="download-action-btn" data-action="download-media" data-media-url='${escapeHtml(JSON.stringify(media.url))}' data-media-name='${escapeHtml(JSON.stringify(displayName))}' title="下载">
+                    ${!isCompleted ? `<button class="download-action-btn" data-action="download-media" data-media-url='${escapeHtml(JSON.stringify(media.url))}' data-media-name='${escapeHtml(JSON.stringify(displayName))}' title="下载">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
-                    </button>` : ''}
-                    ${mediaDownload && mediaDownload.state === 'completed' ? `
+                    </button>` : `
                         <button class="download-action-btn" data-action="open-media-download" data-file-path='${escapeHtml(JSON.stringify(folderPath))}' title="打开文件">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
                         </button>
                         <button class="download-action-btn" data-action="folder-media-download" data-file-path='${escapeHtml(JSON.stringify(folderPath))}' title="打开文件所在文件夹">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
                         </button>
-                    ` : ''}
+                    `}
                     ${mediaDownload && mediaDownload.filePath ? `
                         <button class="download-action-btn danger" data-action="delete-media-download" data-download-id="${mediaDownload.id}" data-file-path='${escapeHtml(JSON.stringify(mediaDownload.filePath || ''))}' title="彻底删除本地文件">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/></svg>
@@ -1688,17 +1676,6 @@ function renderMediaItems(mediaList, isCompletedView) {
             </div>
         `;
     }).join('');
-}
-
-// 切换显示已下载列表
-function toggleSniffView() {
-    appState.showCompletedOnly = false;
-    renderMediaList();
-}
-
-function toggleCompletedView() {
-    appState.showCompletedOnly = !appState.showCompletedOnly;
-    renderMediaList();
 }
 
 // 更新收藏星号状态
@@ -2457,31 +2434,6 @@ async function downloadMedia(url, fileName) {
     }
 }
 
-async function downloadAllMedia() {
-    try {
-        const mediaList = window.electronAPI.getAllMediaUrls ? await window.electronAPI.getAllMediaUrls() : Array.from(appState.mediaUrls.values()).flat();
-        if (!mediaList || mediaList.length === 0) {
-            alert('当前没有可下载的嗅探视频');
-            return;
-        }
-        // 只下载未完成的
-        const undownloaded = mediaList.filter(media => {
-            const dl = appState.mediaDownloads.get(media.url) || media.download;
-            return !dl || dl.state !== 'completed';
-        });
-        if (undownloaded.length === 0) {
-            alert('所有视频都已下载');
-            return;
-        }
-        const result = await window.electronAPI.downloadMediaList(undownloaded, { roughName: appState.mediaRoughNaming });
-        if (!result || !result.success) {
-            alert(`一键下载失败：${result && result.error ? result.error : '未知错误'}`);
-        }
-    } catch (error) {
-        alert(`一键下载失败：${error.message}`);
-    }
-}
-
 function toggleMediaRoughNaming(checked) {
     appState.mediaRoughNaming = Boolean(checked);
     if (checked) {
@@ -2739,15 +2691,6 @@ async function deleteMediaUrl(tabId, url) {
 }
 
 async function clearMediaList() {
-    if (appState.showCompletedOnly) {
-        // 清除已下载列表
-        appState.mediaDownloads.forEach((download, url) => {
-            if (download.state === 'completed') appState.mediaDownloads.delete(url);
-        });
-        updateMediaBadge();
-        renderMediaList();
-        return;
-    }
     // 清除嗅探列表（仅清除未下载的嗅探记录，不影响已下载的）
     const result = await window.electronAPI.clearMediaList();
     if (result && result.success) {

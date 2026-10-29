@@ -1000,77 +1000,6 @@ body {
     flex-wrap: wrap;
 }
 
-.media-sniff-btn {
-    height: 32px;
-    padding: 0 16px;
-    border: 1px solid #1677ff;
-    border-radius: var(--border-radius);
-    background: var(--bg-color);
-    color: #1677ff;
-    cursor: pointer;
-    font-size: 12px;
-    white-space: nowrap;
-    flex-shrink: 0;
-    transition: all 0.2s;
-}
-
-.media-sniff-btn:hover {
-    background: #1677ff;
-    color: #fff;
-}
-
-.media-sniff-btn.active {
-    background: #1677ff;
-    color: #fff;
-}
-
-.media-downloaded-btn {
-    height: 32px;
-    padding: 0 16px;
-    border: 1px solid #52c41a;
-    border-radius: var(--border-radius);
-    background: var(--bg-color);
-    color: #52c41a;
-    cursor: pointer;
-    font-size: 12px;
-    white-space: nowrap;
-    flex-shrink: 0;
-    transition: all 0.2s;
-}
-
-.media-downloaded-btn:hover {
-    background: #52c41a;
-    color: #fff;
-}
-
-.media-downloaded-btn.active {
-    background: #52c41a;
-    color: #fff;
-}
-
-.media-batch-row {
-    margin-bottom: 10px;
-    display: inline-flex;
-}
-
-.media-batch-download-btn {
-    height: 28px;
-    padding: 0 14px;
-    border: 1px solid #1677ff;
-    border-radius: var(--border-radius);
-    background: var(--bg-color);
-    color: #1677ff;
-    cursor: pointer;
-    font-size: 12px;
-    white-space: nowrap;
-    transition: all 0.2s;
-}
-
-.media-batch-download-btn:hover {
-    background: #1677ff;
-    color: #fff;
-}
-
 .media-item {
     display: flex;
     align-items: center;
@@ -1092,6 +1021,13 @@ body {
     color: white;
     font-size: 18px;
     flex-shrink: 0;
+}
+
+/* 已下载的媒体项：橙色勾标识（与下载管理一致） */
+.media-icon-completed {
+    background: var(--primary-color);
+    font-size: 20px;
+    font-weight: bold;
 }
 
 .media-info {
