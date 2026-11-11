@@ -1573,6 +1573,7 @@ async function renderMediaList() {
         ${sniffOff ? '<div class="media-sniff-off-banner">媒体嗅探已关闭，已停止捕获新视频</div>' : ''}
         <div class="media-toolbar">
             <button class="media-clear-all" onclick="clearMediaList()">清除列表</button>
+            ${undownloaded.length > 0 ? `<button class="media-batch-download-btn" onclick="downloadAllMedia()">一键下载 (${undownloaded.length})</button>` : ''}
         </div>
         ${renderMediaItems(mediaList)}
     `;
@@ -2431,6 +2432,32 @@ async function downloadMedia(url, fileName) {
         }
     } catch (error) {
         console.error('下载媒体失败:', error);
+    }
+}
+
+// 一键下载全部未下载的嗅探媒体
+async function downloadAllMedia() {
+    try {
+        const mediaList = window.electronAPI.getAllMediaUrls ? await window.electronAPI.getAllMediaUrls() : Array.from(appState.mediaUrls.values()).flat();
+        if (!mediaList || mediaList.length === 0) {
+            alert('当前没有可下载的嗅探视频');
+            return;
+        }
+        // 只下载未完成的
+        const undownloaded = mediaList.filter(media => {
+            const dl = appState.mediaDownloads.get(media.url) || media.download;
+            return !dl || dl.state !== 'completed';
+        });
+        if (undownloaded.length === 0) {
+            alert('所有视频都已下载');
+            return;
+        }
+        const result = await window.electronAPI.downloadMediaList(undownloaded, { roughName: appState.mediaRoughNaming });
+        if (!result || !result.success) {
+            alert(`一键下载失败：${result && result.error ? result.error : '未知错误'}`);
+        }
+    } catch (error) {
+        alert(`一键下载失败：${error.message}`);
     }
 }
 
